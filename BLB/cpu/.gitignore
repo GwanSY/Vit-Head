@@ -1,0 +1,20 @@
+# Build Directory
+dataset/
+build/
+bin/
+mpc_venv
+# Vim c_tags files
+c_*
+# SEAL
+.vscode/
+clash*
+ABY/
+CMakeCache.txt
+# *.txt
+# local keys
+cryptocontext.txt
+evalmultkey.txt
+evalrotkey.txt
+publickey.txt
+secretkey.txt
+

@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/BOLT-softmax.dir/bolt_softmax.cpp.o  -o BOLT-softmax -lSCI-FloatingPoint -lSCI-Math 

@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/IRON-softmax.dir/iron_softmax.cpp.o  -o IRON-softmax -lSCI-Math -lSCI-FloatingPoint 

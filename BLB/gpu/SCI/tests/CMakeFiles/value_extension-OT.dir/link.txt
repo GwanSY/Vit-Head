@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/value_extension-OT.dir/test_ring_value_extension.o  -o value_extension-OT -lSCI-OT 

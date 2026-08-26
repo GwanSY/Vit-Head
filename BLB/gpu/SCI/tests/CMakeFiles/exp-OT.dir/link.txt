@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/exp-OT.dir/test_ring_exp.o  -o exp-OT -lSCI-OT 

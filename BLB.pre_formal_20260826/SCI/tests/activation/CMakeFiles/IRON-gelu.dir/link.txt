@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/IRON-gelu.dir/iron_gelu.cpp.o  -o IRON-gelu -lSCI-Math -lSCI-FloatingPoint 

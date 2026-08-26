@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/matmul-OT.dir/test_ring_matmul.o  -o matmul-OT -lSCI-OT 

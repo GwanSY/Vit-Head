@@ -1,0 +1,26 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/ezpc_dir/EzPC/SCI/tests/activation/bolt_layer_norm.cpp
+FloatingPoint/fp-math.h
+/ezpc_dir/EzPC/SCI/tests/activation/FloatingPoint/fp-math.h
+BuildingBlocks/aux-protocols.h
+/ezpc_dir/EzPC/SCI/tests/activation/BuildingBlocks/aux-protocols.h
+NonLinear/argmax.h
+/ezpc_dir/EzPC/SCI/tests/activation/NonLinear/argmax.h
+fstream
+-
+iostream
+-
+thread
+-
+cmath
+-
+vector
+-
+

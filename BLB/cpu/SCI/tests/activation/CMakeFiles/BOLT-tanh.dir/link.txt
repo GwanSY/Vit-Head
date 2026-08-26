@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/BOLT-tanh.dir/bolt_tanh.cpp.o  -o BOLT-tanh -lSCI-FloatingPoint -lSCI-Math 

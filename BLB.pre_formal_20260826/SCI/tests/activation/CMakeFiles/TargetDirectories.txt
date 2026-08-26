@@ -1,0 +1,5 @@
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/rebuild_cache.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/edit_cache.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/BOLT-layer_norm.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/BOLT-gelu.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/BOLT-softmax.dir

@@ -1,0 +1,7 @@
+# Build Directory
+build/
+bin/
+# Vim c_tags files
+CMakeCache.txt
+# *.txt
+

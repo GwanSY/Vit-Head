@@ -1,0 +1,16 @@
+/ezpc_dir/EzPC/SCI/tests/CMakeFiles/rebuild_cache.dir
+/ezpc_dir/EzPC/SCI/tests/CMakeFiles/edit_cache.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/rebuild_cache.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/edit_cache.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/BOLT-layer_norm.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/BOLT-tanh.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/BOLT-gelu.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/BOLT-softmax.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/IRON-tanh.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/IRON-gelu.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/IRON-softmax.dir
+/ezpc_dir/EzPC/SCI/tests/activation/CMakeFiles/IRON-layer_norm.dir
+/ezpc_dir/EzPC/SCI/tests/bert_bolt/CMakeFiles/rebuild_cache.dir
+/ezpc_dir/EzPC/SCI/tests/bert_bolt/CMakeFiles/edit_cache.dir
+/ezpc_dir/EzPC/SCI/tests/bert_bolt/CMakeFiles/BOLT_BERT.dir
+/ezpc_dir/EzPC/SCI/tests/bert_bolt/CMakeFiles/LIB_BERT.dir

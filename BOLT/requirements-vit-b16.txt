@@ -1,0 +1,10 @@
+# Non-Torch dependencies for the reproducible ViT-B/16 CPU reference.
+# Install torch/torchvision separately from the official PyTorch CPU index.
+# They are intentionally absent here so a later PyPI install cannot replace
+# the prepared CPU-only wheels.
+transformers==4.40.0
+safetensors==0.5.3
+Pillow==10.4.0
+numpy==1.26.4
+scipy==1.13.1
+tqdm==4.67.1

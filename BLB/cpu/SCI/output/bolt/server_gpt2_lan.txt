@@ -1,0 +1,128 @@
+>>> Evaluating Bert
+-> Role: 1
+-> Address: 127.0.0.1
+-> Port: 1234
+<<<
+
+> Setup Linear
+> HE instance initialized: 
+-> Poly Mod Degree: 8192
+-> Coeff Mod: 54 54 55 55 
+-> Plaintext Mod: 536903681(29 bits)
+
+> HE instance initialized: 
+-> Poly Mod Degree: 8192
+-> Coeff Mod: 60 60 60 
+-> Plaintext Mod: 557057(19 bits)
+
+> HE instance initialized: 
+-> Poly Mod Degree: 8192
+-> Coeff Mod: 54 54 55 55 
+-> Plaintext Mod: 4295049217(32 bits)
+
+> Setup NonLinear
+> Loading and preprocessing weights on server
+i: 0
+> Bert intialized done!
+
+==>> Inference sample #0
+begin
+> Receive input cts from client 
+> --- Entering Attention Layers ---
+-> Layer - 0: Linear #1 HE
+begin
+temp_result_size: 1
+bert_cipher_plain_bsgs OK
+-> Layer - 0: Linear #1 done HE
+q_k_v.size: 12
+qk_offset: 6
+OK1
+OK2
+OK1
+0
+sub:136934618985
+OK 957
+begin max
+end max
+begin concat
+begin exp
+OK1
+OK2
+OK3
+OK4
+OK5
+OK6
+OK1.1
+OK1.2
+OK1.3s
+OK7
+OK8
+reduce exp
+dix batch
+l_out: 19 s_out: 12
+0
+msnzb_one_hot1
+look up 1
+look up 1.1
+add1
+LSB1
+mul1
+s_out: 12 m: 5 iters: 0
+extend
+ok 982
+OK 1010
+OK 1034
+1
+sub:136953896575
+-> Layer - 0: Linear #2 HE
+-> Layer - 0: Linear #2 HE done 
+0
+sub:137438696275
+look up 1
+look up 1.1
+1
+sub:136689810470
+-> Layer - 0: Linear #3 HE
+-> Layer - 0: Linear #3 HE done 
+1
+sub:735883
+-> Layer - 0: Linear #4 HE 
+-> Layer - 0: Linear #4 HE done
+1
+sub:137438667565
+look up 1
+look up 1.1
+1
+sub:133982655934
+-----------comm------------
+cts_transfer_comm:7.70939e+06
+conversion_comm:4.10051e+07
+truncate_comm:2.01585e+07
+other_nonlinear_comm:0
+ln_comm:8.57209e+07
+gelu_comm:8.65321e+07
+softmax_comm:4.30964e+07
+total comm:2.84222e+08
+comm should be 0, :0
+other comm, should be 0. :0
+-----------round------------
+cts_transfer_round:14
+conversion_round:47
+truncate_round:94
+other_nonlinear_round:0
+ln_round:432
+gelu_round:88
+softmax_round:226
+total round:901
+other round, should be 0. :0
+-----------time-------------
+total_la:48.4022
+ct_transfer_la:0.481428
+conversion_la:5.89806
+truncate_la:3.86048
+he_compute_la:13.2939
+other_nonlinear_la:0
+ln_la:8.15756
+gelu_la:10.1421
+softmax_la:4.8923
+other la:1.67642

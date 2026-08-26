@@ -1,0 +1,6 @@
+[submodule "SCI/extern/SEAL"]
+	path = SCI/extern/SEAL
+	url = https://github.com/Clive2312/SEAL
+[submodule "SCI/extern/eigen"]
+	path = SCI/extern/eigen
+	url = https://gitlab.com/libeigen/eigen

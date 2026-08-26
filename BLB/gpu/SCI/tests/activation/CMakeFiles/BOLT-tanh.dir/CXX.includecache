@@ -1,0 +1,22 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/ezpc_dir/EzPC/SCI/tests/activation/bolt_tanh.cpp
+FloatingPoint/fp-math.h
+/ezpc_dir/EzPC/SCI/tests/activation/FloatingPoint/fp-math.h
+BuildingBlocks/aux-protocols.h
+/ezpc_dir/EzPC/SCI/tests/activation/BuildingBlocks/aux-protocols.h
+fstream
+-
+iostream
+-
+thread
+-
+math.h
+-
+

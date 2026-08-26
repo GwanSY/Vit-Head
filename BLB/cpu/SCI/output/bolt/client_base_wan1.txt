@@ -1,0 +1,109 @@
+>>> Evaluating Bert
+-> Role: 2
+-> Address: 127.0.0.1
+-> Port: 1234
+<<<
+
+> Setup Linear
+> HE instance initialized: 
+-> Poly Mod Degree: 8192
+-> Coeff Mod: 54 54 55 55 
+-> Plaintext Mod: 536903681(29 bits)
+
+> HE instance initialized: 
+-> Poly Mod Degree: 8192
+-> Coeff Mod: 60 60 60 
+-> Plaintext Mod: 557057(19 bits)
+
+> HE instance initialized: 
+-> Poly Mod Degree: 8192
+-> Coeff Mod: 54 54 55 55 
+-> Plaintext Mod: 4295049217(32 bits)
+
+> Setup NonLinear
+> Bert intialized done!
+
+==>> Inference sample #0
+begin
+> Loading inputs
+input path: ../../dataset/quantize/mrpc/weights_txt/inputs_0_data.txt
+> Repacking to column
+> Send to client
+> --- Entering Attention Layers ---
+qk_cts_len: 24
+OK1
+0
+sub:84408140
+OK 957
+begin max
+end max
+begin concat
+begin exp
+OK1
+OK2
+OK3
+OK4
+OK5
+OK6
+OK1.1
+OK1.2
+OK1.3s
+OK7
+OK8
+reduce exp
+dix batch
+l_out: 19 s_out: 12
+0
+msnzb_one_hot1
+add1
+LSB1
+mul1
+s_out: 12 m: 5 iters: 0
+extend
+ok 982
+OK 1010
+OK 1034
+1
+sub:287791669
+0
+sub:152960
+0
+sub:2941465731
+0
+sub:149189
+0
+sub:318583
+1
+sub:2956053821
+-----------comm------------
+cts_transfer_comm:4.55344e+07
+conversion_comm:5.49851e+08
+truncate_comm:4.10296e+08
+other_nonlinear_comm:0
+ln_comm:7.95853e+08
+gelu_comm:9.92084e+08
+softmax_comm:9.15845e+08
+total comm:3.70946e+09
+comm should be 0, :0
+other comm, should be 0. :0
+-----------round------------
+cts_transfer_round:14
+conversion_round:47
+truncate_round:94
+other_nonlinear_round:0
+ln_round:432
+gelu_round:88
+softmax_round:232
+total round:907
+other round, should be 0. :0
+-----------time-------------
+total_la:175.453
+ct_transfer_la:0
+conversion_la:17.4219
+truncate_la:13.6847
+he_compute_la:1.18676
+other_nonlinear_la:0
+ln_la:26.9163
+gelu_la:31.5983
+softmax_la:31.3689
+other la:53.2762

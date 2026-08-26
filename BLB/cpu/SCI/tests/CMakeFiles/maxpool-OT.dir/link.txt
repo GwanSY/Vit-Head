@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/maxpool-OT.dir/test_ring_maxpool.o  -o maxpool-OT -lSCI-OT 

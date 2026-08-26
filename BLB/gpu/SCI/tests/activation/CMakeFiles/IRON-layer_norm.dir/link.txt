@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/IRON-layer_norm.dir/iron_layer_norm.cpp.o  -o IRON-layer_norm -lSCI-Math -lSCI-FloatingPoint 

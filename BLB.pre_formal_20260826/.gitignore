@@ -1,0 +1,42 @@
+# Clangd
+.cache/
+__pycache__/
+*.py[cod]
+.clangd
+# Build Directory
+dataset/
+build/
+build_vit_e2e/
+build_vit_smoke_e2e/
+build_vit_e2e/
+build_host_gpu/
+build_host_gpu_vole/
+build_vit_b16/
+build_vit_b16_gpu/
+build_vit_b16_gpu_local/
+build_blb_container/
+build_blb_*/
+build_deps/
+checkpoints/
+artifacts/zenodo/*.zip
+artifacts/zenodo/*.tar
+artifacts/zenodo/*.tar.gz
+vit_adapter/build*/
+fixtures/vit_e2e_tiny/
+outputs/
+bin/
+mpc_venv
+# Vim c_tags files
+c_*
+# SEAL
+.vscode/
+clash*
+ABY/
+CMakeCache.txt
+# *.txt
+# local keys
+cryptocontext.txt
+evalmultkey.txt
+evalrotkey.txt
+publickey.txt
+secretkey.txt

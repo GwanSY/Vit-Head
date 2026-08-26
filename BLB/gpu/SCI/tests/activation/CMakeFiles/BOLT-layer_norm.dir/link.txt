@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/BOLT-layer_norm.dir/bolt_layer_norm.cpp.o  -o BOLT-layer_norm -lSCI-FloatingPoint -lSCI-Math 

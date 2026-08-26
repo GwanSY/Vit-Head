@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/BOLT-gelu.dir/bolt_gelu.cpp.o  -o BOLT-gelu -lSCI-FloatingPoint -lSCI-Math 

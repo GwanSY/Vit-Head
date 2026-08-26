@@ -1,0 +1,159 @@
+# Copyright 2021 Ant Group Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("//bazel:spu.bzl", "spu_cc_binary", "spu_cc_library", "spu_cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+config_setting(
+    name = "phantom_enabled",
+    define_values = {"openbumblebee_phantom": "true"},
+)
+
+spu_cc_library(
+    name = "bumblebee_rlwe",
+    deps = [
+        ":bumblebee_metrics",
+        ":modswitch_helper",
+        ":phantom_evaluator",
+    ],
+)
+
+spu_cc_library(
+    name = "bumblebee_metrics",
+    srcs = ["bumblebee_metrics.cc"],
+    hdrs = ["bumblebee_metrics.h"],
+)
+
+spu_cc_library(
+    name = "phantom_evaluator",
+    srcs = ["phantom_evaluator.cc"],
+    hdrs = [
+        "phantom_evaluator.h",
+        "phantom_host_compat.h",
+    ],
+    deps = [
+        ":bumblebee_metrics",
+        "//libspu/core:parallel_utils",
+        "@com_github_microsoft_seal//:seal",
+    ] + select({
+        ":phantom_enabled": [
+            ":phantom_bridge_kernels",
+            "@local_cuda//:cuda_runtime",
+            "@openbumblebee_phantom//:phantom_shared",
+        ],
+        "//conditions:default": [],
+    }),
+    local_defines = select({
+        ":phantom_enabled": ["OPENBUMBLEBEE_ENABLE_PHANTOM=1"],
+        "//conditions:default": [],
+    }),
+)
+
+cuda_library(
+    name = "phantom_bridge_kernels",
+    srcs = ["phantom_bridge_kernels.cu"],
+    hdrs = ["phantom_bridge_kernels.h"],
+    tags = ["manual"],
+    deps = [
+        "@local_cuda//:cuda_runtime",
+        "@openbumblebee_phantom//:phantom_shared",
+    ],
+)
+
+spu_cc_library(
+    name = "lwe",
+    srcs = ["lwe_ct.cc"],
+    hdrs = ["lwe_ct.h"],
+    deps = [":modswitch_helper"],
+)
+
+spu_cc_library(
+    name = "packlwes",
+    srcs = ["packlwes.cc"],
+    hdrs = ["packlwes.h"],
+    deps = [
+        ":bumblebee_metrics",
+        ":lwe",
+        ":phantom_evaluator",
+        ":rlwe_utils",
+    ],
+)
+
+spu_cc_library(
+    name = "modswitch_helper",
+    srcs = [
+        "modswitch_helper.cc",
+        "utils.cc",
+    ],
+    hdrs = [
+        "modswitch_helper.h",
+        "utils.h",
+    ],
+    deps = [":rlwe_utils"],
+)
+
+spu_cc_library(
+    name = "rlwe_utils",
+    srcs = ["utils.cc"],
+    hdrs = [
+        "types.h",
+        "utils.h",
+    ],
+    deps = [
+        ":bumblebee_metrics",
+        ":phantom_evaluator",
+        "//libspu/mpc/utils:ring_ops",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_test(
+    name = "modswitch_helper_test",
+    srcs = ["modswitch_helper_test.cc"],
+    deps = [
+        ":modswitch_helper",
+        "//libspu/core:xt_helper",
+    ],
+)
+
+spu_cc_test(
+    name = "packlwes_test",
+    srcs = ["packlwes_test.cc"],
+    deps = [
+        ":modswitch_helper",
+        ":packlwes",
+    ],
+)
+
+spu_cc_test(
+    name = "phantom_evaluator_test",
+    srcs = ["phantom_evaluator_test.cc"],
+    tags = ["gpu"],
+    deps = [
+        ":phantom_evaluator",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "bench_seal_ntt",
+    srcs = [
+        "bench_seal_ntt.cc"],
+    deps= [
+        "@com_github_microsoft_seal//:seal",
+        "@yacl//yacl/utils:elapsed_timer",
+    ],
+)
