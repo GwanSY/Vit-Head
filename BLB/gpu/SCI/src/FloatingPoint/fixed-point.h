@@ -136,6 +136,10 @@ FixArray concat(const vector<FixArray>& x);
 
 class FixOp {
 public:
+  // Optional accounting hook used by the ViT benchmark. A null hook leaves
+  // the protocol and every existing BERT caller unchanged.
+  void *profile_context = nullptr;
+  void (*profile_comm_callback)(void *, int, uint64_t) = nullptr;
   int party;
   sci::IOPack *iopack;
   sci::OTPack *otpack;

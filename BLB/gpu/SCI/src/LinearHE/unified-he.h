@@ -163,6 +163,11 @@ void kswitchkey_to_device(const seal::SEALContext &hcontext,
                           const PhantomContext &dcontext,
                           std::vector<PhantomPublicKey> &dksk);
 
+void kswitchkey_to_device(const seal::SEALContext &hcontext,
+                          const std::vector<seal::PublicKey> &hksk,
+                          const PhantomContext &dcontext,
+                          PhantomRelinKey &dksk);
+
 void galoiskeys_to_device(const seal::SEALContext &hcontext,
                           const seal::GaloisKeys &hks,
                           const PhantomContext &dcontext,

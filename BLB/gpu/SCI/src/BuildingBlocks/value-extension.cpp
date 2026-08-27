@@ -110,6 +110,61 @@ void XTProtocol::s_extend(int32_t dim, uint64_t *inA, uint64_t *outB,
   delete[] mapped_outB;
 }
 
+void XTProtocol::s_extend_wide(int32_t dim, const uint64_t *inA,
+                               uint64_t *out_low, uint64_t *out_high,
+                               int32_t bwA, int32_t bwB, uint8_t *msbA) {
+  if (dim <= 0 || bwA <= 1 || bwA >= 64 || bwB <= 64 || bwB > 127 ||
+      bwB <= bwA || out_low == nullptr || out_high == nullptr) {
+    throw std::invalid_argument("invalid wide signed-extension metadata");
+  }
+
+  const uint64_t mask_a = (uint64_t{1} << bwA) - 1;
+  const uint64_t sign_a = uint64_t{1} << (bwA - 1);
+  const int32_t delta = bwB - bwA;
+  const __uint128_t modulus_b = __uint128_t{1} << bwB;
+  const __uint128_t mask_b = modulus_b - 1;
+
+  vector<uint64_t> mapped_in(static_cast<size_t>(dim));
+  for (int32_t i = 0; i < dim; ++i) {
+    const uint64_t value = inA[i] & mask_a;
+    mapped_in[i] = party == sci::ALICE ? (value + sign_a) & mask_a : value;
+  }
+
+  vector<uint8_t> mapped_msb;
+  uint8_t *mapped_msb_ptr = nullptr;
+  if (msbA != nullptr) {
+    mapped_msb.resize(static_cast<size_t>(dim));
+    for (int32_t i = 0; i < dim; ++i) {
+      mapped_msb[i] = party == sci::ALICE
+                          ? static_cast<uint8_t>(msbA[i] ^ 1)
+                          : msbA[i];
+    }
+    mapped_msb_ptr = mapped_msb.data();
+  }
+
+  vector<uint8_t> wrap(static_cast<size_t>(dim));
+  if (mapped_msb_ptr != nullptr) {
+    aux->MSB_to_Wrap(mapped_in.data(), mapped_msb_ptr, wrap.data(), dim,
+                     bwA);
+  } else {
+    aux->wrap_computation(mapped_in.data(), wrap.data(), dim, bwA);
+  }
+  vector<uint64_t> arithmetic_wrap(static_cast<size_t>(dim));
+  aux->B2A(wrap.data(), arithmetic_wrap.data(), dim, delta);
+
+  const __uint128_t low_mask = static_cast<__uint128_t>(~uint64_t{0});
+  for (int32_t i = 0; i < dim; ++i) {
+    __uint128_t extended =
+        (__uint128_t(mapped_in[i]) -
+         (__uint128_t{1} << bwA) * arithmetic_wrap[i]) & mask_b;
+    if (party == sci::ALICE) {
+      extended = (extended - sign_a) & mask_b;
+    }
+    out_low[i] = static_cast<uint64_t>(extended & low_mask);
+    out_high[i] = static_cast<uint64_t>(extended >> 64);
+  }
+}
+
 // prime to ring, use optim. from bumblebee, assume inA is positive
 void XTProtocol::z_prime2ring(int32_t dim, uint64_t *inA, uint64_t *outB,
                           uint64_t Q, int32_t bwB) {

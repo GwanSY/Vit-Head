@@ -45,6 +45,12 @@ public:
 
   void s_extend(int32_t dim, uint64_t *inA, uint64_t *outB, int32_t bwA,
                 int32_t bwB, uint8_t *msbA = nullptr);
+
+  // BLB Appendix C.3/C.4 signed extension into the l+40 working ring. The
+  // result uses two limbs because a FixArray element is one uint64_t.
+  void s_extend_wide(int32_t dim, const uint64_t *inA,
+                     uint64_t *out_low, uint64_t *out_high,
+                     int32_t bwA, int32_t bwB, uint8_t *msbA = nullptr);
   
   //By xts
   void z_prime2ring(int32_t dim, uint64_t *inA, uint64_t *outB,

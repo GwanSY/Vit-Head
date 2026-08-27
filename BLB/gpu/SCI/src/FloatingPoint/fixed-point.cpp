@@ -932,10 +932,20 @@ FixArray FixOp::max(const vector<FixArray>& x) {
     // print_fix(lhs_fp);
     // print_fix(rhs_fp);
     // cout << "OK here" << endl;
+    const uint64_t cmp_comm_before = iopack->get_comm();
     BoolArray cond = fix->GT(lhs_fp, rhs_fp);
+    if (profile_comm_callback != nullptr) {
+      profile_comm_callback(profile_context, 0,
+                            iopack->get_comm() - cmp_comm_before);
+    }
     // print_bool(cond)
     // cout << "OK here2" << endl;
+    const uint64_t mux_comm_before = iopack->get_comm();
     lhs_fp = fix->if_else(cond, lhs_fp, rhs_fp);
+    if (profile_comm_callback != nullptr) {
+      profile_comm_callback(profile_context, 1,
+                            iopack->get_comm() - mux_comm_before);
+    }
     // cout << "OK here3" << endl;
     for (int j = 0; j < num_cmps_old && j + 1 < num_cmps_old; j += 2) {
       memcpy(x_tr[odd_num_cmps + (j/2)].data, lhs_fp.data + (j/2)*N, N*sizeof(uint64_t));

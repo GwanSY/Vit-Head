@@ -54,6 +54,38 @@ macro (add_test_CKKS _name)
 endmacro()
 
 add_test_CKKS(ckks_bert_large_main)
+
+# ViT-B/16 reuses BLB in a separate library so the reproduced BERT CPU/GPU
+# sources and executable targets remain unchanged.
+set(BLB_VIT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../vit_b16")
+set(BLB_VIT_RUNTIME "${BLB_VIT_ROOT}/runtime")
+add_library(LIB_VIT_BLB_CKKS
+    "${BLB_VIT_RUNTIME}/he.cpp"
+    "${BLB_VIT_RUNTIME}/nonlinear.cpp"
+    "${BLB_VIT_RUNTIME}/linear_ckks.cpp"
+    "${BLB_VIT_RUNTIME}/ckks_bert.cpp"
+    "${BLB_VIT_RUNTIME}/ckks_bert_basic.cpp"
+    "${BLB_VIT_RUNTIME}/bert_utils.cpp"
+)
+target_include_directories(LIB_VIT_BLB_CKKS PUBLIC
+    "${BLB_VIT_RUNTIME}"
+    "${BLB_VIT_ROOT}"
+)
+if(USE_HE_GPU)
+    target_compile_definitions(LIB_VIT_BLB_CKKS PUBLIC BLB_HAS_HE_GPU=1)
+endif()
+target_link_libraries(LIB_VIT_BLB_CKKS
+    SCI-LinearHE
+    SCI-FloatingPoint
+    SCI-Math
+)
+
+add_executable(ckks_vit_b16_main
+    "${BLB_VIT_RUNTIME}/ckks_vit_b16_main.cpp"
+    "${BLB_VIT_ROOT}/vit_model.cpp"
+)
+target_link_libraries(ckks_vit_b16_main LIB_VIT_BLB_CKKS)
+
 add_test_BOLT(bolt_bert_large)
 # add_executable(BOLT_WE_BERT "bolt_bert_word_elimination.cpp")
 # target_link_libraries(BOLT_WE_BERT LIB_BERT)

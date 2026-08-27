@@ -1,10 +1,11 @@
 #ifndef LINEARHE_EVALUATOR_WRAPPER_H_
 #define LINEARHE_EVALUATOR_WRAPPER_H_
 
-#include <phantom/ciphertext.h>
-#include <phantom/context.cuh>
-#include <phantom/plaintext.h>
-#include <phantom/secretkey.h>
+#include "phantom-host-compat.h"
+#include <ciphertext.h>
+#include <context.cuh>
+#include <plaintext.h>
+#include <secretkey.h>
 
 class PhantomEvaluator {
 

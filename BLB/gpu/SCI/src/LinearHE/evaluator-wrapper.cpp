@@ -1,5 +1,5 @@
 #include "evaluator-wrapper.h"
-#include <phantom/evaluate.cuh>
+#include <evaluate.cuh>
 
 void PhantomEvaluator::negate_inplace(PhantomCiphertext &encrypted) const {
   phantom::negate_inplace(context_, encrypted);
