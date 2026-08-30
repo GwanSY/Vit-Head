@@ -166,7 +166,7 @@ complex<uint64_t> wide_root_mul_scalar(const complex<uint64_t> &root,
                                        uint64_t scalar, int width,
                                        int root_scale) {
     const int product_bits = root_scale * 2;
-    if (product_bits >= 127 || width <= root_scale || width >= 127) {
+    if (product_bits >= 127 || width <= 1 || width >= 127) {
         throw std::invalid_argument("wide CKKS root-scalar width is invalid");
     }
     const WideScalar product_modulus = WideScalar{1} << product_bits;
@@ -182,21 +182,20 @@ complex<uint64_t> wide_root_mul_scalar(const complex<uint64_t> &root,
         real_product, product_bits, root_scale, product_result_mask);
     const WideScalar imag_result = wide_arithmetic_right_shift(
         imag_product, product_bits, root_scale, product_result_mask);
-    // mulRootScalar returns a root word, not a product word.  The result is
-    // already at the root's fixed-point scale after the arithmetic shift.  A
-    // BERT QKV source ring can be l=35, while the intermediate product is
-    // 40-bit (the two 20-bit fixed-point factors); in that case the signed
-    // result must be narrowed back into Z_2^l.  Only a wider working ring
-    // needs sign extension.  Requiring extension in both directions rejects
-    // the paper's l=35 Table-6 path.
-    auto resize_signed = [&](WideScalar value) -> uint64_t {
-        if (width > product_bits) {
-            return static_cast<uint64_t>(wide_sign_extend(
-                value, product_bits, width));
+    // mulRootScalar returns a public root word, not a value in the source
+    // ring.  When the two root-scale factors fit below 64 bits, the result's
+    // sign bit is below bit 63 and must be extended before wide_mul_root
+    // interprets the word as a signed fixed-point root.  Without this,
+    // fft_scale=20 turns every negative final twiddle into a large positive
+    // root; fft_scale=40 happened to hide the bug because the product already
+    // occupied at least 64 bits.
+    auto root_word = [&](WideScalar value) -> uint64_t {
+        if (product_bits < 64) {
+            value = wide_sign_extend(value, product_bits, 64);
         }
-        return static_cast<uint64_t>(value & wide_mask(width));
+        return static_cast<uint64_t>(value);
     };
-    return {resize_signed(real_result), resize_signed(imag_result)};
+    return {root_word(real_result), root_word(imag_result)};
 }
 
 vector<WideComplex> wide_fft_inverse(
@@ -549,8 +548,8 @@ vector<HE_CKKS::scalar_t> HE_CKKS::ckks_decode_wide(
         source_scale >= 127 || target_scale < 0 || fft_scale <= 0) {
         throw invalid_argument("invalid wide CKKS decode metadata");
     }
-    const int width = working_ell > 0 ? working_ell : output_ell + 40;
-    if (width <= output_ell || width >= 127) {
+    const int width = working_ell > 0 ? working_ell : output_ell;
+    if (width <= 1 || width >= 127) {
         throw invalid_argument("invalid wide CKKS working ring width");
     }
     const int final_shift = source_scale - target_scale;

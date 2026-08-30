@@ -17,7 +17,9 @@ model=${BLB_VIT_MODEL:-$root/checkpoints/vit_b16/bolt_model.txt}
 input=${BLB_VIT_INPUT:-$root/inputs/vit_b16/bob_image.txt}
 stop_after_block=${BLB_VIT_STOP_AFTER_BLOCK:-12}
 timeout_s=${BLB_VIT_TIMEOUT_SECONDS:-21600}
-full_pause_file=${BLB_VIT_FULL_PAUSE_FILE:-/tmp/blb_vit_full_paused}
+omp_threads=${BLB_VIT_OMP_THREADS:-64}
+gpu_direct_plaintext=${BLB_VIT_GPU_DIRECT_PLAINTEXT:-1}
+gpu_linear_streams=${BLB_VIT_GPU_LINEAR_STREAMS:-8}
 
 if [[ "$output_dir" != /* ]]; then output_dir="$root/$output_dir"; fi
 if [[ "$backend" != cpu && "$backend" != gpu ]]; then
@@ -28,15 +30,28 @@ if [[ "$backend" == gpu && -z "$alice_gpu_id" ]]; then
   echo "GPU IDs are required for the gpu backend" >&2
   exit 2
 fi
-if [[ "$stop_after_block" -eq 12 && -e "$full_pause_file" ]]; then
-  echo "full 12-block run is paused while single-block performance is under diagnosis: $full_pause_file" >&2
-  exit 4
+if [[ ! "$omp_threads" =~ ^[1-9][0-9]*$ || "$omp_threads" -gt 64 ]]; then
+  echo "BLB_VIT_OMP_THREADS must be an integer in [1, 64]" >&2
+  exit 2
+fi
+if [[ "$gpu_direct_plaintext" != 0 && "$gpu_direct_plaintext" != 1 ]]; then
+  echo "BLB_VIT_GPU_DIRECT_PLAINTEXT must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ! "$gpu_linear_streams" =~ ^[1-9][0-9]*$ ||
+      "$gpu_linear_streams" -gt 16 ]]; then
+  echo "BLB_VIT_GPU_LINEAR_STREAMS must be an integer in [1, 16]" >&2
+  exit 2
 fi
 for path in "$binary" "$model" "$input"; do
   if [[ ! -e "$path" ]]; then echo "missing required path: $path" >&2; exit 2; fi
 done
 
 mkdir -p "$output_dir"
+# The secure parties run as root inside the reference container, while the
+# float/fixed-clear verifier is intentionally run from the mounted host tree.
+# Keep the selected result directory writable by that verifier.
+chmod a+rwx "$output_dir"
 alice_pid=
 bob_pid=
 qdisc_owned=0
@@ -75,10 +90,13 @@ tc qdisc show dev lo > "$output_dir/qdisc_active.txt"
   echo "network=1Gbps/0.3ms_RTT"
   echo "alice_cpus=0-47,96-111"
   echo "bob_cpus=48-95,144-159"
-  echo "threads_per_party=64"
+  echo "omp_threads_per_party=$omp_threads"
+  echo "mpc_workers_per_party=64"
   if [[ "$backend" == gpu ]]; then
     echo "alice_gpu_id=$alice_gpu_id"
     echo "bob_gpu_id=$bob_gpu_id"
+    echo "gpu_direct_plaintext=$gpu_direct_plaintext"
+    echo "gpu_linear_streams=$gpu_linear_streams"
     nvidia-smi -i "$alice_gpu_id" --query-gpu=index,name,uuid,memory.total,memory.free,utilization.gpu --format=csv,noheader
     if [[ "$bob_gpu_id" != "$alice_gpu_id" ]]; then
       nvidia-smi -i "$bob_gpu_id" --query-gpu=index,name,uuid,memory.total,memory.free,utilization.gpu --format=csv,noheader
@@ -87,11 +105,15 @@ tc qdisc show dev lo > "$output_dir/qdisc_active.txt"
   lscpu | grep -E 'Model name|Socket\(s\)|Core\(s\) per socket|Thread\(s\) per core'
 } > "$output_dir/environment.txt"
 
-alice_env=(env OMP_NUM_THREADS=64 OMP_DYNAMIC=FALSE)
-bob_env=(env OMP_NUM_THREADS=64 OMP_DYNAMIC=FALSE)
+alice_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE)
+bob_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE)
 if [[ "$backend" == gpu ]]; then
-  alice_env+=(CUDA_VISIBLE_DEVICES="$alice_gpu_id")
-  bob_env+=(CUDA_VISIBLE_DEVICES="$bob_gpu_id")
+  alice_env+=(CUDA_VISIBLE_DEVICES="$alice_gpu_id"
+    BLB_VIT_GPU_DIRECT_PLAINTEXT="$gpu_direct_plaintext"
+    BLB_VIT_GPU_LINEAR_STREAMS="$gpu_linear_streams")
+  bob_env+=(CUDA_VISIBLE_DEVICES="$bob_gpu_id"
+    BLB_VIT_GPU_DIRECT_PLAINTEXT="$gpu_direct_plaintext"
+    BLB_VIT_GPU_LINEAR_STREAMS="$gpu_linear_streams")
 fi
 
 date --iso-8601=ns > "$output_dir/start.txt"
@@ -124,6 +146,18 @@ tc -s qdisc show dev lo > "$output_dir/qdisc_end.txt"
 date --iso-8601=ns > "$output_dir/end.txt"
 printf 'alice_rc=%s\nbob_rc=%s\n' "$alice_rc" "$bob_rc" > "$output_dir/status.txt"
 if [[ $alice_rc -ne 0 || $bob_rc -ne 0 ]]; then exit 1; fi
+
+# Tensor/noise diagnostics intentionally stop before the profiler writes the
+# end-to-end latency CSV files.  The two protocol parties have already exited
+# successfully, so do not misreport the expected absence of those CSV files as
+# a failed secure run.
+if [[ -n "${BLB_QKV_AGGREGATE:-}" ||
+      -n "${BLB_VIT_DIAGNOSTIC_STOP_AFTER_QK:-}" ||
+      -n "${BLB_VIT_DIAGNOSTIC_STOP_AFTER_SOFTMAX:-}" ||
+      -n "${BLB_VIT_DIAGNOSTIC_SOFTMAX_V_PATH:-}" ]]; then
+  echo "BLB_VIT_RUN status=PASS_DIAGNOSTIC backend=$backend output=$output_dir"
+  exit 0
+fi
 
 python3.7 "$root/vit_b16/scripts/summarize_blb_vit_baseline.py" \
   --run-dir "$output_dir"

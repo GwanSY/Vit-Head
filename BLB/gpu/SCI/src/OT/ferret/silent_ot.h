@@ -701,7 +701,8 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
           for (int h = 0; h < num_hashes; h++) {
             pad[(k - j) * num_hashes + h] = sci::xorBlocks(rcm_data[ot_idx], sci::toBlock(h));
             pad[pad1_offset + (k - j) * num_hashes + h] =
-                sci::xorBlocks(pad[(k - j) * num_hashes + h], block_s);
+                sci::xorBlocks(pad[(k - j) * num_hashes + h],
+                               ferret->Delta);
           }
         }
         if (bsize <= (dim - j) * num_hashes)
@@ -923,7 +924,8 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         for (int h = 0; h < num_hashes; h++) {
           pad[(k - j) * num_hashes + h] = sci::xorBlocks(rcm_data[ot_idx], sci::toBlock(h));
           pad[pad1_offset + (k - j) * num_hashes + h] =
-              sci::xorBlocks(pad[(k - j) * num_hashes + h], block_s);
+              sci::xorBlocks(pad[(k - j) * num_hashes + h],
+                             ferret->Delta);
         }
       }
       if (bsize <= (dim - j) * num_hashes)

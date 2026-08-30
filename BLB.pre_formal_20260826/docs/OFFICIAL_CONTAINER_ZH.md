@@ -17,7 +17,7 @@ crpi-hxmgk7l66ku6bx2x.cn-hangzhou.personal.cr.aliyuncs.com/tianshixu/ppdl:blbv1
 所有文件只落到当前 BLB：
 
 ```bash
-cd /home/dm/mind/MIND_code/Pencil/BLB
+cd /home/dm/mind/Vit-Head/BLB.pre_formal_20260826
 bash repro/fetch_official_artifacts.sh \
   2>&1 | tee outputs/zenodo_fetch.log
 ```
@@ -74,7 +74,7 @@ uncompressed size: 18,176,988,884 bytes
 使用 Zenodo tarball：
 
 ```bash
-cd /home/dm/mind/MIND_code/Pencil/BLB
+cd /home/dm/mind/Vit-Head/BLB.pre_formal_20260826
 bash repro/load_official_container.sh \
   2>&1 | tee outputs/container_load.log
 docker image ls
@@ -98,7 +98,7 @@ docker pull \
 newgrp docker
 
 # 2. 进入 BLB
-cd /home/dm/mind/MIND_code/Pencil/BLB
+cd /home/dm/mind/Vit-Head/BLB.pre_formal_20260826
 
 # 3. 进入官方容器；同名容器已存在时会自动重新进入
 CUDA_ROOT=/usr/local/cuda-12.3 \
@@ -199,7 +199,7 @@ docker run --rm --gpus all \
 为了遵守“只修改和构建当前 BLB”，正式运行不得使用容器内 `/home/CKKS-MPC` 的源码、库或构建产物。下面的脚本只把容器当作工具链环境，将当前 BLB 挂载到 `/workspace/BLB` 并把它设为工作目录：
 
 ```bash
-cd /home/dm/mind/MIND_code/Pencil/BLB
+cd /home/dm/mind/Vit-Head/BLB.pre_formal_20260826
 PULL_IMAGE=0 bash repro/run_official_container.sh
 ```
 
@@ -217,7 +217,7 @@ readlink -f /workspace/BLB
 镜像内包含 MRPC、RTE、SST-2、STS-B 四套真实 BERT-base 权重。本轮选择与当前二分类设置匹配的 MRPC，仅将模型数据和输入复制到：
 
 ```text
-/home/dm/mind/MIND_code/Pencil/BLB/checkpoints/official-blb-mrpc/weights_txt
+/home/dm/mind/Vit-Head/BLB.pre_formal_20260826/checkpoints/official-blb-mrpc/weights_txt
 ```
 
 未复制或引用容器内源码、库、脚本和构建产物。导入目录约 403 MB、1017 个文件，包含 12 层 encoder、pooler、classifier、输入、mask 和 labels。manifest 命令：

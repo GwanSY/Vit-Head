@@ -24,6 +24,16 @@ cmake -S "$root/gpu/SCI" -B "$root/build/gpu" \
   -DCMAKE_CUDA_FLAGS=-arch=sm_80 \
   -DEigen3_DIR=/usr/local/share/eigen3/cmake
 
+# Phantom is installed into the build tree when SCI is first configured.
+# Rebuild that vendored dependency here so ViT-only additive encoder APIs do
+# not leave a stale installed header/library on incremental builds. Existing
+# Phantom encode callers (including BERT) keep their original checked path.
+if [[ -d "$root/build/gpu/thirdparty/phantom-build" ]]; then
+  cmake --build "$root/build/gpu/thirdparty/phantom-build" \
+    --target Phantom --parallel "$jobs"
+  cmake --install "$root/build/gpu/thirdparty/phantom-build"
+fi
+
 cmake --build "$root/build/gpu" \
   --target ckks_vit_b16_main --parallel "$jobs"
 

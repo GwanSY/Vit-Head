@@ -1770,8 +1770,16 @@ vector<FixArray> FPMath::layer_norm_fix(const vector<FixArray>& x, FixArray& w, 
   // 开始计算方差(x-x_avg)^2，这里位宽是l+s，而不是l+l
   FixArray x_flat_avg_square = fix->mul(x_flat_avg, x_flat_avg, ell + s, msb_x_avg.data, msb_x_avg.data);
   //point5.5
-  
+
+  // The signed LinearOT product only guarantees the lower ell+s-1 bits when
+  // the output is wider than either input; its redundant top sign bit is not
+  // defined.  A square is public-domain nonnegative, so reduce that bit before
+  // truncation and zero-extend the exact fixed-point result back to ell bits.
+  x_flat_avg_square = fix->reduce(x_flat_avg_square, ell + s - 1);
   x_flat_avg_square = fix->truncate_reduce(x_flat_avg_square, s);
+  x_flat_avg_square.signed_ = false;
+  x_flat_avg_square = fix->extend(x_flat_avg_square, ell);
+  x_flat_avg_square.signed_ = true;
   //point6
   vector<FixArray> square_group(N);
   for(int i = 0; i < N; i++){
@@ -1857,8 +1865,16 @@ std::map<char*,FixArray> FPMath::layer_norm_fix_part1(const vector<FixArray>& x,
   // 开始计算方差(x-x_avg)^2，这里位宽是l+s，而不是l+l
   FixArray x_flat_avg_square = fix->mul(x_flat_avg, x_flat_avg, ell + s, msb_x_avg.data, msb_x_avg.data);
   //point5.5
-  
+
+  // Match layer_norm_fix above.  The LinearOT square has one redundant top
+  // sign bit at the ell+s product width; a square is nonnegative, so remove
+  // that bit before the paper's s-bit truncation and restore the ell-bit
+  // representation by zero extension.
+  x_flat_avg_square = fix->reduce(x_flat_avg_square, ell + s - 1);
   x_flat_avg_square = fix->truncate_reduce(x_flat_avg_square, s);
+  x_flat_avg_square.signed_ = false;
+  x_flat_avg_square = fix->extend(x_flat_avg_square, ell);
+  x_flat_avg_square.signed_ = true;
   //point6
   vector<FixArray> square_group(N);
   for(int i = 0; i < N; i++){
@@ -1883,6 +1899,10 @@ std::map<char*,FixArray> FPMath::layer_norm_fix_part1(const vector<FixArray>& x,
   }
   result["x_flat_avg"] = x_flat_avg;
   result["sigma_flat"] = sigma_flat;
+  if (getenv("BLB_LN_COMPONENTS_AGGREGATE") != nullptr) {
+    result["centered_square"] = x_flat_avg_square;
+    result["variance"] = square_sum;
+  }
   result["w"] = w;
   result["b"] = b;
   return result;

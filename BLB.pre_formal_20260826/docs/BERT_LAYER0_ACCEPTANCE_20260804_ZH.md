@@ -3,7 +3,7 @@
 > 2026-08-05 更新：官方 BLB 容器中的 MRPC BERT-base 12 层权重和 128×768 输入已复制到 `checkpoints/official-blb-mrpc/weights_txt`，shape/packing/SHA256 manifest PASS；layer 0 已按官方 `bert.py` 的 post-norm 顺序接入真实输入、两组 LayerNorm 参数、attention/FFN residual 和三 oracle 比较入口。下文早期 checkpoint/输入 BLOCKED 是历史记录；当前阻塞是官方容器五块 MSE 实测和 pooling/classifier。
 
 日期：2026-08-04  
-唯一工作根目录：`/home/dm/mind/MIND_code/Pencil/BLB`  
+唯一工作根目录：`/home/dm/mind/Vit-Head/BLB.pre_formal_20260826`
 总状态：`BLOCKED`  
 `formal_ready=no`
 
@@ -13,7 +13,7 @@ smoke target 已删除，任何历史 smoke 结果均不计入本报告。
 ## 实际执行命令
 
 ```bash
-cd /home/dm/mind/MIND_code/Pencil/BLB
+cd /home/dm/mind/Vit-Head/BLB.pre_formal_20260826
 
 CMAKE_BIN=/usr/bin/cmake \
 CUDA_COMPILER=/usr/local/cuda-12.3/bin/nvcc \

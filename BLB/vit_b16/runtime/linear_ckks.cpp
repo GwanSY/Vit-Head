@@ -2,12 +2,34 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
 
 namespace {
+
+bool use_direct_device_plaintext_packing(const HE_CKKS &he) {
+    if (!he.is_gpu_enable()) return false;
+    const char *value = std::getenv("BLB_VIT_GPU_DIRECT_PLAINTEXT");
+    if (value == nullptr || std::string(value) == "1") return true;
+    if (std::string(value) == "0") return false;
+    throw std::runtime_error(
+        "BLB_VIT_GPU_DIRECT_PLAINTEXT must be 0 or 1");
+}
+
+int direct_device_plaintext_streams() {
+    const char *value = std::getenv("BLB_VIT_GPU_LINEAR_STREAMS");
+    if (value == nullptr) return 8;
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 1 || parsed > 16) {
+        throw std::runtime_error(
+            "BLB_VIT_GPU_LINEAR_STREAMS must be an integer in [1, 16]");
+    }
+    return static_cast<int>(parsed);
+}
 
 // Phantom accepts only device plaintexts.  They are created for one evaluator
 // call and deliberately do not survive the call or retain a cross-layer
@@ -57,15 +79,23 @@ PhantomPlaintext copy_plaintext_to_device(HE_CKKS &he,
 }
 
 PhantomPlaintext encode_semantic_plaintext_to_device(
-    HE_CKKS &he, const SemanticPlaintext &source, double scale,
-    std::size_t seal_chain) {
+    HE_CKKS &he, PhantomCKKSEncoder &encoder,
+    const SemanticPlaintext &source, double scale, std::size_t seal_chain) {
     if (source.size() != he.num_slots || !std::isfinite(scale) || scale <= 0.0)
         throw std::runtime_error(
             "Phantom packing: invalid semantic plaintext metadata");
     PhantomPlaintext result;
-    he.dencoder->encode(*he.dcontext, source, scale, result,
-                        phantom_chain_for_seal_chain(he, seal_chain));
+    encoder.encode_trusted(*he.dcontext, source, scale, result,
+                           phantom_chain_for_seal_chain(he, seal_chain));
     return result;
+}
+
+
+PhantomPlaintext encode_semantic_plaintext_to_device(
+    HE_CKKS &he, const SemanticPlaintext &source, double scale,
+    std::size_t seal_chain) {
+    return encode_semantic_plaintext_to_device(
+        he, *he.dencoder, source, scale, seal_chain);
 }
 
 DevicePlainMatrix encode_semantic_matrix_to_device(
@@ -819,10 +849,11 @@ PreprocessParams_1 Linear_ckks::params_preprocessing_ct_ct(
     pp.weight_scale = weight_scale;
     pp.bias_scale = bias_scale;
     pp.input_scale = input_scale;
-    // Preserve BLB's audited SEAL-plaintext -> Phantom device transfer.
-    // Direct Phantom semantic packing duplicates the full FFN plaintext set
-    // on DEVICE and exceeds an A100 80 GB before the existing FFN1 kernel.
-    pp.device_semantic_packed = false;
+    // The upstream GPU benchmark encodes its (placeholder) plaintext directly
+    // with Phantom.  Keep an opt-in real-checkpoint equivalent so the ViT
+    // adapter can avoid copying a full SEAL/RNS plaintext over PCIe for every
+    // ct-pt multiply.  CPU continues to use the original SEAL representation.
+    pp.device_semantic_packed = use_direct_device_plaintext_packing(*he);
 
     cout << "filter.h, filter.w:" << data.filter_h << "," << data.filter_w << endl;
     
@@ -896,9 +927,7 @@ PreprocessParams_2 Linear_ckks::params_preprocessing_ct_pt(
     pp.weight_scale = weight_scale;
     pp.bias_scale = bias_scale;
     pp.input_scale = input_scale;
-    // Use the same audited host-packed plaintexts for both backends.  DEVICE
-    // copies are scoped to the evaluator call and do not change the packing.
-    pp.device_semantic_packed = false;
+    pp.device_semantic_packed = use_direct_device_plaintext_packing(*he);
 
     vector<vector<uint64_t>> matrix_mod_p1_storage(
         common_dim, vector<uint64_t>(output_dim / 2));
@@ -1766,7 +1795,7 @@ void Linear_ckks::bert_cipher_plain_bsgs(
     const DevicePreprocessParams_1 *device_pp = nullptr;
 #ifdef BLB_HAS_HE_GPU
     DevicePreprocessParams_1 device_params;
-    if (loc == LOCATION::DEVICE) {
+    if (loc == LOCATION::DEVICE && !pp.device_semantic_packed) {
         const auto copy_start = std::chrono::steady_clock::now();
         device_params = copy_qkv_params_to_device(*he, pp);
         const double device_prepare_seconds = std::chrono::duration<double>(
@@ -1782,6 +1811,20 @@ void Linear_ckks::bert_cipher_plain_bsgs(
         throw runtime_error(
             "formal QKV DEVICE backend was not compiled with USE_HE_GPU=ON");
     }
+#endif
+
+#ifdef BLB_HAS_HE_GPU
+    double qkv_encode_seconds = 0.0;
+    auto encode_qkv_plain = [&](PhantomCKKSEncoder &encoder,
+                                const SemanticPlaintext &slots, double scale,
+                                std::size_t chain, double &elapsed_seconds) {
+        const auto encode_start = std::chrono::steady_clock::now();
+        auto plain = encode_semantic_plaintext_to_device(
+            *he, encoder, slots, scale, chain);
+        elapsed_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - encode_start).count();
+        return plain;
+    };
 #endif
 
     // begin computation
@@ -1934,6 +1977,8 @@ void Linear_ckks::bert_cipher_plain_bsgs(
     }
     } else {
     // ******************** GPU ********************
+    const int stream_count = pp.device_semantic_packed
+        ? direct_device_plaintext_streams() : 1;
     for (int packing_index = 0; packing_index < PACKING_NUM/2; packing_index++) {
         //compute matrix multiplication
         vector<vector<UnifiedCiphertext>> temp_results(temp_result_size * 3, vector<UnifiedCiphertext>(n2, UnifiedCiphertext(loc)));
@@ -1941,7 +1986,29 @@ void Linear_ckks::bert_cipher_plain_bsgs(
         vector<vector<UnifiedCiphertext>> temp_results_k(temp_result_size, vector<UnifiedCiphertext>(n2 * cts.size(), UnifiedCiphertext(loc)));
         vector<vector<UnifiedCiphertext>> temp_results_v(temp_result_size, vector<UnifiedCiphertext>(n2 * cts.size(), UnifiedCiphertext(loc)));
 
-        for (int k = 0; k < cts.size() * n2; k++) {
+#ifdef BLB_HAS_HE_GPU
+        if (stream_count > 1) {
+            const auto error = cudaStreamSynchronize(cudaStreamPerThread);
+            if (error != cudaSuccess) {
+                throw runtime_error(
+                    string("QKV pre-stream synchronization failed: ") +
+                    cudaGetErrorString(error));
+            }
+        }
+        vector<double> stream_encode_seconds(stream_count, 0.0);
+        vector<int> stream_errors(stream_count,
+                                  static_cast<int>(cudaSuccess));
+#pragma omp parallel num_threads(stream_count) if(stream_count > 1)
+        {
+            const int stream_id = omp_get_thread_num();
+            std::unique_ptr<PhantomCKKSEncoder> stream_encoder;
+            PhantomCKKSEncoder *encoder = he->dencoder;
+            if (stream_count > 1) {
+                stream_encoder.reset(new PhantomCKKSEncoder(*he->dcontext));
+                encoder = stream_encoder.get();
+            }
+#pragma omp for schedule(static)
+        for (int k = 0; k < static_cast<int>(cts.size()) * n2; k++) {
             int j = k / cts.size();
             int ct_i = k % cts.size();
             for (int l = 0; l < data.image_size * data.filter_w * 2 / data.slot_count; l++) {
@@ -1954,12 +2021,72 @@ void Linear_ckks::bert_cipher_plain_bsgs(
                     UnifiedCiphertext ct_r_v(loc);
 
                     const size_t diag = l * n1 * n2 + j * n1 + i;
-                    const auto &wq_l = device_pp->wq_pack[packing_index].first[diag][ct_i];
-                    const auto &wq_r = device_pp->wq_pack[packing_index].second[diag][ct_i];
-                    const auto &wk_l = device_pp->wk_pack[packing_index].first[diag][ct_i];
-                    const auto &wk_r = device_pp->wk_pack[packing_index].second[diag][ct_i];
-                    const auto &wv_l = device_pp->wv_pack[packing_index].first[diag][ct_i];
-                    const auto &wv_r = device_pp->wv_pack[packing_index].second[diag][ct_i];
+                    PhantomPlaintext owned_wq_l, owned_wq_r;
+                    PhantomPlaintext owned_wk_l, owned_wk_r;
+                    PhantomPlaintext owned_wv_l, owned_wv_r;
+                    const PhantomPlaintext *wq_l_ptr;
+                    const PhantomPlaintext *wq_r_ptr;
+                    const PhantomPlaintext *wk_l_ptr;
+                    const PhantomPlaintext *wk_r_ptr;
+                    const PhantomPlaintext *wv_l_ptr;
+                    const PhantomPlaintext *wv_r_ptr;
+                    if (pp.device_semantic_packed) {
+                        owned_wq_l = encode_qkv_plain(
+                            *encoder,
+                            pp.device_wq_pack[packing_index].first[diag][ct_i],
+                            pp.weight_scale, pp.weight_chain,
+                            stream_encode_seconds[stream_id]);
+                        owned_wq_r = encode_qkv_plain(
+                            *encoder,
+                            pp.device_wq_pack[packing_index].second[diag][ct_i],
+                            pp.weight_scale, pp.weight_chain,
+                            stream_encode_seconds[stream_id]);
+                        owned_wk_l = encode_qkv_plain(
+                            *encoder,
+                            pp.device_wk_pack[packing_index].first[diag][ct_i],
+                            pp.weight_scale, pp.weight_chain,
+                            stream_encode_seconds[stream_id]);
+                        owned_wk_r = encode_qkv_plain(
+                            *encoder,
+                            pp.device_wk_pack[packing_index].second[diag][ct_i],
+                            pp.weight_scale, pp.weight_chain,
+                            stream_encode_seconds[stream_id]);
+                        owned_wv_l = encode_qkv_plain(
+                            *encoder,
+                            pp.device_wv_pack[packing_index].first[diag][ct_i],
+                            pp.weight_scale, pp.weight_chain,
+                            stream_encode_seconds[stream_id]);
+                        owned_wv_r = encode_qkv_plain(
+                            *encoder,
+                            pp.device_wv_pack[packing_index].second[diag][ct_i],
+                            pp.weight_scale, pp.weight_chain,
+                            stream_encode_seconds[stream_id]);
+                        wq_l_ptr = &owned_wq_l;
+                        wq_r_ptr = &owned_wq_r;
+                        wk_l_ptr = &owned_wk_l;
+                        wk_r_ptr = &owned_wk_r;
+                        wv_l_ptr = &owned_wv_l;
+                        wv_r_ptr = &owned_wv_r;
+                    } else {
+                        wq_l_ptr = &device_pp->wq_pack[packing_index]
+                                          .first[diag][ct_i];
+                        wq_r_ptr = &device_pp->wq_pack[packing_index]
+                                          .second[diag][ct_i];
+                        wk_l_ptr = &device_pp->wk_pack[packing_index]
+                                          .first[diag][ct_i];
+                        wk_r_ptr = &device_pp->wk_pack[packing_index]
+                                          .second[diag][ct_i];
+                        wv_l_ptr = &device_pp->wv_pack[packing_index]
+                                          .first[diag][ct_i];
+                        wv_r_ptr = &device_pp->wv_pack[packing_index]
+                                          .second[diag][ct_i];
+                    }
+                    const auto &wq_l = *wq_l_ptr;
+                    const auto &wq_r = *wq_r_ptr;
+                    const auto &wk_l = *wk_l_ptr;
+                    const auto &wk_r = *wk_r_ptr;
+                    const auto &wv_l = *wv_l_ptr;
+                    const auto &wv_r = *wv_r_ptr;
                     require_device_plain_compatible(
                         rotatedIR[ct_i][i], wq_l,
                         CkksCtPtOperation::Multiply, "QKV.wq.left");
@@ -2008,14 +2135,31 @@ void Linear_ckks::bert_cipher_plain_bsgs(
                     // cout << "add done" << endl;
                 }
 
-                ++rescale_count;
                 he->devaluator->rescale_to_next_inplace(temp_results_q[l][k]);
-                ++rescale_count;
                 he->devaluator->rescale_to_next_inplace(temp_results_k[l][k]);
-                ++rescale_count;
                 he->devaluator->rescale_to_next_inplace(temp_results_v[l][k]);
             }
         }
+            if (stream_count > 1) {
+                stream_errors[stream_id] = static_cast<int>(
+                    cudaStreamSynchronize(cudaStreamPerThread));
+            }
+        }
+        for (int error : stream_errors) {
+            if (error != static_cast<int>(cudaSuccess)) {
+                throw runtime_error(
+                    string("QKV worker-stream synchronization failed: ") +
+                    cudaGetErrorString(static_cast<cudaError_t>(error)));
+            }
+        }
+        qkv_encode_seconds += *std::max_element(
+            stream_encode_seconds.begin(), stream_encode_seconds.end());
+        rescale_count += static_cast<uint64_t>(cts.size()) * n2 *
+            temp_result_size * 3;
+#else
+        throw runtime_error(
+            "formal QKV DEVICE backend was not compiled with USE_HE_GPU=ON");
+#endif
         // cout << "part 1 ok" << endl;
         for (int j = 0; j < n2; j++) {
             for (int ct_i = 0; ct_i < cts.size(); ct_i++) {
@@ -2061,9 +2205,34 @@ void Linear_ckks::bert_cipher_plain_bsgs(
             auto &q_result = result[l + packing_index * data.image_size * data.filter_w * 2 / data.slot_count];
             auto &k_result = result[l + packing_index * data.image_size * data.filter_w * 2 / data.slot_count + data.image_size * data.filter_w * PACKING_NUM / data.slot_count];
             auto &v_result = result[l + packing_index * data.image_size * data.filter_w * 2 / data.slot_count + data.image_size * data.filter_w * PACKING_NUM * 2 / data.slot_count];
-            const auto &bq = device_pp->bq_pack[packing_index][l];
-            const auto &bk = device_pp->bk_pack[packing_index][l];
-            const auto &bv = device_pp->bv_pack[packing_index][l];
+            PhantomPlaintext owned_bq, owned_bk, owned_bv;
+            const PhantomPlaintext *bq_ptr;
+            const PhantomPlaintext *bk_ptr;
+            const PhantomPlaintext *bv_ptr;
+            if (pp.device_semantic_packed) {
+                owned_bq = encode_qkv_plain(
+                    *he->dencoder,
+                    pp.device_bq_pack[packing_index][l], pp.bias_scale,
+                    pp.bias_chain, qkv_encode_seconds);
+                owned_bk = encode_qkv_plain(
+                    *he->dencoder,
+                    pp.device_bk_pack[packing_index][l], pp.bias_scale,
+                    pp.bias_chain, qkv_encode_seconds);
+                owned_bv = encode_qkv_plain(
+                    *he->dencoder,
+                    pp.device_bv_pack[packing_index][l], pp.bias_scale,
+                    pp.bias_chain, qkv_encode_seconds);
+                bq_ptr = &owned_bq;
+                bk_ptr = &owned_bk;
+                bv_ptr = &owned_bv;
+            } else {
+                bq_ptr = &device_pp->bq_pack[packing_index][l];
+                bk_ptr = &device_pp->bk_pack[packing_index][l];
+                bv_ptr = &device_pp->bv_pack[packing_index][l];
+            }
+            const auto &bq = *bq_ptr;
+            const auto &bk = *bk_ptr;
+            const auto &bv = *bv_ptr;
             require_device_plain_compatible(
                 q_result, bq, CkksCtPtOperation::Add, "QKV.bq");
             require_device_plain_compatible(
@@ -2077,7 +2246,14 @@ void Linear_ckks::bert_cipher_plain_bsgs(
     }
     }
 #ifdef BLB_HAS_HE_GPU
-    if (loc == LOCATION::DEVICE) {
+    if (loc == LOCATION::DEVICE && pp.device_semantic_packed) {
+        plaintext_device_encode_time += qkv_encode_seconds;
+        cout << "CKKS_DEVICE_STREAMS op=QKV streams="
+             << direct_device_plaintext_streams()
+             << " critical_encode_ms=" << qkv_encode_seconds * 1000.0
+             << endl;
+    }
+    if (loc == LOCATION::DEVICE && device_pp != nullptr) {
         device_pp = nullptr;
         plaintext_device_release_time +=
             release_device_plaintexts(device_params, "QKV");
@@ -2188,7 +2364,7 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
     const DevicePreprocessParams_2 *device_pp = nullptr;
 #ifdef BLB_HAS_HE_GPU
     DevicePreprocessParams_2 device_params;
-    if (loc == LOCATION::DEVICE) {
+    if (loc == LOCATION::DEVICE && !use_device_semantics) {
         const auto copy_start = std::chrono::steady_clock::now();
         device_params = copy_linear_params_to_device(*he, pp);
         const double device_prepare_seconds = std::chrono::duration<double>(
@@ -2204,6 +2380,21 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
         throw runtime_error(
             "formal output/FFN DEVICE backend was not compiled with USE_HE_GPU=ON");
     }
+#endif
+
+#ifdef BLB_HAS_HE_GPU
+    double linear_encode_seconds = 0.0;
+    auto encode_linear_plain = [&](PhantomCKKSEncoder &encoder,
+                                   const SemanticPlaintext &slots,
+                                   double scale, std::size_t chain,
+                                   double &elapsed_seconds) {
+        const auto encode_start = std::chrono::steady_clock::now();
+        auto plain = encode_semantic_plaintext_to_device(
+            *he, encoder, slots, scale, chain);
+        elapsed_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - encode_start).count();
+        return plain;
+    };
 #endif
 
     // start computation
@@ -2259,7 +2450,10 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
     for (int k = 0; k < cts.size() * n2; k++) {
         int j = k / cts.size();
         int ct_i = k % cts.size();
-        #pragma omp parallel for
+        // Keep the original BLB BSGS2 schedule: the outer loop owns the
+        // parallelism.  A nested default-sized OpenMP team here multiplies
+        // cts.size()*n2 by OMP_NUM_THREADS on the CPU (for ViT this can
+        // create thousands of threads and exhaust memory).
         for (int l = 0; l < data.image_size * data.filter_w / data.slot_count; l++) {
             for (int i = 0; i < n1; i++) {
                 Ciphertext ct1_l;
@@ -2280,7 +2474,30 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
     }
     } else {
     // ******************** GPU ********************
-    for (int k = 0; k < cts.size() * n2; k++) {
+    const int stream_count =
+        use_device_semantics ? direct_device_plaintext_streams() : 1;
+#ifdef BLB_HAS_HE_GPU
+    if (stream_count > 1) {
+        const auto error = cudaStreamSynchronize(cudaStreamPerThread);
+        if (error != cudaSuccess) {
+            throw runtime_error(
+                string("BSGS2 pre-stream synchronization failed: ") +
+                cudaGetErrorString(error));
+        }
+    }
+    vector<double> stream_encode_seconds(stream_count, 0.0);
+    vector<int> stream_errors(stream_count, static_cast<int>(cudaSuccess));
+#pragma omp parallel num_threads(stream_count) if(stream_count > 1)
+    {
+        const int stream_id = omp_get_thread_num();
+        std::unique_ptr<PhantomCKKSEncoder> stream_encoder;
+        PhantomCKKSEncoder *encoder = he->dencoder;
+        if (stream_count > 1) {
+            stream_encoder.reset(new PhantomCKKSEncoder(*he->dcontext));
+            encoder = stream_encoder.get();
+        }
+#pragma omp for schedule(static)
+    for (int k = 0; k < static_cast<int>(cts.size()) * n2; k++) {
         int j = k / cts.size();
         int ct_i = k % cts.size();
         for (int l = 0; l < data.image_size * data.filter_w / data.slot_count; l++) {
@@ -2288,10 +2505,30 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
                 UnifiedCiphertext ct1_l(loc);
                 UnifiedCiphertext ct1_r(loc);
                 const size_t diag = l * n1 * n2 + j * n1 + i;
-                const auto &weight_l =
-                    device_pp->cross_mat_single.first[diag][ct_i];
-                const auto &weight_r =
-                    device_pp->cross_mat_single.second[diag][ct_i];
+                PhantomPlaintext owned_weight_l, owned_weight_r;
+                const PhantomPlaintext *weight_l_ptr;
+                const PhantomPlaintext *weight_r_ptr;
+                if (use_device_semantics) {
+                    owned_weight_l = encode_linear_plain(
+                        *encoder,
+                        pp.device_cross_mat_single.first[diag][ct_i],
+                        pp.weight_scale, pp.target_chain,
+                        stream_encode_seconds[stream_id]);
+                    owned_weight_r = encode_linear_plain(
+                        *encoder,
+                        pp.device_cross_mat_single.second[diag][ct_i],
+                        pp.weight_scale, pp.target_chain,
+                        stream_encode_seconds[stream_id]);
+                    weight_l_ptr = &owned_weight_l;
+                    weight_r_ptr = &owned_weight_r;
+                } else {
+                    weight_l_ptr =
+                        &device_pp->cross_mat_single.first[diag][ct_i];
+                    weight_r_ptr =
+                        &device_pp->cross_mat_single.second[diag][ct_i];
+                }
+                const auto &weight_l = *weight_l_ptr;
+                const auto &weight_r = *weight_r_ptr;
                 require_device_plain_compatible(
                     rotatedIR[ct_i][i], weight_l,
                     CkksCtPtOperation::Multiply, "BSGS2.weight.left");
@@ -2313,6 +2550,30 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
             }
         }
     }
+        if (stream_count > 1) {
+            stream_errors[stream_id] = static_cast<int>(
+                cudaStreamSynchronize(cudaStreamPerThread));
+        }
+    }
+    for (int error : stream_errors) {
+        if (error != static_cast<int>(cudaSuccess)) {
+            throw runtime_error(
+                string("BSGS2 worker-stream synchronization failed: ") +
+                cudaGetErrorString(static_cast<cudaError_t>(error)));
+        }
+    }
+    const double critical_encode_seconds = *std::max_element(
+        stream_encode_seconds.begin(), stream_encode_seconds.end());
+    linear_encode_seconds += critical_encode_seconds;
+    if (use_device_semantics) {
+        cout << "CKKS_DEVICE_STREAMS op=BSGS2 streams=" << stream_count
+             << " critical_encode_ms=" << critical_encode_seconds * 1000.0
+             << endl;
+    }
+#else
+    throw runtime_error(
+        "formal output/FFN DEVICE backend was not compiled with USE_HE_GPU=ON");
+#endif
     }
 
     // cout << "OK2" << endl;
@@ -2383,7 +2644,18 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
                 he->devaluator->add_inplace(result[l], temp_rot_ct);
             }
         }
-        const auto &bias = device_pp->cross_bias_single[l];
+        PhantomPlaintext owned_bias;
+        const PhantomPlaintext *bias_ptr;
+        if (use_device_semantics) {
+            owned_bias = encode_linear_plain(
+                *he->dencoder,
+                pp.device_cross_bias_single[l], pp.bias_scale,
+                pp.target_chain, linear_encode_seconds);
+            bias_ptr = &owned_bias;
+        } else {
+            bias_ptr = &device_pp->cross_bias_single[l];
+        }
+        const auto &bias = *bias_ptr;
         require_device_plain_compatible(
             result[l], bias, CkksCtPtOperation::Add, "BSGS2.bias");
         he->devaluator->add_plain_inplace(result[l], bias);
@@ -2416,7 +2688,10 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
          << result.size() << endl;
     }
 #ifdef BLB_HAS_HE_GPU
-    if (loc == LOCATION::DEVICE) {
+    if (loc == LOCATION::DEVICE && use_device_semantics) {
+        plaintext_device_encode_time += linear_encode_seconds;
+    }
+    if (loc == LOCATION::DEVICE && device_pp != nullptr) {
         device_pp = nullptr;
         plaintext_device_release_time +=
             release_device_plaintexts(device_params, "BSGS2");

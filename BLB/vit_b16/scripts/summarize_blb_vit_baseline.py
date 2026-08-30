@@ -226,7 +226,9 @@ def main() -> None:
         stream.write(f"- D2H internal counter: **{float(summary['d2h_instrumented_s']):.6f} s**\n")
         stream.write(f"- MPC nonlinear wall buckets: **{float(summary['mpc_nonlinear_bucket_s']):.6f} s**\n")
         stream.write("\nThe nonlinear bucket is diagnostic and overlaps the prescribed HE/conversion boundaries inside LayerNorm; it is not added to the other counters.\n\n")
-        stream.write("| Stage | 12-block wall time (s) | Alice+Bob send bytes |\n")
+        stream.write(
+            f"| Stage | {len(block_ids)}-block wall time (s) | "
+            "Alice+Bob send bytes |\n")
         stream.write("|---|---:|---:|\n")
         for stage in STAGE_NAMES:
             stream.write(f"| {stage} | {per_stage_wall[stage] / 1000.0:.6f} | {per_stage_bytes[stage]} |\n")

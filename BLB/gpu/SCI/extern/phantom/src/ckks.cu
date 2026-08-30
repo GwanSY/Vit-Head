@@ -68,7 +68,8 @@ PhantomCKKSEncoder::PhantomCKKSEncoder(const PhantomContext &context) {
 
 void PhantomCKKSEncoder::encode_internal(const PhantomContext &context, const std::vector<cuDoubleComplex> &values,
                                          size_t chain_index, double scale,
-                                         PhantomPlaintext &destination, const cudaStream_t &stream) {
+                                         PhantomPlaintext &destination, const cudaStream_t &stream,
+                                         bool validate_encoded_coefficients) {
     auto &context_data = context.get_context_data(chain_index);
     auto &parms = context_data.parms();
     auto &coeff_modulus = parms.coeff_modulus();
@@ -103,27 +104,51 @@ void PhantomCKKSEncoder::encode_internal(const PhantomContext &context, const st
 
     special_fft_backward(*gpu_ckks_msg_vec_, log_slot_count, fix, stream);
 
-    // TODO: boundary check on GPU
-    vector<cuDoubleComplex> temp2(slots_);
-    cudaMemcpyAsync(temp2.data(), gpu_ckks_msg_vec_->in(), slots_ * sizeof(cuDoubleComplex),
-                    cudaMemcpyDeviceToHost, stream);
-    // explicit stream synchronize to avoid error
-    cudaStreamSynchronize(stream);
+    int max_coeff_bit_count;
+    if (validate_encoded_coefficients) {
+        // TODO: boundary check on GPU
+        vector<cuDoubleComplex> temp2(slots_);
+        cudaMemcpyAsync(temp2.data(), gpu_ckks_msg_vec_->in(), slots_ * sizeof(cuDoubleComplex),
+                        cudaMemcpyDeviceToHost, stream);
+        // explicit stream synchronize to avoid error
+        cudaStreamSynchronize(stream);
 
-    double max_coeff = 0;
-    for (std::size_t i = 0; i < slots_; i++) {
-        max_coeff = std::max(max_coeff, std::fabs(temp2[i].x));
-    }
-    for (std::size_t i = 0; i < slots_; i++) {
-        max_coeff = std::max(max_coeff, std::fabs(temp2[i].y));
-    }
-    // Verify that the values are not too large to fit in coeff_modulus
-    // Note that we have an extra + 1 for the sign bit
-    // Don't compute logarithmis of numbers less than 1
-    int max_coeff_bit_count = static_cast<int>(std::ceil(std::log2(std::max(max_coeff, 1.0)))) + 1;
+        double max_coeff = 0;
+        for (std::size_t i = 0; i < slots_; i++) {
+            max_coeff = std::max(max_coeff, std::fabs(temp2[i].x));
+        }
+        for (std::size_t i = 0; i < slots_; i++) {
+            max_coeff = std::max(max_coeff, std::fabs(temp2[i].y));
+        }
+        // Verify that the values are not too large to fit in coeff_modulus
+        // Note that we have an extra + 1 for the sign bit
+        // Don't compute logarithmis of numbers less than 1
+        max_coeff_bit_count = static_cast<int>(std::ceil(std::log2(std::max(max_coeff, 1.0)))) + 1;
 
-    if (max_coeff_bit_count >= context_data.total_coeff_modulus_bit_count()) {
-        throw std::invalid_argument("encoded values are too large");
+        if (max_coeff_bit_count >= context_data.total_coeff_modulus_bit_count()) {
+            throw std::invalid_argument("encoded values are too large");
+        }
+    } else {
+        // The validated ViT checkpoint path uses real-only coefficients.  A
+        // CKKS inverse embedding has the conservative l1 bound
+        // scale * max(|real| + |imag|).  Compute that bound from the compact
+        // host slots so we can select the same 64/128/large decomposition
+        // kernel without copying the expanded FFT result back to the host or
+        // synchronizing after every plaintext.
+        double max_slot_l1 = 0.0;
+        for (const auto &value : values) {
+            max_slot_l1 = std::max(
+                max_slot_l1, std::fabs(value.x) + std::fabs(value.y));
+        }
+        const double bounded_bits =
+            std::log2(scale) +
+            std::log2(std::max(max_slot_l1, 1.0)) + 2.0;
+        max_coeff_bit_count = static_cast<int>(std::ceil(bounded_bits));
+        if (!std::isfinite(bounded_bits) ||
+            max_coeff_bit_count >=
+                context_data.total_coeff_modulus_bit_count()) {
+            throw std::invalid_argument("trusted encoded values are too large");
+        }
     }
 
     rns_tool.base_Ql().decompose_array(destination.data(), gpu_ckks_msg_vec_->in(), coeff_count, max_coeff_bit_count,

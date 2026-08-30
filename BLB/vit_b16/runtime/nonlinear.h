@@ -33,6 +33,10 @@ public:
     void softmax_iron(int nthreads, uint64_t* input, uint64_t* output, int dim, int array_size, int ell, int s);
 
     void layer_norm(int nthreads, uint64_t* input, uint64_t* output, uint64_t* weight, uint64_t* bias, int dim, int array_size, int ell, int s);
+    void layer_norm_part1(int nthreads, uint64_t* input,
+                          uint64_t* centered, uint64_t* inverse_sigma,
+                          uint64_t* weight, uint64_t* bias, int dim,
+                          int array_size, int ell, int s);
 
     void gelu(int nthreads, uint64_t* input, uint64_t* output, int size, int ell, int s);
     void gelu_iron(int nthreads, uint64_t* input, uint64_t* output, int size, int ell, int s);
@@ -61,6 +65,9 @@ public:
     void ring_extend_wide(int nthreads, uint64_t* input,
                           uint64_t* output_low, uint64_t* output_high,
                           int size, int bitwidth, int target_bitwidth);
+    void ring_extend_wide_zero(int nthreads, uint64_t* input,
+                               uint64_t* output_low, uint64_t* output_high,
+                               int size, int bitwidth, int target_bitwidth);
     void n_matrix_mul(int nthreads, uint64_t* input_1, uint64_t* input_2, uint64_t* output, int n, int dim1, int dim2, int dim3, int ell, int s);
 
    void n_matrix_mul_iron(

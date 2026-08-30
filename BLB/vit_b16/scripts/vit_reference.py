@@ -515,10 +515,27 @@ def _lookup_table_exp_iron_raw(value_raw: np.ndarray) -> np.ndarray:
     return _ring_reduce(digits_exp[0], ell)
 
 
-def _div_exp37_raw(numerator: np.ndarray,
-                   denominator: np.ndarray) -> np.ndarray:
-    """Softmax specialization of ``FixOp::div(..., 37, 12)``."""
-    ell = ELL
+def _paper_softmax_exp_raw(value_raw: np.ndarray) -> np.ndarray:
+    """Clear form of BLB Algorithm 5's clipped MPC exponentiation.
+
+    The secure ViT path evaluates ``(1 + x/2**6)**(2**6)`` in the MPC ring and
+    applies the paper's ``T_exp=-13`` comparison/mux.  Keep the independent
+    fixed-clear oracle on that operator instead of the unrelated lookup-table
+    exponent used by ``softmax_fix_iron``.
+    """
+    shifted = (_ring_signed(_ring_reduce(value_raw, ELL), ELL)
+               .astype(np.float64) / float(1 << ACT_SCALE))
+    valid = shifted > -13.0
+    approximate = np.zeros_like(shifted, dtype=np.float64)
+    approximate[valid] = np.power(
+        1.0 + shifted[valid] / float(1 << 6), 1 << 6)
+    return _ring_reduce(
+        np.floor(approximate * float(1 << ACT_SCALE)).astype(np.int64), ELL)
+
+
+def _div_exp_raw(numerator: np.ndarray, denominator: np.ndarray,
+                 ell: int) -> np.ndarray:
+    """Softmax specialization of ``FixOp::div(..., ell, 12)``."""
     scale = ACT_SCALE
     numerator_raw = _ring_reduce(numerator, ell)
     denominator_raw = _ring_reduce(denominator, ell)
@@ -578,10 +595,12 @@ def _div_exp37_raw(numerator: np.ndarray,
 
 
 def fixed_softmax(value: np.ndarray) -> np.ndarray:
-    """Bit-exact clear emulation of BLB's 37-bit fixed Softmax.
+    """Fixed-clear emulation of BLB Algorithm 5's ViT Softmax.
 
-    The ViT adapter selects this existing 37-bit variant because a 197-item
-    row can overflow the legacy ``softmax_fix`` 19-bit exponent sum.
+    The exponent follows the secure CKKS path and the normalization follows
+    the existing 37-bit SCI reciprocal/division path.  CKKS approximation
+    means secure comparisons use a numerical tolerance rather than requiring
+    this oracle to be bit-exact.
     """
     input_raw = _ring_reduce(round_int(value, ACT_SCALE), ELL)
     if input_raw.ndim == 0 or input_raw.shape[-1] == 0:
@@ -589,10 +608,17 @@ def fixed_softmax(value: np.ndarray) -> np.ndarray:
     input_signed = _ring_signed(input_raw, ELL)
     row_max = input_signed.max(axis=-1, keepdims=True)
     shifted = _ring_reduce(input_signed - row_max, ELL)
-    exponent = _lookup_table_exp_iron_raw(shifted)
-    denominator = _ring_reduce(
-        np.sum(exponent, axis=-1, dtype=np.int64), ELL)
-    output = _div_exp37_raw(exponent, denominator)
+    exponent_37 = _paper_softmax_exp_raw(shifted)
+    # The secure path performs a real unsigned ring extension before its
+    # three guard bits are used for the 256-term row sum.
+    exponent_40 = _ring_reduce(exponent_37, 40)
+    denominator_40 = _ring_reduce(
+        np.sum(exponent_40, axis=-1, dtype=np.int64), 40)
+    # Guard bits end at the summation boundary; BLB's reciprocal/division
+    # remains in the original 37-bit nonlinear ring.
+    numerator = _ring_reduce(exponent_40, ELL)
+    denominator = _ring_reduce(denominator_40, ELL)
+    output = _div_exp_raw(numerator, denominator, ELL)
     return (_ring_signed(output, ELL).astype(np.float64) /
             float(1 << ACT_SCALE))
 

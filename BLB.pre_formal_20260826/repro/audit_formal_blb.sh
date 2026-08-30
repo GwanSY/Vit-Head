@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-expected_host="/home/dm/mind/MIND_code/Pencil/BLB"
+expected_host="${BLB_EXPECTED_HOST:-/home/dm/mind/Vit-Head/BLB.pre_formal_20260826}"
 expected_container="/workspace/BLB"
 bert_src="$repo/SCI/tests/bert_large_bolt"
 bert_checkpoint="${BERT_CHECKPOINT:-$repo/checkpoints/official-blb-mrpc/weights_txt}"

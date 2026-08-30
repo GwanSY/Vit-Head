@@ -44,12 +44,18 @@ CKKS context 继续使用 SEAL `tc128`；GPU evaluator 为官方 Phantom DEVICE
 64 线程。安全非线性边界保持 37-bit ring、scale 12，算子内部 weight/bias
 scale 沿用 BLB 的原调度。
 
-真实 checkpoint 的 GPU 明文先按原 BLB BSGS/FineGrainFusion 布局由 SEAL 在
-准确 chain/scale 上生成，再通过已有兼容层传入官方 Phantom evaluator；CPU
-直接保留 SEAL plaintext。每个原 fused MatMul 结束后只释放该算子的设备明文，
-并清理由 Phantom `UINT64_MAX` pool threshold 留下的空闲页面，避免 QKV 的已
-释放页面阻塞 FFN1 分配。该处理只修正资源生命周期，不改变 packing、密文数、
-rotation/multiply/rescale、通信或协议；没有加入分块 device encoding 等新调度。
+真实 checkpoint 的 GPU 明文保留原 BLB BSGS/FineGrainFusion slot 布局，但由
+compact semantic slots 直接交给官方 Phantom encoder，不再先扩张成 SEAL/RNS
+plaintext 后把数百 GB 的表示逐个拷到 GPU。checkpoint loader 已检查有限值、
+定点位宽与 scale；ViT 专用 `encode_trusted` 因此可在 compact host slots 上做
+保守系数界检查，跳过每个明文一次的 GPU→CPU FFT 系数回读和全 stream 同步。
+原 Phantom `encode` 保持原检查，BERT 调用没有改变。
+
+QKV/BSGS2 的独立外层任务默认使用 8 个 Phantom encoder/CUDA streams；每个
+packing/operator 结束都有同步边界，随后释放临时 plaintext。可用
+`BLB_VIT_GPU_LINEAR_STREAMS=1..16` 调整并发，用
+`BLB_VIT_GPU_DIRECT_PLAINTEXT=0` 退回旧的 SEAL plaintext H2D 诊断路径。
+该调度不改变真实权重、packing、密文数、rotation/multiply/rescale、通信或协议。
 
 完整 12 层的全部离线 plaintext cache 同时驻留会超过测试机内存。实现只在
 当前层调用原 `weights_preprocess_layer`，该层结束即释放；plaintext 内容、
@@ -59,18 +65,25 @@ online 和二者之和，不能把离线调度时间混入在线时间。
 ## 构建与运行
 
 ```bash
-cd /home/dm/mind/Vit-Head/BLB
-docker exec --user 1001:1001 --env HOME=/tmp \
-  --workdir /workspace/BLB blb_vit_head_env \
-  ./scripts/build_vit_b16.sh
+docker start blb
+docker exec blb bash -lc '
+cd /workspace/BLB
+JOBS=64 ./scripts/build_vit_b16.sh
+'
 ```
 
-CPU（1 Gbps / 0.3 ms RTT、双方各 64 线程）：
+CPU（1 Gbps / 0.3 ms RTT）。下面的命令复现此前 CPU 表格中的
+`OMP_NUM_THREADS=16`；MPC/VOLE 的 64 个 protocol workers 保持不变：
 
 ```bash
-docker exec --workdir /workspace/BLB blb_vit_head_env \
-  ./scripts/run_vit_b16.sh cpu \
-  outputs/vit_b16_blb/cpu_run 63940
+docker exec blb bash -lc '
+cd /workspace/BLB
+BLB_VIT_OMP_THREADS=16 \
+BLB_VIT_STOP_AFTER_BLOCK=12 \
+BLB_VIT_TIMEOUT_SECONDS=21600 \
+./scripts/run_vit_b16.sh cpu \
+  outputs/vit_b16_blb/cpu_full_12blocks 63940
+'
 ```
 
 GPU 运行前先用 `nvidia-smi` 选择两张空闲 A100，再把示例中的 `0 1` 换成
@@ -80,62 +93,98 @@ GPU 运行前先用 `nvidia-smi` 选择两张空闲 A100，再把示例中的 `0
 nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.free \
   --format=csv,noheader
 
-docker exec --workdir /workspace/BLB blb_vit_head_env \
-  ./scripts/run_vit_b16.sh gpu \
-  outputs/vit_b16_blb/gpu_run 63942 0 1
+docker exec blb bash -lc '
+cd /workspace/BLB
+BLB_VIT_OMP_THREADS=64 \
+BLB_VIT_STOP_AFTER_BLOCK=12 \
+BLB_VIT_TIMEOUT_SECONDS=21600 \
+./scripts/run_vit_b16.sh gpu \
+  outputs/vit_b16_blb/gpu_full_12blocks 63942 0 1
+'
 ```
 
 性能排查时只跑一个完整 block（执行路径不变）：
 
 ```bash
-docker exec \
-  -e BLB_VIT_STOP_AFTER_BLOCK=1 \
-  -e BLB_VIT_TIMEOUT_SECONDS=3600 \
-  --workdir /workspace/BLB blb_vit_head_env \
-  ./scripts/run_vit_b16.sh gpu \
+docker exec blb bash -lc '
+cd /workspace/BLB
+BLB_VIT_STOP_AFTER_BLOCK=1 \
+BLB_VIT_TIMEOUT_SECONDS=3600 \
+./scripts/run_vit_b16.sh gpu \
   outputs/vit_b16_blb/gpu_block1_diagnostic 63944 0 1
+'
 ```
 
-## GPU 单 block 性能排查（2026-08-27）
+## GPU 性能回归排查（2026-08-29）
 
-在 A100 GPU3/GPU4、双方各 64 线程、1 Gbps/0.3 ms RTT 下，audited
-SEAL-plaintext → Phantom 路径的最终成功目录为
-`outputs/vit_b16_blb/guard_gpu_finalisolated_block1_1gbps_0p3ms_20260827/`，
-双方退出码为 0/0：
+迁移检查定位到两处 shape-adaptation 回归：QKᵀ 的 256-token 路径没有按
+BLB Figure 7 / Appendix C.1 的 MHP/BSGS 调度重算，曾先后落入错误的历史
+rotation cutoff 和完整逐对角展开；Softmax division 也曾被合并到单个
+`FPMath` worker。修复只恢复同一 BLB 调度：`256×64=16384` slots、每个 head
+一个 ciphertext、MHP factor 1、BSGS `baby=16/giant=16`，以及原来的 48 个
+完整 row worker。没有新增 packing、近似、协议或安全参数。
+
+在空闲 A100 GPU2/GPU3、双方 64 OpenMP threads、1 Gbps/0.3 ms RTT 下，完整
+单 block 成功目录为
+`outputs/vit_b16_blb/gpu_block1_bsgs_parallel_20260829/`，双方退出码为 0/0：
 
 | 项目 | 实测 |
 |---|---:|
-| 单 block secure wall time | 129.503 s |
-| setup/offline（一次性上下文、VOLE、patch、layer-0 packing） | 329.005 s |
-| block HE/fused stages | 68.982 s |
-| conversion | 36.527 s |
-| plaintext H2D | 57.262 s |
-| ciphertext H2D / D2H | 0.106 / 0.173 s |
-| MPC nonlinear wall buckets | 31.798 s |
-| block 通信（Alice+Bob） | 2.936 GB |
-| block rotation / ct-ct / ct-pt / rescale | 1968 / 6168 / 150594 / 3009 |
-| block CKKS→MPC / MPC→CKKS / conversion ciphertexts | 426 / 696 / 1122 |
+| 单 block secure online | 214.423 s |
+| setup/offline | 305.593 s |
+| 实际 Alice wall | 9:23.40 |
+| QKᵀ Phantom HE | 5.743 s |
+| block HE internal counter | 40.463 s |
+| conversion internal counter | 32.836 s |
+| plaintext H2D | 76.208 s |
+| MPC nonlinear wall buckets | 80.041 s |
+| 总通信（Alice+Bob，含初始化） | 9.649 GB |
+| full-graph rotation / ct-ct / ct-pt / rescale | 11124 / 3072 / 166584 / 6720 |
+| full-graph CKKS→MPC / MPC→CKKS / conversion ciphertexts | 204 / 252 / 456 |
 
-本次排查修复了三项迁移退化：conversion worker 从误设的 1 恢复为要求的
-64；offline plaintext 按算子实际 chain/scale 一次生成，不再在线
-decode/re-encode；每个 fused MatMul 结束后释放 Phantom plaintext pool 空闲页，
-QKV 后 GPU 占用可回落，FFN1 不再因累计页面 OOM。布局适配日志均为本地公开
-置换（communication=0），没有重复网络 repack，也没有 512-token padding。
+其中 QKᵀ 自身固定为 9720 rotations、3072 ct-ct、9876 ct-pt；独立 CPU、
+GPU QK 和 Softmax 中间量已与修复前的正确参考路径比较，误差处于 CKKS
+随机噪声重复运行范围。最终正确性仍必须以完整 12-block 的 secure logits 对
+float/fixed-clear 参考图验证，不能用单 block 外推代替。
 
-129.503 s/层直接外推 12 层为 25.90 min。即使假设 plaintext H2D 完全为零，
-按同一实测时间线的下界仍约 14.45 min，因此在保持真实权重、论文宽位
-CKKS↔MPC 转换和 GPU smudging 边界的前提下，不能把 10 min 当作该实现的可达
-验收值；要继续降低会需要新的 device-weight 调度/分块或削弱安全步骤，均不在
-本迁移范围内。完整 12 层运行目前保持暂停。
+论文 BERT GPU artifact 的 `ckks_bert_large_main` 实际只运行一个 block
+（`ATTENTION_LAYERS=1`），线性 kernel 又用复用的 all-one plaintext 模拟权重；
+因此其约 2.5 分钟数据不是“真实 checkpoint、12 blocks”的直接基准。
+
+## 真实权重 GPU 性能修复（2026-08-30）
+
+旧的完整 12-block GPU 运行把 150k 级真实 CKKS plaintext/层的完整 RNS 表示
+从 host 复制到 Phantom，累计 plaintext H2D 为 1695.74 s，secure online 为
+2235.93 s（37.27 min），所以明显慢于 CPU。修复后在 A100 GPU1/GPU2、
+1 Gbps/0.3 ms RTT 下的正式目录为
+`outputs/vit_b16_blb/gpu_direct_qkv_stream8_full12_gpu1_gpu2_20260830/`：
+
+| 项目 | 修复后实测 |
+|---|---:|
+| 12-block + final head secure end-to-end | 498.104 s（8.302 min） |
+| 12 Transformer blocks wall | 490.631 s（8.177 min） |
+| setup/offline | 282.695 s（4.712 min） |
+| Alice 全进程 wall（含 setup） | 13:10.77 |
+| plaintext H2D | 0.000 s |
+| Phantom direct plaintext encode | 102.231 s |
+| Alice 最大 RSS | 94.75 GB |
+| 双方退出码 | 0 / 0 |
+
+双方 secure logits 与 prediction 文件逐字一致。现有参考验证仍报告 secure
+top-1 705 与 fixed-clear top-1 248 不一致；旧 CPU/GPU 完整运行也分别得到
+240/709 等不同 secure top-1，因此这是尚未解决的既有数值正确性问题，不应把
+本次性能修复的 `PASS` 误写成端到端数值验证通过。
 
 脚本会在 loopback 上设置单向 0.15 ms delay 和 1 Gbit/s rate，对应 0.3 ms
 RTT；仅清理由该次运行创建的 qdisc。完整运行结束后验证双方输出，并独立执行
 float/fixed-clear 12 层参考图：
 
 ```bash
-cd /home/dm/mind/Vit-Head/BLB
-bash scripts/validate_vit_b16.sh outputs/vit_b16_blb/gpu_run
-bash scripts/validate_vit_b16.sh outputs/vit_b16_blb/cpu_run
+docker exec blb bash -lc '
+cd /workspace/BLB
+./scripts/validate_vit_b16.sh outputs/vit_b16_blb/gpu_full_12blocks
+./scripts/validate_vit_b16.sh outputs/vit_b16_blb/cpu_full_12blocks
+'
 ```
 
 每个正式目录保存双方原始日志、资源峰值、qdisc 证据、逐层/逐阶段时间与通信、

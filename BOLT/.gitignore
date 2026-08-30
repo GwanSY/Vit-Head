@@ -83,5 +83,7 @@ __pycache__/
 
 #data
 checkpoints/
+.checkpoints.readonly_migration/
 datasets/
 fixtures/
+.venv-vit-b16

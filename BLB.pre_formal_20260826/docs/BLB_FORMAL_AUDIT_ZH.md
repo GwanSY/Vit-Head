@@ -1,7 +1,7 @@
 # BLB 正式 BERT/ViT 路径审计
 
 审计日期：2026-08-04  
-审计根目录：`/home/dm/mind/MIND_code/Pencil/BLB`  
+审计根目录：`/home/dm/mind/Vit-Head/BLB.pre_formal_20260826`
 论文：*Breaking the Layer Barrier: Remodeling Private Transformer Inference with Hybrid CKKS and MPC*（USENIX Security 2025）
 
 ## 结论
@@ -24,7 +24,7 @@ residual 和三 oracle 比较入口，当前主要阻塞是官方容器中的五
 允许读取、修改、构建和生成结果的唯一项目根目录是：
 
 ```text
-/home/dm/mind/MIND_code/Pencil/BLB
+/home/dm/mind/Vit-Head/BLB.pre_formal_20260826
 ```
 
 允许使用操作系统提供的编译器、CMake、OpenSSL、GMP、OpenMP、pthread、CUDA runtime 等系统依赖，但禁止链接相邻工程的源码、库、脚本和构建产物。当前验收使用 `BLB/build_blb_formal_oracle_gpu/`；其他 `build_blb_*` 目录只是 BLB 内独立构建缓存，原有 `SCI/build/` 是迁移前遗留构建，动态依赖不完整，不得用于正式运行。

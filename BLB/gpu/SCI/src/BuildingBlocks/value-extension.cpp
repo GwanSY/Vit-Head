@@ -165,6 +165,37 @@ void XTProtocol::s_extend_wide(int32_t dim, const uint64_t *inA,
   }
 }
 
+void XTProtocol::z_extend_wide(int32_t dim, uint64_t *inA,
+                               uint64_t *out_low, uint64_t *out_high,
+                               int32_t bwA, int32_t bwB, uint8_t *msbA) {
+  if (dim <= 0 || bwA <= 1 || bwA >= 64 || bwB <= 64 || bwB > 127 ||
+      bwB <= bwA || out_low == nullptr || out_high == nullptr) {
+    throw std::invalid_argument("invalid wide zero-extension metadata");
+  }
+
+  const uint64_t mask_a = (uint64_t{1} << bwA) - 1;
+  const __uint128_t modulus_b = __uint128_t{1} << bwB;
+  const __uint128_t mask_b = modulus_b - 1;
+  const int32_t delta = bwB - bwA;
+
+  vector<uint8_t> wrap(static_cast<size_t>(dim));
+  if (msbA != nullptr) {
+    aux->MSB_to_Wrap(inA, msbA, wrap.data(), dim, bwA);
+  } else {
+    aux->wrap_computation(inA, wrap.data(), dim, bwA);
+  }
+  vector<uint64_t> arithmetic_wrap(static_cast<size_t>(dim));
+  aux->B2A(wrap.data(), arithmetic_wrap.data(), dim, delta);
+
+  for (int32_t i = 0; i < dim; ++i) {
+    const __uint128_t extended =
+        (__uint128_t(inA[i] & mask_a) -
+         (__uint128_t{1} << bwA) * arithmetic_wrap[i]) & mask_b;
+    out_low[i] = static_cast<uint64_t>(extended);
+    out_high[i] = static_cast<uint64_t>(extended >> 64);
+  }
+}
+
 // prime to ring, use optim. from bumblebee, assume inA is positive
 void XTProtocol::z_prime2ring(int32_t dim, uint64_t *inA, uint64_t *outB,
                           uint64_t Q, int32_t bwB) {

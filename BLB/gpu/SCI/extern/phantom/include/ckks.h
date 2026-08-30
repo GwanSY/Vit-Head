@@ -23,19 +23,22 @@ private:
                          const std::vector<cuDoubleComplex> &values,
                          size_t chain_index, double scale,
                          PhantomPlaintext &destination,
-                         const cudaStream_t &stream);
+                         const cudaStream_t &stream,
+                         bool validate_encoded_coefficients = true);
 
     inline void encode_internal(const PhantomContext &context,
                                 const std::vector<double> &values,
                                 size_t chain_index, double scale,
                                 PhantomPlaintext &destination,
-                                const cudaStream_t &stream) {
+                                const cudaStream_t &stream,
+                                bool validate_encoded_coefficients = true) {
         size_t values_size = values.size();
         std::vector<cuDoubleComplex> input(values_size);
         for (size_t i = 0; i < values_size; i++) {
             input[i] = make_cuDoubleComplex(values[i], 0.0);
         }
-        encode_internal(context, input, chain_index, scale, destination, stream);
+        encode_internal(context, input, chain_index, scale, destination, stream,
+                        validate_encoded_coefficients);
     }
 
     void decode_internal(const PhantomContext &context,
@@ -79,6 +82,23 @@ public:
         destination.chain_index_ = 0;
         destination.resize(context.coeff_mod_size_, context.poly_degree_, s);
         encode_internal(context, values, chain_index, scale, destination, s);
+    }
+
+    // ViT's checkpoint loader validates the quantized real-valued model
+    // coefficients before packing.  That trusted path can skip Phantom's
+    // per-plaintext GPU-to-host coefficient scan (and its stream-wide sync)
+    // while retaining the regular checked encoder for every existing caller.
+    template<class T>
+    inline void encode_trusted(const PhantomContext &context,
+                               const std::vector<T> &values,
+                               double scale,
+                               PhantomPlaintext &destination,
+                               size_t chain_index = 1) {
+        const auto &s = cudaStreamPerThread;
+        destination.chain_index_ = 0;
+        destination.resize(context.coeff_mod_size_, context.poly_degree_, s);
+        encode_internal(context, values, chain_index, scale, destination, s,
+                        false);
     }
 
     template<class T>

@@ -353,32 +353,14 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext>
         x_intt[i] = he->ckks_intt(pts[i]);
     }
     vector<HE_CKKS::scalar_t> x_intt_flatten_field,x_intt_flatten_ring(x_intt.size()*x_intt[0].size());
-    // #pragma omp parallel for
+    // Keep the original BLB Algorithm 1 boundary.  The field share is
+    // converted directly to the l-bit ring and decoded by the original
+    // local FFT; no extra wide-ring protocol is used here.
     for(int i=0;i<x_intt.size();i++){
         for(int j=0;j<x_intt[i].size();j++){
-            // ckks_intt returns centered coefficients through a uint64_t
-            // container.  Negative coefficients therefore arrive in
-            // two's-complement form; Algorithm 1's field share must instead
-            // be the canonical residue in [0, Q).
-            const uint64_t raw = x_intt[i][j].real();
-            int64_t signed_value = 0;
-            static_assert(sizeof(signed_value) == sizeof(raw),
-                          "unexpected fixed-width integer size");
-            memcpy(&signed_value, &raw, sizeof(raw));
-            uint64_t canonical = 0;
-            if (signed_value < 0) {
-                const uint64_t magnitude =
-                    static_cast<uint64_t>(-(signed_value + 1)) + 1;
-                const uint64_t reduced = magnitude % conversion_prime;
-                canonical = reduced == 0 ? 0 : conversion_prime - reduced;
-            } else {
-                canonical = raw % conversion_prime;
-            }
-            x_intt_flatten_field.push_back(canonical);
+            x_intt_flatten_field.push_back(x_intt[i][j].real());
         }
     }
-    cout << "CKKS_INTT_FIELD_CANONICAL status=PASS range=[0,q) q="
-         << conversion_prime << endl;
     cout << "intt done" << endl;
 	// step 2
     int s_in;
@@ -393,102 +375,33 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext>
             "CKKS-to-MPC cannot raise scale at the Algorithm 1 boundary");
     }
 
-    // SEAL's inverse NTT exposes each local share as a centered coefficient,
-    // while field_to_ring reconstructs the secret as its canonical residue
-    // modulo q.  Translate the shared field value by the public midpoint
-    // before the prime-to-ring conversion so the q-residue has the signed
-    // representative in the source ring.  Subtract the same midpoint from
-    // Alice's ring share before changing scale.  Algorithm 1 first reaches
-    // the paper's l-bit MPC ring; Appendix C.4 extends exactly that ring by
-    // 40 bits before the public decoding FFT.
-    const int source_ring_bits = bit_out;
-    if (bit_out <= 1 || bit_out >= 63 || source_ring_bits + 40 >= 127) {
-        throw runtime_error(
-            "CKKS-to-MPC working ring cannot hold the secure scale truncation");
-    }
-    const uint64_t center_offset = (conversion_prime - 1) / 2;
-    if (party == sci::ALICE) {
-        for (uint64_t &share : x_intt_flatten_field) {
-            share = static_cast<uint64_t>(
-                (static_cast<__uint128_t>(share) + center_offset) %
-                conversion_prime);
-        }
-    }
-    // Keep the source-scale value in the field-adapter ring. The scale change
-    // belongs to Appendix C.4's extended-ring local decode.
     nonlinear.field_to_ring(
         kBlbConversionThreads,
         x_intt_flatten_field.data(),
         Q,
         x_intt_flatten_ring.data(),
         x_intt_flatten_field.size(),
-        source_ring_bits,
+        bit_out,
         s_in,
-        s_in
+        s_out
     );
-    if (party == sci::ALICE) {
-        const uint64_t output_mask = (uint64_t{1} << source_ring_bits) - 1;
-        const uint64_t ring_offset = center_offset & output_mask;
-        for (uint64_t &share : x_intt_flatten_ring) {
-            share = (share - ring_offset) & output_mask;
-        }
-    }
     field_to_ring_calls++;
     ckks_to_mpc_conversions += pts.size();
 
-    // Appendix C.4: extend the signed source-ring share by 40 bits and keep
-    // that wider share through the public FFT. Each public-root multiply and
-    // the final 40->13/11 shift are local arithmetic shifts in this ring.
-    const int truncation_ring_bits = source_ring_bits + 40;
-    vector<uint64_t> wide_low(x_intt_flatten_ring.size());
-    vector<uint64_t> wide_high(x_intt_flatten_ring.size());
-    nonlinear.ring_extend_wide(
-        kBlbConversionThreads, x_intt_flatten_ring.data(), wide_low.data(), wide_high.data(),
-         static_cast<int>(x_intt_flatten_ring.size()), source_ring_bits,
-        truncation_ring_bits);
-    cout << "CKKS_CENTERED_FIELD_TO_RING status=PASS offset="
-         << center_offset << " field_ring_bits=" << source_ring_bits
-         << " source_ring_bits=" << source_ring_bits
-         << " source_scale=" << s_in << " target_scale=" << s_out
-         << " secure_truncate_bits=" << (s_in - s_out)
-         << " original_ell=" << source_ring_bits
-         << " original_scale=" << s_in
-         << " working_ell=" << truncation_ring_bits
-         << " truncation_ring_bits=" << truncation_ring_bits
-         << " working_scale=" << s_in
-         << " truncation=BLB_Appendix_C4_extend_then_local_arithmetic_shift"
-         << endl;
 	// step 3
-    vector<vector<HE_CKKS::wide_complex_t>> x_decode(pts.size());
-    for (size_t i = 0; i < pts.size(); ++i) {
-        x_decode[i].resize(static_cast<size_t>(degree));
+    vector<vector<HE_CKKS::complex_t>> x_decode(pts.size());
+    for (int i = 0; i < pts.size(); ++i) {
         for (int j = 0; j < degree; ++j) {
-            const size_t index = i * static_cast<size_t>(degree) +
-                                 static_cast<size_t>(j);
-            x_decode[i][j].real =
-            (static_cast<__uint128_t>(wide_high[index]) << 64) |
-                                 wide_low[index];
-            x_decode[i][j].imag = 0;
+            x_decode[i].push_back(HE_CKKS::complex_t(
+                x_intt_flatten_ring[i * degree + j], 0));
         }
     }
     cout << "pts.size():" << pts.size() << endl;
     vector<vector<HE_CKKS::scalar_t>> y(pts.size());
 #pragma omp parallel for num_threads(num_threads)
     for(int i=0;i<static_cast<int>(pts.size());i++){
-        y[i] = he->ckks_decode_wide(
-            x_decode[i], degree, bit_out, s_in, s_out, half,
-            truncation_ring_bits);
+        y[i] = he->ckks_decode(x_decode[i], degree, half);
     }
-    cout << "CKKS_WIDE_LOCAL_FFT direction=decode degree=" << degree
-         << " ell=" << truncation_ring_bits
-         << " scale=" << s_out
-         << " slots=" << pts.size() << endl;
-    cout << "CKKS_TO_MPC_SECURE_FFT_WORK_SCALE status=PASS"
-         << " original_ell=" << source_ring_bits
-         << " original_scale=" << s_in
-         << " working_ell=" << truncation_ring_bits
-         << " working_scale=" << s_out
-         << " post_fft_secure_truncate_bits=0" << endl;
     // cout << "decode ok" << endl;
     // uint8_t* msb_x = new uint8_t[y[0].size()];
     // for(int i=0;i<y.size();i++){
@@ -581,35 +494,7 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
     vector<vector<HE_CKKS::scalar_t>> x_ifft(x.size());
     #pragma omp parallel for num_threads(thread_num)
     for(int i=0;i<x.size();i++){
-        // Algorithm 2 performs Encode on each local share in Z_(2^l).
-        // The historical uint64_t FFT multiplies its operands before the
-        // signed shift; with l=35/43 the intermediate product can exceed
-        // 64 bits even though the result belongs to Z_(2^l).  That silently
-        // changes the local polynomial before ring-to-field and destroys
-        // additivity of the two shares.  Run the same fixed-point FFT in a
-        // width exactly equal to the source ring and reduce only after the
-        // public ring operation.  The +40 extension belongs to the
-        // ring-to-field/truncation stage below, not to local Encode.
-        vector<HE_CKKS::wide_complex_t> encoded_input(
-            static_cast<size_t>(poly_degree));
-        const uint64_t source_mask =
-            bitwidth == 64 ? ~uint64_t{0}
-                           : ((uint64_t{1} << bitwidth) - 1);
-        for (int j = 0; j < slot; ++j) {
-            const uint64_t value = x[i][j] & source_mask;
-            const size_t real_index = he->matrix_reps_index_map_[j];
-            const size_t conjugate_index =
-                he->matrix_reps_index_map_[j + slot];
-            encoded_input[real_index].real = value;
-            encoded_input[conjugate_index].real = value;
-        }
-        const auto encoded_wide =
-            he->ckks_encode_wide(encoded_input, poly_degree, bitwidth);
-        x_ifft[i].resize(static_cast<size_t>(poly_degree));
-        for (int j = 0; j < poly_degree; ++j) {
-            x_ifft[i][j] = static_cast<HE_CKKS::scalar_t>(
-                encoded_wide[j].real & source_mask);
-        }
+        x_ifft[i] = he->ckks_encode(x[i],slot,half);
     }
     vector<HE_CKKS::scalar_t> encode_ring(
         x_ifft.size() * static_cast<size_t>(poly_degree));
@@ -618,13 +503,9 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
              encode_ring.begin() + ct * static_cast<size_t>(poly_degree));
     }
     vector<HE_CKKS::scalar_t> encode_field(encode_ring.size());
-    // Preserve BLB's official 64-worker split at the interactive conversion
-    // boundary.  Each worker processes a disjoint chunk through its existing
-    // VOLE/MPC channel; this does not change the conversion or its packing.
-    const int working_bits = bitwidth + 40;
-    nonlinear.ring_to_field_wide(
-        kBlbConversionThreads, encode_ring.data(), Q, encode_field.data(), encode_ring.size(),
-        bitwidth, s_in, s_out, working_bits);
+    nonlinear.ring_to_field(
+        kBlbConversionThreads, encode_ring.data(), Q, encode_field.data(),
+        encode_ring.size(), bitwidth, s_in, s_out);
     ring_to_field_calls++;
     vector<Plaintext> y(x.size());
     #pragma omp parallel for num_threads(thread_num)
@@ -635,11 +516,6 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
              x_encode.begin());
         he->ckks_ntt(x_encode, poly_degree, pow(2,s_out), y[i]);
     }
-    cout << "BLB_RING_TO_FIELD_WIDE status=PASS input_bits=" << bitwidth
-         << " extension_bits=" << working_bits
-         << " source_scale=" << s_in << " target_scale=" << s_out
-         << " batch_elements=" << encode_ring.size()
-         << " encode=paper_local_ckks_encode_then_signed_batch" << endl;
     mpc_to_ckks_conversions += x.size();
     cout << "mpc_to_ckks done" << endl;
 	if (profile_conversion) {
@@ -854,61 +730,20 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
         throw runtime_error("formal LayerNorm input/parameter shape mismatch");
     }
     const int rows = input.size / COMMON_DIM;
-    const int ell = input.ell;
-    const int s = input.s;
-    FPMath *fpmath = nonlinear.fpmath[0];
-    vector<FixArray> row_shares(rows);
-    for (int row = 0; row < rows; ++row) {
-        row_shares[row] = FixArray(party, COMMON_DIM, input.signed_, ell, s);
-        copy(input.data + row * COMMON_DIM,
-             input.data + (row + 1) * COMMON_DIM, row_shares[row].data);
-    }
+    FixArray centered(party, input.size, input.signed_, input.ell, input.s);
+    FixArray sigma_flat(party, input.size, input.signed_, input.ell, input.s);
 
-    // The public 1/d factor is represented as a fixed-point constant; all
-    // data-dependent reductions remain MPC shares.
-    FixArray sum = fpmath->fix->tree_sum(row_shares);
-    const uint64_t dn_value = static_cast<uint64_t>(
-        llround((1.0 / static_cast<double>(COMMON_DIM)) * pow(2.0, 2 * s)));
-    sum = fpmath->fix->extend(sum, ell + 2 * s);
-    for (int i = 0; i < sum.size; ++i) {
-        sum.data[i] = (sum.data[i] * dn_value) & sum.ell_mask();
-    }
-    sum.s += 2 * s;
-    FixArray avg = fpmath->fix->truncate_reduce(sum, 2 * s);
-
-    FixArray avg_flat(party, input.size, input.signed_, ell, s);
-    for (int row = 0; row < rows; ++row) {
-        fill(avg_flat.data + row * COMMON_DIM,
-             avg_flat.data + (row + 1) * COMMON_DIM, avg.data[row]);
-    }
-    FixArray centered = fpmath->fix->sub(input, avg_flat);
-    FixArray centered_square = element_wise_square(input.size, centered);
-
-    vector<FixArray> square_rows(rows);
-    for (int row = 0; row < rows; ++row) {
-        square_rows[row] = FixArray(party, COMMON_DIM,
-                                    centered_square.signed_, ell, s);
-        copy(centered_square.data + row * COMMON_DIM,
-             centered_square.data + (row + 1) * COMMON_DIM,
-             square_rows[row].data);
-    }
-    FixArray square_sum = fpmath->fix->tree_sum(square_rows);
-    square_sum = fpmath->fix->extend(square_sum, ell + 2 * s);
-    for (int i = 0; i < square_sum.size; ++i) {
-        square_sum.data[i] = (square_sum.data[i] * dn_value) & square_sum.ell_mask();
-    }
-    square_sum.s += 2 * s;
-    square_sum = fpmath->fix->truncate_reduce(square_sum, 2 * s);
-    // rsqrt is the existing Bumblebee MPC nonlinear primitive.
-    FixArray inv_sigma = fpmath->sqrt(square_sum, true);
-    FixArray sigma_flat(party, input.size, input.signed_, ell, s);
-    for (int row = 0; row < rows; ++row) {
-        fill(sigma_flat.data + row * COMMON_DIM,
-             sigma_flat.data + (row + 1) * COMMON_DIM, inv_sigma.data[row]);
-    }
+    // LayerNorm part 1 is the original BLB MPC primitive.  The previous ViT
+    // adapter evaluated centered^2 by converting every share through CKKS,
+    // encrypting it, and converting it back.  That is not the BERT BLB
+    // protocol and added two large CKKS conversion/transfer paths per block.
+    nonlinear.layer_norm_part1(
+        NL_NTHREADS, input.data, centered.data, sigma_flat.data,
+        w.data, b.data,
+        rows, COMMON_DIM, input.ell, input.s);
 
     std::map<char*,FixArray> result;
-    result["x_flat_avg"] = centered;
+    result["x_flat_avg"] = std::move(centered);
     result["sigma_flat"] = sigma_flat;
     result["w"] = w;
     result["b"] = b;

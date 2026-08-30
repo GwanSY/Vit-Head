@@ -179,6 +179,76 @@ void NonLinear::layer_norm(int nthreads, uint64_t* input, uint64_t* output, uint
     }
 }
 
+static void layer_norm_part1_thread(
+    int tid, int party, uint64_t *input, uint64_t *centered,
+    uint64_t *inverse_sigma, uint64_t *weight, uint64_t *bias,
+    int num_ops, int array_size, int ell, int s, FPMath *fpmath) {
+  const int this_party = (tid & 1) ? 3 - party : party;
+  vector<FixArray> input_rows;
+  input_rows.reserve(num_ops);
+  for (int row = 0; row < num_ops; ++row) {
+    input_rows.push_back(fpmath->fix->input(
+        this_party, array_size, input + row * array_size, true, ell, s));
+  }
+  FixArray weight_array = fpmath->fix->input(
+      this_party, num_ops * array_size, weight, true, ell, s);
+  FixArray bias_array = fpmath->fix->input(
+      this_party, num_ops * array_size, bias, true, ell, s);
+  map<char *, FixArray> result = fpmath->layer_norm_fix_part1(
+      input_rows, weight_array, bias_array);
+  if (tid == 0 && getenv("BLB_LN_COMPONENTS_AGGREGATE") != nullptr) {
+    FixArray opened_square = fpmath->fix->output(
+        sci::PUBLIC, result.at("centered_square"));
+    FixArray opened_variance = fpmath->fix->output(
+        sci::PUBLIC, result.at("variance"));
+    if (party == sci::ALICE) {
+      cout << "BLB_LN_INTERNAL_DIAGNOSTIC worker=0 square_raw=";
+      for (int index = 0; index < min(4, opened_square.size); ++index) {
+        if (index != 0) cout << ',';
+        cout << signed_val(opened_square.data[index], opened_square.ell);
+      }
+      cout << " variance_raw=";
+      for (int index = 0; index < min(4, opened_variance.size); ++index) {
+        if (index != 0) cout << ',';
+        cout << signed_val(opened_variance.data[index], opened_variance.ell);
+      }
+      cout << endl;
+    }
+  }
+  memcpy(centered, result.at("x_flat_avg").data,
+         static_cast<size_t>(num_ops) * array_size * sizeof(uint64_t));
+  memcpy(inverse_sigma, result.at("sigma_flat").data,
+         static_cast<size_t>(num_ops) * array_size * sizeof(uint64_t));
+}
+
+void NonLinear::layer_norm_part1(
+    int nthreads, uint64_t *input, uint64_t *centered,
+    uint64_t *inverse_sigma, uint64_t *weight, uint64_t *bias, int dim,
+    int array_size, int ell, int s) {
+  if (nthreads <= 0 || nthreads > MAX_THREADS || dim < nthreads ||
+      input == nullptr || centered == nullptr || inverse_sigma == nullptr ||
+      weight == nullptr || bias == nullptr || array_size <= 0) {
+    throw invalid_argument("invalid BLB LayerNorm-part1 dimensions");
+  }
+  vector<thread> threads;
+  threads.reserve(nthreads);
+  const int chunk_size = dim / nthreads;
+  for (int worker = 0; worker < nthreads; ++worker) {
+    const int row_offset = worker * chunk_size;
+    const int row_count = worker == nthreads - 1
+                              ? dim - row_offset
+                              : chunk_size;
+    const size_t element_offset =
+        static_cast<size_t>(row_offset) * array_size;
+    threads.emplace_back(
+        layer_norm_part1_thread, worker, party, input + element_offset,
+        centered + element_offset, inverse_sigma + element_offset,
+        weight + element_offset, bias + element_offset, row_count,
+        array_size, ell, s, fpmath[worker]);
+  }
+  for (thread &worker : threads) worker.join();
+}
+
 void gelu_thread(int tid, int party, uint64_t *x, uint64_t *y, int num_ops, int ell, int s, FPMath *fpmath) {
   int this_party;
   if (tid & 1) {
@@ -425,26 +495,20 @@ void field_to_ring_thread(int tid, int party, uint64_t *x, uint64_t p, uint64_t 
   // cout << "in field_to_ring, b_out, s_in, s_out:" << b_out << "," << s_in << "," << s_out << endl;
   FixArray input = fpmath->fix->input(this_party, num_ops, x, false, b_in, s_in);
 
-  // Convert the field share at its original scale first.  The public BLB
-  // source accidentally overwrote s_in with s_out below, so the CKKS path
-  // bypassed the l=43/s=13 field-to-ring boundary and fed source-scale
-  // coefficients into the FFT.  Keep the signed fixed-point metadata here:
-  // after the centered field adapter, the ring value is a two's-complement
-  // signed value even though the field input itself is unsigned.
+  // Match the original BLB/BERT field-to-ring adapter.  The CKKS conversion
+  // already supplies the ring word used by the original local FFT; keep this
+  // boundary free of an additional per-element secure truncation protocol.
   FixArray output = fpmath->fix->field2ring(input, p, b_in);
   assert(b_in>=b_out);
+  s_in = s_out;
   if(s_in > s_out){
-    output.signed_ = true;
-    output = fpmath->fix->truncate_reduce(output, s_in - s_out);
+    output = fpmath->fix->truncate_reduce_lsb(output, s_in - s_out);
   }
   else if(s_in < s_out){
     output = fpmath->fix->mul(output, 1<<(s_out - s_in));
   }
-  output.signed_ = true;
-  if(output.ell < b_out){
-    output = fpmath->fix->extend(output, b_out);
-  }
-  else if(output.ell>b_out){
+  assert (output.ell>=b_out);
+  if(output.ell>b_out){
     output = fpmath->fix->reduce(output, b_out);
   }
   // reduce bitwidth
@@ -859,6 +923,16 @@ static void ring_extend_wide_thread(int tid, int party, uint64_t *input,
       num_ops, input, output_low, output_high, bitwidth, target_bitwidth);
 }
 
+static void ring_extend_wide_zero_thread(
+    int tid, int party, uint64_t *input, uint64_t *output_low,
+    uint64_t *output_high, int num_ops, int bitwidth, int target_bitwidth,
+    FPMath *fpmath) {
+  (void)tid;
+  (void)party;
+  fpmath->fix->xt->z_extend_wide(
+      num_ops, input, output_low, output_high, bitwidth, target_bitwidth);
+}
+
 void NonLinear::ring_extend_wide(int nthreads, uint64_t* input,
                                  uint64_t* output_low,
                                  uint64_t* output_high, int size,
@@ -875,8 +949,31 @@ void NonLinear::ring_extend_wide(int nthreads, uint64_t* input,
         const int offset = i * chunk_size;
         const int count = (i == nthreads - 1) ? size - offset : chunk_size;
         if (count == 0) continue;
+    threads.emplace_back(
+        ring_extend_wide_thread, i, party, input + offset,
+            output_low + offset, output_high + offset, count, bitwidth,
+            target_bitwidth, this->fpmath[i]);
+    }
+    for (auto &thread : threads) thread.join();
+}
+
+void NonLinear::ring_extend_wide_zero(
+    int nthreads, uint64_t* input, uint64_t* output_low,
+    uint64_t* output_high, int size, int bitwidth, int target_bitwidth) {
+    if (nthreads <= 0 || nthreads > MAX_THREADS || size <= 0 ||
+        bitwidth <= 1 || bitwidth >= 64 || target_bitwidth <= bitwidth ||
+        target_bitwidth > 127) {
+        throw std::invalid_argument("invalid wide zero-extension dimensions");
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(nthreads));
+    const int chunk_size = size / nthreads;
+    for (int i = 0; i < nthreads; ++i) {
+        const int offset = i * chunk_size;
+        const int count = (i == nthreads - 1) ? size - offset : chunk_size;
+        if (count == 0) continue;
         threads.emplace_back(
-            ring_extend_wide_thread, i, party, input + offset,
+            ring_extend_wide_zero_thread, i, party, input + offset,
             output_low + offset, output_high + offset, count, bitwidth,
             target_bitwidth, this->fpmath[i]);
     }

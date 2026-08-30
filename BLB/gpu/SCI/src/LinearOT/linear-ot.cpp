@@ -294,45 +294,27 @@ void LinearOT::matmul_cross_terms(int32_t dim1, int32_t dim2, int32_t dim3,
         tmpR[inp_idx] >>= 1;
       }
     }
-// #pragma omp parallel num_threads(2)
-    {
-      if (omp_get_thread_num() == 1 && use_reversed_ot) {
-        if (party == sci::ALICE) {
-          if (batch_size <= num_ot - i) {
-            otpack->iknp_reversed->recv_batched_cot(ABr, choice, msg_len,
-                                                    batch_size, msgs_per_ot);
-          } else {
-            otpack->iknp_reversed->recv_batched_cot(ABr, choice, msg_len,
-                                                    num_ot - i, msgs_per_ot);
-          }
-        } else { // party == sci::BOB
-          if (batch_size <= num_ot - i) {
-            otpack->iknp_reversed->send_batched_cot(ABs, corr, msg_len,
-                                                    batch_size, msgs_per_ot);
-          } else {
-            otpack->iknp_reversed->send_batched_cot(ABs, corr, msg_len,
-                                                    num_ot - i, msgs_per_ot);
-          }
-        }
-      } else if (omp_get_thread_num() == 0 && use_straight_ot) {
-        if (party == sci::ALICE) {
-          if (batch_size <= num_ot - i) {
-            otpack->iknp_straight->send_batched_cot(ABs, corr, msg_len,
-                                                    batch_size, msgs_per_ot);
-          } else {
-            otpack->iknp_straight->send_batched_cot(ABs, corr, msg_len,
-                                                    num_ot - i, msgs_per_ot);
-          }
-        } else { // party == sci::BOB
-          if (batch_size <= num_ot - i) {
-            otpack->iknp_straight->recv_batched_cot(ABr, choice, msg_len,
-                                                    batch_size, msgs_per_ot);
-          } else {
-            otpack->iknp_straight->recv_batched_cot(ABr, choice, msg_len,
-                                                    num_ot - i, msgs_per_ot);
-          }
-        }
-      }
+    const int current_batch =
+        std::min(batch_size, static_cast<int>(num_ot - i));
+    // The VOLE pack uses one NetIO for both logical directions.  Execute the
+    // two BLB cross terms serially in the same order on both parties; after
+    // the old OpenMP pragma was disabled, the thread-id branch below silently
+    // skipped the reversed cross term entirely.
+    if (use_straight_ot) {
+      if (party == sci::ALICE)
+        otpack->iknp_straight->send_batched_cot(
+            ABs, corr, msg_len, current_batch, msgs_per_ot);
+      else
+        otpack->iknp_straight->recv_batched_cot(
+            ABr, choice, msg_len, current_batch, msgs_per_ot);
+    }
+    if (use_reversed_ot) {
+      if (party == sci::ALICE)
+        otpack->iknp_reversed->recv_batched_cot(
+            ABr, choice, msg_len, current_batch, msgs_per_ot);
+      else
+        otpack->iknp_reversed->send_batched_cot(
+            ABs, corr, msg_len, current_batch, msgs_per_ot);
     }
     // cout << "mul ot ok" << endl;
     for (int h = 0; h < dim2; h++) {

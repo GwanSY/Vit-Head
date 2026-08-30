@@ -51,6 +51,13 @@ public:
   void s_extend_wide(int32_t dim, const uint64_t *inA,
                      uint64_t *out_low, uint64_t *out_high,
                      int32_t bwA, int32_t bwB, uint8_t *msbA = nullptr);
+
+  // Zero extension for a ring share.  This is the linear lift used when a
+  // local Algorithm-1 FFT needs a wider temporary ring; unlike signed
+  // extension it preserves the l-bit residue of each share.
+  void z_extend_wide(int32_t dim, uint64_t *inA,
+                     uint64_t *out_low, uint64_t *out_high,
+                     int32_t bwA, int32_t bwB, uint8_t *msbA = nullptr);
   
   //By xts
   void z_prime2ring(int32_t dim, uint64_t *inA, uint64_t *outB,

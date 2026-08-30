@@ -73,7 +73,7 @@ bash repro/run_original_bert.sh
 
 ```bash
 grep -E 'HE_BACKEND mode=gpu|BLB_VIT_BASELINE.*backend=gpu' \
-  /home/dm/mind/MIND_code/Pencil/BLB/outputs/bert_layer0_gpu_100m_80ms/alice.log
+  /home/dm/mind/Vit-Head/BLB.pre_formal_20260826/outputs/bert_layer0_gpu_100m_80ms/alice.log
 ```
 
 CPU 与 GPU 使用同一个真实 checkpoint；GPU 路径已具备与 host plaintext 对应的
