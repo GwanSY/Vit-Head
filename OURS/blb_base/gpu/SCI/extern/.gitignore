@@ -1,0 +1,5 @@
+bin
+thirdparty
+CMakeCache.txt
+eigen
+SEAL

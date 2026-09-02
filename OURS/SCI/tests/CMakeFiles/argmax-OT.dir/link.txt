@@ -1,1 +1,0 @@
-/usr/bin/c++    -rdynamic CMakeFiles/argmax-OT.dir/test_ring_argmax.o  -o argmax-OT -lSCI-OT 

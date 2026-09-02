@@ -1,1 +1,0 @@
-/usr/bin/c++    -rdynamic CMakeFiles/fc-HE.dir/test_field_fc.o  -o fc-HE -lSCI-HE 

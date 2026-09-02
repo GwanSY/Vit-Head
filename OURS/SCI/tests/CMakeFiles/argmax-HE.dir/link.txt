@@ -1,1 +1,0 @@
-/usr/bin/c++    -rdynamic CMakeFiles/argmax-HE.dir/test_field_argmax.o  -o argmax-HE -lSCI-HE 

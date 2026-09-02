@@ -1,1 +1,0 @@
-/usr/bin/c++    -rdynamic CMakeFiles/sigmoid-OT.dir/test_ring_sigmoid.o  -o sigmoid-OT -lSCI-OT 

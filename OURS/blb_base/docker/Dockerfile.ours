@@ -1,0 +1,14 @@
+FROM crpi-hxmgk7l66ku6bx2x.cn-hangzhou.personal.cr.aliyuncs.com/tianshixu/ppdl:blbv1
+
+# Keep the derived image minimal: the native executable and public offline
+# verification scripts are immutable image content. Checkpoints, inputs,
+# plans, and result directories are supplied as narrowly scoped runtime mounts.
+WORKDIR /workspace/OURS
+
+COPY build/container-gpu/bin/ours_vit_b16_main build/gpu/bin/ours_vit_b16_main
+COPY build/container-gpu/bin/ours_vit_hetero_plan_test build/gpu/bin/ours_vit_hetero_plan_test
+COPY build/container-gpu/extern/phantom/lib/libPhantom.so /opt/ours/lib/libPhantom.so
+COPY scripts/run_ours_vit_b16.sh scripts/run_ours_vit_b16.sh
+COPY ours_vit_b16/scripts/ ours_vit_b16/scripts/
+
+ENV LD_LIBRARY_PATH=/opt/ours/lib:/usr/local/cuda-12.3/targets/x86_64-linux/lib

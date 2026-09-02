@@ -1,0 +1,17 @@
+*
+!build/
+!build/container-gpu/
+!build/container-gpu/bin/
+!build/container-gpu/bin/ours_vit_b16_main
+!build/container-gpu/bin/ours_vit_hetero_plan_test
+!build/container-gpu/extern/
+!build/container-gpu/extern/phantom/
+!build/container-gpu/extern/phantom/lib/
+!build/container-gpu/extern/phantom/lib/libPhantom.so
+!scripts/
+!scripts/run_ours_vit_b16.sh
+!ours_vit_b16/
+!ours_vit_b16/scripts/
+!ours_vit_b16/scripts/*.py
+!docker/
+!docker/Dockerfile.ours
