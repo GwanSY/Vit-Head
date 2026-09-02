@@ -3,7 +3,7 @@
 以下命令都在 BOLT 根目录执行：
 
 ```bash
-cd /home/dm/mind/MIND_code/Pencil/BOLT
+cd /home/dm/mind/Vit-Head/BOLT
 ```
 
 ## 1. 先选择模型，再选择执行后端
@@ -44,7 +44,7 @@ CPU/SEAL evaluator。
 ### 1.3 进入 CPU 环境
 
 ```bash
-cd /home/dm/mind/MIND_code/Pencil/BOLT
+cd /home/dm/mind/Vit-Head/BOLT
 source .venv-vit-b16/bin/activate
 python -c 'import torch; print(torch.__version__, torch.cuda.is_available())'
 ```

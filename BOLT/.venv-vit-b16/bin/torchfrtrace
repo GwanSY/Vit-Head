@@ -1,4 +1,4 @@
-#!/home/dm/mind/MIND_code/Pencil/BOLT/.venv-vit-b16/bin/python
+#!/home/dm/mind/Vit-Head/BOLT/.venv-vit-b16/bin/python
 import sys
 from tools.flight_recorder.fr_trace import main
 if __name__ == '__main__':

@@ -56,7 +56,7 @@ not the ZIP path and not the `weights_txt/` directory itself.  For example,
 after extracting the official `bolt.zip` in this checkout, MRPC uses:
 
 ```text
-/home/dm/mind/MIND_code/Pencil/BOLT/datasets/official_bert/bolt/quantize/mrpc
+/home/dm/mind/Vit-Head/BOLT/datasets/official_bert/bolt/quantize/mrpc
 └── weights_txt/
     ├── classifier.weight.txt
     ├── classifier.bias.txt

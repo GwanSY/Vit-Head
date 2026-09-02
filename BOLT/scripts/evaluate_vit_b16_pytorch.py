@@ -15,6 +15,11 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--image-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--predictions-output",
+        type=Path,
+        help="optional per-image CSV with top-1/top-5 predictions and margin",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument(
@@ -65,6 +70,7 @@ def main() -> None:
     model.eval()
     correct1 = 0
     correct5 = 0
+    prediction_rows: list[dict[str, object]] = []
     with torch.inference_mode():
         for start in range(0, len(samples), args.batch_size):
             batch = samples[start:start + args.batch_size]
@@ -82,6 +88,23 @@ def main() -> None:
             correct1 += int((predictions == labels).sum().item())
             top5 = logits.topk(k=5, dim=-1).indices
             correct5 += int((top5 == labels[:, None]).any(dim=1).sum().item())
+            top2_values = logits.topk(k=2, dim=-1).values
+            if args.predictions_output:
+                for (image, label), prediction, top5_row, top2_row in zip(
+                    batch,
+                    predictions.cpu().tolist(),
+                    top5.cpu().tolist(),
+                    top2_values.cpu().tolist(),
+                ):
+                    prediction_rows.append({
+                        "image_path": str(image),
+                        "true_label": label,
+                        "top1": prediction,
+                        "top5": ";".join(str(value) for value in top5_row),
+                        "top1_margin": top2_row[0] - top2_row[1],
+                        "top1_correct": prediction == label,
+                        "top5_correct": label in top5_row,
+                    })
 
     report = {
         "format": "BOLT_VIT_B16_PYTORCH_IMAGENET_EVAL_V1",
@@ -97,6 +120,15 @@ def main() -> None:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if args.predictions_output:
+        args.predictions_output.parent.mkdir(parents=True, exist_ok=True)
+        with args.predictions_output.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=(
+                "image_path", "true_label", "top1", "top5", "top1_margin",
+                "top1_correct", "top5_correct",
+            ))
+            writer.writeheader()
+            writer.writerows(prediction_rows)
     print(f"VIT_PYTORCH_IMAGENET_SAMPLES={len(samples)}")
     print(f"VIT_PYTORCH_IMAGENET_TOP1={correct1 / len(samples):.8f}")
     print(f"VIT_PYTORCH_IMAGENET_TOP5={correct5 / len(samples):.8f}")

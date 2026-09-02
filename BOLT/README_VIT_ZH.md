@@ -18,7 +18,7 @@ BOLT/
 BERT 的 `<data>` 必须是直接包含 `weights_txt/` 的目录，例如：
 
 ```text
-/home/dm/mind/MIND_code/Pencil/BOLT/datasets/official_bert/bolt/quantize/mrpc
+/home/dm/mind/Vit-Head/BOLT/datasets/official_bert/bolt/quantize/mrpc
 └── weights_txt/
     ├── bert.encoder.layer.0.attention.self.query.weight.txt
     ├── classifier.weight.txt
@@ -69,7 +69,7 @@ BERT_DATA="$PWD/datasets/official_bert/bolt/quantize/mrpc"
 先做数据预检：
 
 ```bash
-cd /home/dm/mind/MIND_code/Pencil/BOLT
+cd /home/dm/mind/Vit-Head/BOLT
 
 python3 scripts/preflight_bert_data.py \
   --data "$PWD/datasets/official_bert/bolt/quantize/mrpc" \
@@ -86,7 +86,7 @@ PORT=18000 SAMPLE_ID=0 NUM_SAMPLE=1 \
   scripts/run_bert_e2e.sh 2>&1 | tee outputs/bert_e2e_mrpc/runner.log
 ```
 #### 改显卡
-cd /home/dm/mind/MIND_code/Pencil/BOLT
+cd /home/dm/mind/Vit-Head/BOLT
 
 unset BOLT_VIT_MAX_LAYERS
 

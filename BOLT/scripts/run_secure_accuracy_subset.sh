@@ -5,7 +5,9 @@ set -euo pipefail
 # This is an experiment harness only: it does not alter the secure operator
 # graph or enable a layer-prefix validation mode.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MANIFEST="${1:-$ROOT/datasets/imagenet2012/val/validation_manifest_100.csv}"
+WORKSPACE_ROOT="$(cd "$ROOT/.." && pwd)"
+DATASET_ROOT="${DATASET_ROOT:-$WORKSPACE_ROOT/datasets/imagenet2012/val}"
+MANIFEST="${1:-$WORKSPACE_ROOT/datasets/imagenet2012/splits/secure_random_seed20260830_n100.csv}"
 OUTPUT_ROOT="${2:-$ROOT/outputs/secure_accuracy}"
 BASE_PORT="${3:-49201}"
 
@@ -13,15 +15,18 @@ BASE_PORT="${3:-49201}"
 BINARY="${BINARY:-$ROOT/SCI/build_gpu/bin/BOLT_VIT_GPU}"
 PYTHON="${PYTHON:-$ROOT/.venv-vit-b16/bin/python}"
 BOLT_GPU_RESIDENT="${BOLT_GPU_RESIDENT:-0}"
+PHANTOM_LIB_DIR="${BOLT_PHANTOM_LIB_DIR:-$WORKSPACE_ROOT/../MIND_code/Pencil/.retired-OURS-20260830/build_vit_b16_gpu/sci/extern/phantom/lib}"
 
 [[ -s "$MANIFEST" ]] || { echo "manifest not found or empty: $MANIFEST" >&2; exit 2; }
 [[ -x "$BINARY" ]] || { echo "executable not found: $BINARY" >&2; exit 2; }
 [[ -x "$PYTHON" ]] || { echo "Python interpreter not found: $PYTHON" >&2; exit 2; }
+[[ -s "$PHANTOM_LIB_DIR/libPhantom.so" ]] || { echo "Phantom runtime not found: $PHANTOM_LIB_DIR/libPhantom.so" >&2; exit 2; }
+export LD_LIBRARY_PATH="$PHANTOM_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 mkdir -p "$OUTPUT_ROOT"
 SUMMARY="$OUTPUT_ROOT/summary.csv"
 if [[ ! -s "$SUMMARY" ]]; then
-  printf 'index,image_path,true_label,predicted_class,fixed_class,secure_matches_fixed,secure_correct,status,return_code,communication_bytes,end_to_end_time_ms\n' > "$SUMMARY"
+  printf 'index,image_path,true_label,clear_class,fixed_class,secure_class,clear_correct,fixed_correct,secure_correct,secure_matches_fixed,fixed_matches_clear,status,return_code,communication_bytes,end_to_end_time_ms\n' > "$SUMMARY"
 fi
 
 mapfile -t ROWS < "$MANIFEST"
@@ -43,12 +48,12 @@ for row in "${ROWS[@]}"; do
 
   # A PASS row is durable evidence that this item completed.  This makes an
   # interrupted batch resumable without rerunning completed secure sessions.
-  if awk -F',' -v id="$index" '$1 == id && $8 == "PASS" { found=1 } END { exit !found }' "$SUMMARY"; then
+  if awk -F',' -v id="$index" '$1 == id && $12 == "PASS" { found=1 } END { exit !found }' "$SUMMARY"; then
     echo "BOLT_VIT_SECURE_SAMPLE index=$index status=SKIP_ALREADY_PASS"
     continue
   fi
 
-  image_path="$ROOT/datasets/imagenet2012/val/$relative_image"
+  image_path="$DATASET_ROOT/$relative_image"
   mkdir -p "$sample_output"
   echo "BOLT_VIT_SECURE_SAMPLE index=$index/$total image=$relative_image label=$true_label port=$port status=START"
 
@@ -62,30 +67,40 @@ for row in "${ROWS[@]}"; do
   return_code=$?
   set -e
 
-  predicted_class=""
+  secure_class=""
   if [[ -s "$sample_output/prediction.txt" ]]; then
-    predicted_class="$(sed -n 's/.*predicted_class[ =]\([0-9][0-9]*\).*/\1/p; s/.*class[= ]\([0-9][0-9]*\).*/\1/p' "$sample_output/prediction.txt" | tail -1)"
+    secure_class="$(sed -n 's/.*predicted_class[ =]\([0-9][0-9]*\).*/\1/p; s/.*class[= ]\([0-9][0-9]*\).*/\1/p' "$sample_output/prediction.txt" | tail -1)"
   fi
+  clear_class=""
   fixed_class=""
   secure_matches_fixed=""
+  fixed_matches_clear=""
   if [[ -s "$sample_output/reference_report.json" ]]; then
-    read -r fixed_class secure_matches_fixed < <(
+    read -r clear_class fixed_class secure_matches_fixed fixed_matches_clear < <(
       "$PYTHON" - "$sample_output/reference_report.json" <<'PY'
 import json
 import sys
 report = json.load(open(sys.argv[1], encoding="utf-8"))
+clear = report.get("clear", {})
 fixed = report.get("fixed", {})
 secure = report.get("secure", {})
-print(fixed.get("top1", ""), secure.get("top1_matches_fixed", ""))
+print(
+    clear.get("top1", ""),
+    fixed.get("top1", ""),
+    secure.get("top1_matches_fixed", ""),
+    fixed.get("top1_matches_clear", ""),
+)
 PY
     )
   fi
+  clear_correct="false"
+  fixed_correct="false"
   secure_correct="false"
-  if [[ -n "$predicted_class" && "$predicted_class" == "$true_label" ]]; then
-    secure_correct="true"
-  fi
+  [[ -n "$clear_class" && "$clear_class" == "$true_label" ]] && clear_correct="true"
+  [[ -n "$fixed_class" && "$fixed_class" == "$true_label" ]] && fixed_correct="true"
+  [[ -n "$secure_class" && "$secure_class" == "$true_label" ]] && secure_correct="true"
   status="FAIL"
-  if [[ "$return_code" -eq 0 && -n "$predicted_class" && -n "$fixed_class" && "$secure_matches_fixed" == "True" ]]; then
+  if [[ "$return_code" -eq 0 && -n "$secure_class" && -n "$fixed_class" && "$secure_matches_fixed" == "True" ]]; then
     status="PASS"
   fi
 
@@ -96,11 +111,16 @@ PY
     communication_bytes="$(sed -n 's/.*communication_bytes=\([0-9][0-9]*\).*/\1/p' <<< "$metrics_line")"
     end_to_end_time_ms="$(sed -n 's/.*end_to_end_time_ms=\([0-9.][0-9.]*\).*/\1/p' <<< "$metrics_line")"
   fi
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$index" "$relative_image" "$true_label" "$predicted_class" "$fixed_class" \
-    "$secure_matches_fixed" "$secure_correct" "$status" "$return_code" \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$index" "$relative_image" "$true_label" "$clear_class" "$fixed_class" \
+    "$secure_class" "$clear_correct" "$fixed_correct" "$secure_correct" \
+    "$secure_matches_fixed" "$fixed_matches_clear" "$status" "$return_code" \
     "$communication_bytes" "$end_to_end_time_ms" >> "$SUMMARY"
-  echo "BOLT_VIT_SECURE_SAMPLE index=$index predicted=$predicted_class fixed=$fixed_class secure_correct=$secure_correct secure_matches_fixed=$secure_matches_fixed status=$status return_code=$return_code"
+  echo "BOLT_VIT_SECURE_SAMPLE index=$index secure=$secure_class fixed=$fixed_class label=$true_label secure_correct=$secure_correct secure_matches_fixed=$secure_matches_fixed status=$status return_code=$return_code"
+  if [[ "$status" != "PASS" ]]; then
+    echo "BOLT_VIT_SECURE_SUBSET_STOP index=$index reason=NUMERICAL_OR_PROTOCOL_GATE_FAILED" >&2
+    exit 1
+  fi
 done
 
 echo "BOLT_VIT_SECURE_SUBSET_DONE summary=$SUMMARY"

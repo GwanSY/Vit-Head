@@ -1,2 +1,0 @@
-# BGV Examples
-

@@ -34,8 +34,9 @@ find_dependency(GMP REQUIRED)
 find_dependency(Threads REQUIRED)
 
 set_and_check(INSTALL_DIR "${PACKAGE_PREFIX_DIR}")
-find_dependency(Eigen3 REQUIRED PATHS "/home/dm/mind/MIND_code/Pencil/BLB/SCI/build/../extern/eigen/build" NO_DEFAULT_PATH)
-find_dependency(SEAL REQUIRED PATHS "/home/dm/mind/MIND_code/Pencil/BLB/SCI/build" NO_DEFAULT_PATH)
+get_filename_component(SCI_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+find_dependency(Eigen3 REQUIRED PATHS "${SCI_SOURCE_DIR}/extern/eigen/build")
+find_dependency(SEAL REQUIRED PATHS "${SCI_SOURCE_DIR}/build")
 find_dependency(OpenMP REQUIRED)
 
 # Add the targets file

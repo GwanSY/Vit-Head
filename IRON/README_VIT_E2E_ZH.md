@@ -184,7 +184,7 @@ bash scripts/build_secure_vit.sh \
 一键启动 ALICE 和 BOB：
 
 ```bash
-cd /home/dm/mind/MIND_code/Pencil/IRON
+cd /home/dm/mind/Vit-Head/IRON
 bash scripts/run_secure_vit_e2e.sh
 ```
 
@@ -228,7 +228,7 @@ DEBUG_LOGITS=1 PORT=47220 OUTPUT="$PWD/outputs/vit_debug" \
 先生成 fixture：
 
 ```bash
-cd /home/dm/mind/MIND_code/Pencil/IRON
+cd /home/dm/mind/Vit-Head/IRON
 python3 ../BOLT/scripts/generate_vit_fixture.py \
   --protocol IRON --out-dir fixtures/vit_smoke
 ```
