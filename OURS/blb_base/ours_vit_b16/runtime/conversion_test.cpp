@@ -1079,11 +1079,17 @@ int main(int argc, char **argv) {
       const double input_value =
           ldexp(static_cast<double>(signed_ring(exp_expected[index])),
                 -kScale);
-      const int64_t reference = input_value > -13.0
-                                    ? static_cast<int64_t>(llround(
-                                          pow(1.0 + input_value / 64.0,
-                                              64.0) * ldexp(1.0, kScale)))
-                                    : 0;
+      const bool secure_clamp =
+          getenv("OURS_VIT_SECURE_EXP_CLAMP") != nullptr &&
+          strcmp(getenv("OURS_VIT_SECURE_EXP_CLAMP"), "0") != 0;
+      const double divisor = secure_clamp ? 64.0 : 128.0;
+      const double exponent = secure_clamp ? 64.0 : 128.0;
+      const int64_t reference = secure_clamp && input_value <= -13.0
+                                    ? 0
+                                    : static_cast<int64_t>(llround(
+                                          pow(1.0 + input_value / divisor,
+                                              exponent) *
+                                          ldexp(1.0, kScale)));
       const int64_t error = decoded_value - reference;
       const uint64_t absolute =
           static_cast<uint64_t>(error < 0 ? -error : error);

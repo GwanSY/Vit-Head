@@ -966,6 +966,19 @@ int main(int argc, char **argv) {
     const bool hetero_attention_trace =
         getenv("OURS_VIT_HETERO_ATTENTION_TRACE") != nullptr &&
         string(getenv("OURS_VIT_HETERO_ATTENTION_TRACE")) == "1";
+    bool heterogeneous_group_packing = true;
+    if (getenv("OURS_VIT_GROUP_PACKING") != nullptr) {
+      const string value(getenv("OURS_VIT_GROUP_PACKING"));
+      if (value != "0" && value != "1")
+        throw runtime_error("OURS_VIT_GROUP_PACKING must be 0 or 1");
+      heterogeneous_group_packing = value == "1";
+    }
+    if (!heterogeneous_group_packing &&
+        args.ablation < ours_vit::Ablation::A3)
+      throw runtime_error(
+          "unpacked attention is a validation-only A3/A4 ablation");
+    bert.heterogeneous_group_packing_enabled =
+        heterogeneous_group_packing;
     if (a0_trace) {
       if (args.ablation != ours_vit::Ablation::A0 ||
           args.stop_after_block != 1 ||
@@ -1239,7 +1252,15 @@ int main(int argc, char **argv) {
          << " selective_conversion="
          << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0)
          << " blb_fast_attention_packing="
-         << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0) << endl;
+         << (args.ablation >= ours_vit::Ablation::A3 &&
+                     heterogeneous_group_packing
+                 ? 1
+                 : 0)
+         << " attention_packing="
+         << (args.ablation >= ours_vit::Ablation::A3
+                 ? (heterogeneous_group_packing ? "packed" : "unpacked")
+                 : "not_applicable")
+         << endl;
 
     vector<BlockProfile> profiles;
     profiles.reserve(kLayers);
@@ -1273,8 +1294,79 @@ int main(int argc, char **argv) {
            << "patch_embedding=original_bsgs2_ckks\n"
            << "attention_score_scale=1/sqrt(head_dim)=1/8\n"
            << "attention_scale=public_ckks_q_scale_metadata_div8\n"
-           << "fixed_point_ring_bits=37\nfixed_point_scale_bits=12\n"
-           << "attention_normalization="
+           << "fixed_point_ring_bits=37\nfixed_point_scale_bits=12\n";
+      const auto enabled_env = [](const char *name) {
+        const char *value = getenv(name);
+        return value != nullptr && *value != '\0' && string(value) != "0";
+      };
+      const bool unsafe_legacy_conversion =
+          enabled_env("OURS_VIT_UNSAFE_LEGACY_CONVERSION");
+      const bool unsafe_legacy_ckks_to_mpc =
+          unsafe_legacy_conversion ||
+          enabled_env("OURS_VIT_UNSAFE_LEGACY_CKKS_TO_MPC");
+      const bool unsafe_legacy_mpc_to_ckks =
+          unsafe_legacy_conversion ||
+          enabled_env("OURS_VIT_UNSAFE_LEGACY_MPC_TO_CKKS");
+      const char *conversion_mode_value =
+          getenv("OURS_VIT_CONVERSION_MODE");
+      const string conversion_mode =
+          (conversion_mode_value == nullptr || *conversion_mode_value == '\0')
+              ? "fast"
+              : string(conversion_mode_value);
+      if (conversion_mode != "fast" && conversion_mode != "exact") {
+        throw invalid_argument(
+            "OURS_VIT_CONVERSION_MODE must be fast or exact");
+      }
+      const bool exact_conversion =
+          conversion_mode == "exact" &&
+          !unsafe_legacy_ckks_to_mpc && !unsafe_legacy_mpc_to_ckks;
+      meta << "conversion_mode_requested=" << conversion_mode << '\n'
+           << "conversion_mode_effective="
+           << (exact_conversion ? "exact" : "fast") << '\n'
+           << "conversion_path="
+           << (exact_conversion ? "exact_wide_shared_rns_extension"
+                                : "legacy_local_fft")
+           << '\n'
+           << "ckks_to_mpc_conversion="
+           << (exact_conversion ? "exact_wide" : "legacy_local_fft")
+           << '\n'
+           << "mpc_to_ckks_conversion="
+           << (exact_conversion ? "exact_wide_shared_rns_extension"
+                                : "legacy_local_fft")
+           << '\n'
+           << "softmax_product="
+           << (enabled_env("OURS_VIT_SOFTMAX_EXACT_PRODUCT")
+                   ? "mpc_exact_reference"
+                   : "blb_fast_he")
+           << '\n'
+           << "secure_exp_clamp="
+           << (enabled_env("OURS_VIT_SECURE_EXP_CLAMP") ? 1 : 0) << '\n'
+           << "softmax_exp_polynomial="
+           << (enabled_env("OURS_VIT_SECURE_EXP_CLAMP")
+                   ? "clipped_(1+x/64)^64_reference"
+                   : "comparison_free_(1+x/128)^128")
+           << '\n';
+      auto write_he_context = [&](const char *name, HE_CKKS *he) {
+        meta << name << "_poly_modulus_degree=" << he->poly_modulus_degree
+             << '\n'
+             << name << "_slots=" << he->num_slots << '\n'
+             << name << "_ckks_scale_bits=" << he->he_scale << '\n'
+             << name << "_coeff_modulus_bits=";
+        const auto &moduli = he->context->first_context_data()
+                                 ->parms().coeff_modulus();
+        for (size_t i = 0; i < moduli.size(); ++i) {
+          if (i) meta << ',';
+          meta << moduli[i].bit_count();
+        }
+        meta << '\n';
+      };
+      write_he_context("he1", bert.linear.he1);
+      write_he_context("he2", bert.linear.he2);
+      write_he_context("he3", bert.linear.he3);
+      write_he_context("he4", bert.linear.he4);
+      write_he_context("he_softmax", bert.linear.he_softmax);
+      write_he_context("he_onetime", bert.linear.he_onetime);
+      meta << "attention_normalization="
            << (args.ablation == ours_vit::Ablation::A0
                    ? "original_blb_softmax_he_mpc"
                    : args.ablation == ours_vit::Ablation::A1
@@ -1286,7 +1378,16 @@ int main(int argc, char **argv) {
            << "selective_conversion="
            << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0) << '\n'
            << "blb_fast_attention_packing="
-           << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0) << '\n'
+           << (args.ablation >= ours_vit::Ablation::A3 &&
+                       heterogeneous_group_packing
+                   ? 1
+                   : 0)
+           << '\n'
+           << "attention_packing="
+           << (args.ablation >= ours_vit::Ablation::A3
+                   ? (heterogeneous_group_packing ? "packed" : "unpacked")
+                   : "not_applicable")
+           << '\n'
            << "native_ckks_linear="
            << (args.ablation == ours_vit::Ablation::A4 ? 1 : 0) << '\n'
            << "client_decrypt_reencrypt=0\n"
@@ -1297,7 +1398,7 @@ int main(int argc, char **argv) {
                    : 0)
            << '\n'
            << "layernorm=original_blb_layer_norm_mpc_ckks_affine\n"
-           << "gelu=original_blb_gelu_ckks_mpc\n"
+           << "gelu=symmetric_even_quartic_ckks_plus_half_x_mpc_tail\n"
            << "classifier=cls_only_original_bsgs2_ckks\n"
            << "classifier_logical_outputs=1000\n"
            << "classifier_physical_outputs=1024\n"
@@ -1443,6 +1544,14 @@ int main(int argc, char **argv) {
       decode_attention_output(bert, qkv_packed, qk, v);
       write_diagnostic_aggregate_max(qk, "block_0_qk");
       write_diagnostic_aggregate_max(v, "block_0_v");
+      if (hetero_attention_trace && layer == 0) {
+        FixArray qk_row(bert.party, qk.size, qk.signed_, qk.ell, qk.s);
+        bert.linear.plain_cross_packing_postprocess(
+            qk.data, qk_row.data, false, bert.linear.data_lin1_0);
+        write_hetero_attention_stage(
+            bert, qk_row, "block_0_qk",
+            {kHeads, kPhysicalTokens, kPhysicalTokens});
+      }
       if (a0_trace && layer == 0) {
         if (!bert.a0_qkv_ready)
           throw runtime_error("A0 Q/K/V observer was not populated");
@@ -1472,12 +1581,18 @@ int main(int argc, char **argv) {
       } else {
         qk = bert.heterogeneous_attention_norm_a1(
             qk, protocols, alphas, kLogicalTokens, layer,
-            args.ablation >= ours_vit::Ablation::A2,
+            args.ablation >= ours_vit::Ablation::A2 &&
+                (args.ablation < ours_vit::Ablation::A3 ||
+                 heterogeneous_group_packing),
             args.ablation >= ours_vit::Ablation::A3);
       }
       if (a0_trace && layer == 0)
         write_a0_stage(bert, qk, "block_0_softmax",
                        {kHeads, kPhysicalTokens, kPhysicalTokens});
+      if (hetero_attention_trace && layer == 0)
+        write_hetero_attention_stage(
+            bert, qk, "block_0_norm",
+            {kHeads, kPhysicalTokens, kPhysicalTokens});
       write_diagnostic_aggregate_max(qk, "block_0_softmax");
       write_diagnostic_softmax_row_sum_error(
           qk, "block_0_softmax_row_sum_error");
@@ -1537,6 +1652,29 @@ int main(int argc, char **argv) {
           (bert.he_compute_la - he_before_linear2) * 1000.0;
       bert.pre_norm_attention_output_only = false;
       hidden = attention_result.at("residual");
+      if (a0_trace && layer == 0) {
+        if (!bert.a0_av_wo_ready)
+          throw runtime_error("A0 AV/W_O observers were not populated");
+        const FixArray av = a0_projected_tensor_to_token_major(
+            bert.a0_av_share, bert.party, args.physical_tokens);
+        write_a0_stage(bert, av, "block_0_av",
+                       {kPhysicalTokens, kDim});
+        write_a0_stage(bert, bert.a0_wo_share, "block_0_wo",
+                       {kPhysicalTokens, kDim});
+      }
+      if (hetero_attention_trace && layer == 0) {
+        if (!bert.heterogeneous_av_wo_ready)
+          throw runtime_error(
+              "Packed/Unpacked AV/W_O observers were not populated");
+        const FixArray av = a0_projected_tensor_to_token_major(
+            bert.heterogeneous_av_share, bert.party,
+            args.physical_tokens);
+        write_hetero_attention_stage(
+            bert, av, "block_0_av", {kPhysicalTokens, kDim});
+        write_hetero_attention_stage(
+            bert, bert.heterogeneous_wo_share, "block_0_wo",
+            {kPhysicalTokens, kDim});
+      }
       if (args.ablation >= ours_vit::Ablation::A3) {
         const int softmax_heads = static_cast<int>(count(
             protocols.begin(), protocols.end(),
@@ -1563,6 +1701,11 @@ int main(int argc, char **argv) {
           else
             ++mpc_group_calls;
         }
+        if (!heterogeneous_group_packing) {
+          protocol_groups = static_cast<int>(protocols.size());
+          mpc_group_calls = softmax_heads + relu_heads;
+          native_linear_groups = linear_heads;
+        }
         cout << fixed << setprecision(6)
              << "OURS_A3_A4_ASSIGNMENT_PROFILE status=PASS"
              << " ablation=" << ours_vit::to_string(args.ablation)
@@ -1583,6 +1726,8 @@ int main(int argc, char **argv) {
              << " protocol_groups=" << protocol_groups
              << " mpc_group_calls=" << mpc_group_calls
              << " native_linear_groups=" << native_linear_groups
+             << " attention_packing="
+             << (heterogeneous_group_packing ? "packed" : "unpacked")
              << " ckks_to_mpc="
              << bert.ckks_to_mpc_conversions - assignment_ckks_to_mpc_start
              << " mpc_to_ckks="
@@ -1637,6 +1782,9 @@ int main(int argc, char **argv) {
       // CKKS affine result above is the ViT FFN input, but passing that flat
       // tensor would drop the original BLB LayerNorm hand-off.
       auto ffn1 = bert.ln_part2_linear3_gelu_part1(ln2, layer);
+      if (a0_trace && layer == 0)
+        write_a0_stage(bert, ffn1.at("x_array"), "block_0_fc1",
+                       {kPhysicalTokens, kFfDim});
       profile.linear3_he_ms = (bert.he_compute_la - he_before_linear3) * 1000.0;
       bert.pre_norm_ffn_residual_from_external = false;
       comm.mark("block_" + to_string(layer) + "_ffn1");
@@ -1644,6 +1792,9 @@ int main(int argc, char **argv) {
 
       const auto gelu_start = chrono::steady_clock::now();
       FixArray gelu = bert.gelu_nonlinear(ffn1);
+      if (a0_trace && layer == 0)
+        write_a0_stage(bert, gelu, "block_0_gelu",
+                       {kPhysicalTokens, kFfDim});
       profile.nonlinear_gelu_core_ms = chrono::duration<double, milli>(
           chrono::steady_clock::now() - gelu_start).count();
       comm.mark("block_" + to_string(layer) + "_gelu");
@@ -1847,6 +1998,9 @@ int main(int argc, char **argv) {
           bert.layer_norm_part1_real(hidden, final_w, final_b);
       mask_layernorm_padding(final_ln, "final_ln");
       hidden = bert.layer_norm_affine_ckks(final_ln);
+      if (a0_trace)
+        write_a0_stage(bert, hidden, "final_ln",
+                       {kPhysicalTokens, kDim});
       write_diagnostic_cls(hidden, "final_ln");
       comm.mark("final_layer_norm");
       secure_protocol_seconds += chrono::duration<double>(

@@ -37,6 +37,7 @@ def main() -> None:
         "logical_tokens", "physical_tokens", "layers",
         "executed_transformer_blocks", "partial_run",
         "selective_conversion", "blb_fast_attention_packing",
+        "attention_packing",
         "native_ckks_linear",
         "client_decrypt_reencrypt", "mpc_linear_surrogate", "backend",
         "prediction",
@@ -49,7 +50,9 @@ def main() -> None:
     if (ablation not in {"A3", "A4"} or meta.get("partial_run") != "0" or
             meta.get("executed_transformer_blocks") != "12" or
             meta.get("selective_conversion") != "1" or
-            meta.get("blb_fast_attention_packing") != "1" or
+            meta.get("attention_packing") not in {"packed", "unpacked"} or
+            meta.get("blb_fast_attention_packing") !=
+                ("1" if meta.get("attention_packing") == "packed" else "0") or
             meta.get("client_decrypt_reencrypt") != "0" or
             meta.get("mpc_linear_surrogate") != "0"):
         raise ValueError("run metadata do not describe a complete real A3/A4 run")
@@ -70,11 +73,12 @@ def main() -> None:
         "linear": sum(int(row["linear_heads"]) for row in direct_rows),
     }
     output = {
-        "format": "OURS_VIT_A3_A4_FULL_RUN_SUMMARY_V1",
+        "format": "OURS_VIT_A3_A4_FULL_RUN_SUMMARY_V2",
         "structural_status": "PASS",
         "performance_status": "PASS" if secure_s < 480.0 else "FAIL",
         "numerical_accuracy_status": "BLOCKED_A0",
         "ablation": ablation,
+        "attention_packing": meta["attention_packing"],
         "network": "1Gbps/0.3ms_RTT",
         "secure_end_to_end_s": secure_s,
         "under_eight_minutes": int(secure_s < 480.0),
@@ -125,6 +129,7 @@ def main() -> None:
     md_path.write_text(
         "# OURS ViT-B/16 real A3/A4 secure run\n\n"
         f"- Ablation: **{ablation}**\n"
+        f"- Attention packing: **{meta['attention_packing']}**\n"
         "- Structural path validation: **PASS**\n"
         f"- Secure end-to-end: **{secure_s:.6f} s**\n"
         f"- Under 8 minutes: **{'PASS' if secure_s < 480.0 else 'FAIL'}**\n"

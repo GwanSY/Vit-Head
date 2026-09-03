@@ -24,6 +24,7 @@ network_mode=${OURS_VIT_NETWORK_MODE:-netem}
 ablation=${OURS_VIT_ABLATION:-a0}
 head_plan=${OURS_VIT_HEAD_PLAN:-}
 prevalidated_reorder_binding=${OURS_VIT_PREVALIDATED_REORDER_BINDING:-}
+conversion_mode=${OURS_VIT_CONVERSION_MODE:-fast}
 
 if [[ "$output_dir" != /* ]]; then output_dir="$root/$output_dir"; fi
 if [[ "$backend" != cpu && "$backend" != gpu ]]; then
@@ -85,6 +86,10 @@ if [[ ! "$gpu_linear_streams" =~ ^[1-9][0-9]*$ ||
 fi
 if [[ "$network_mode" != netem && "$network_mode" != none ]]; then
   echo "OURS_VIT_NETWORK_MODE must be netem or none" >&2
+  exit 2
+fi
+if [[ "$conversion_mode" != fast && "$conversion_mode" != exact ]]; then
+  echo "OURS_VIT_CONVERSION_MODE must be fast or exact" >&2
   exit 2
 fi
 if [[ ! "$ablation" =~ ^[aA][0-4]$ ]]; then
@@ -222,6 +227,7 @@ fi
   echo "transformer_blocks=$stop_after_block"
   echo "ablation=${ablation^^}"
   echo "head_plan=${head_plan:-built_in_all_softmax_original_order}"
+  echo "conversion_mode=$conversion_mode"
   if [[ -n "${OURS_VIT_STOP_AFTER_NORMALIZATION:-}" ]]; then
     echo "cost_scope=a2_normalization_only"
     echo "conversion_cost_included=0"
@@ -236,6 +242,8 @@ fi
   echo "bob_cpus=48-95,144-159"
   echo "omp_threads_per_party=$omp_threads"
   echo "mpc_workers_per_party=64"
+  echo "cpu_model=$(lscpu | awk -F: '/^Model name:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}')"
+  echo "logical_cpu_count=$(nproc)"
   if [[ "$backend" == gpu ]]; then
     echo "alice_gpu_id=$alice_gpu_id"
     echo "bob_gpu_id=$bob_gpu_id"
@@ -252,8 +260,10 @@ fi
   lscpu | grep -E 'Model name|Socket\(s\)|Core\(s\) per socket|Thread\(s\) per core'
 } > "$output_dir/environment.txt"
 
-alice_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE)
-bob_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE)
+alice_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE
+  OURS_VIT_CONVERSION_MODE="$conversion_mode")
+bob_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE
+  OURS_VIT_CONVERSION_MODE="$conversion_mode")
 if [[ "$backend" == gpu ]]; then
   alice_env+=(CUDA_VISIBLE_DEVICES="$alice_gpu_id"
     BLB_VIT_GPU_DIRECT_PLAINTEXT="$gpu_direct_plaintext"

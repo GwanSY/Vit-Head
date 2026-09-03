@@ -516,19 +516,17 @@ def _lookup_table_exp_iron_raw(value_raw: np.ndarray) -> np.ndarray:
 
 
 def _paper_softmax_exp_raw(value_raw: np.ndarray) -> np.ndarray:
-    """Clear form of BLB Algorithm 5's clipped MPC exponentiation.
+    """Clear form of the fast, comparison-free HE exponentiation.
 
-    The secure ViT path evaluates ``(1 + x/2**6)**(2**6)`` in the MPC ring and
-    applies the paper's ``T_exp=-13`` comparison/mux.  Keep the independent
-    fixed-clear oracle on that operator instead of the unrelated lookup-table
-    exponent used by ``softmax_fix_iron``.
+    The original ``(1+x/64)**64`` schedule becomes unstable for real ViT
+    attention gaps below -128.  The fast-correct binary folds division by 128
+    into MPC-to-CKKS conversion and evaluates ``(1+x/128)**128`` with the same
+    seven rescale levels as the old divide-then-six-square implementation.
     """
     shifted = (_ring_signed(_ring_reduce(value_raw, ELL), ELL)
                .astype(np.float64) / float(1 << ACT_SCALE))
-    valid = shifted > -13.0
-    approximate = np.zeros_like(shifted, dtype=np.float64)
-    approximate[valid] = np.power(
-        1.0 + shifted[valid] / float(1 << 6), 1 << 6)
+    approximate = np.power(
+        1.0 + shifted / float(1 << 7), 1 << 7)
     return _ring_reduce(
         np.floor(approximate * float(1 << ACT_SCALE)).astype(np.int64), ELL)
 
@@ -650,53 +648,29 @@ def fixed_linear_scaling(value: np.ndarray, alpha: float) -> np.ndarray:
 def fixed_gelu(value: np.ndarray) -> np.ndarray:
     """Bit-exact clear emulation of the secure ViT GELU adapter.
 
-    The CKKS polynomial and MPC tail both cross the reproduced BLB boundary
-    at ell=37, scale=12.  The 20-bit polynomial selector is evaluated here in
-    clear with the same fixed-point constants.
+    CKKS evaluates a symmetric quartic approximation of GELU's even term.
+    MPC adds x/2 and selects the exact ReLU tail.  Both values cross the
+    reproduced boundary at ell=37, scale=12.
     """
     input_raw = _ring_reduce(round_int(value, ACT_SCALE), ELL)
-    scale11 = _ring_right_shift(
-        input_raw, ELL, ACT_SCALE - GELU_INPUT_SCALE)
-    x = _ring_reduce(scale11, 20)
-    ell = 20
-    scale = GELU_INPUT_SCALE
-    x_signed = _ring_signed(x, ell)
-    y = np.where(x_signed < 0, _ring_reduce(-x_signed, ell), x)
+    x_signed = _ring_signed(input_raw, ELL)
+    x_real = x_signed.astype(np.float64) / float(1 << GELU_INPUT_SCALE)
+    polynomial_real = (
+        -0.018154344446004743 * np.square(np.square(x_real))
+        + 0.30869355275897581 * np.square(x_real)
+        + 0.027529737185454588)
+    polynomial = _ring_reduce(
+        round_int(polynomial_real, GELU_OUTPUT_SCALE), ELL)
+    half_x = _ring_right_shift(input_raw, ELL, 1)
+    gelu_inner = _ring_add(half_x, polynomial, ELL)
 
-    constants = [
-        _cpp_fixed_constant(0.14439048359960427, scale, ell),
-        _cpp_fixed_constant(-0.7077117131613893, scale, ell),
-        _cpp_fixed_constant(4.5702822654246535, scale, ell),
-        _cpp_fixed_constant(-8.15444702051307, scale, ell),
-        _cpp_fixed_constant(16.382265425072532, scale, ell),
-        _cpp_fixed_constant(0.5, scale, ell),
-    ]
-    c1, c2, c3, c4, c5, half = constants
-    product_ell = ell + scale
-
-    y_c1 = _ring_mul(y, ell, c1, ell, product_ell)
-    y_c1 = _ring_truncate_reduce(y_c1, product_ell, scale)
-    z_left = _ring_add(y_c1, c2, ell)
-    z_left = _ring_mul(z_left, ell, y, ell, product_ell)
-    z_left = _ring_truncate_reduce(z_left, product_ell, scale)
-    z = _ring_add(z_left, c3, ell)
-
-    polynomial = _ring_add(_ring_add(z, y_c1, ell), c4, ell)
-    polynomial = _ring_mul(polynomial, ell, z, ell, product_ell)
-    polynomial = _ring_truncate_reduce(polynomial, product_ell, scale)
-    polynomial = _ring_add(polynomial, c5, ell)
-    half_x = _ring_mul(x, ell, half, ell, product_ell)
-    half_x = _ring_truncate_reduce(half_x, product_ell, scale)
-    gelu_inner = _ring_add(half_x, polynomial, ell)
-
-    within_polynomial = (_ring_signed(y, ell) <
-                         math.trunc(2.7 * (1 << scale)))
-    nonnegative_half = _ring_right_shift(_ring_add(x, y, ell), ell, 1)
+    y = np.abs(x_signed)
+    within_polynomial = y < math.trunc(2.7 * (1 << GELU_INPUT_SCALE))
+    abs_raw = _ring_reduce(y, ELL)
+    nonnegative_half = _ring_right_shift(
+        _ring_add(input_raw, abs_raw, ELL), ELL, 1)
     selected = np.where(within_polynomial, gelu_inner, nonnegative_half)
-    extended = _ring_reduce(_ring_signed(selected, ell), ELL)
-    output = _ring_right_shift(
-        extended, ELL, GELU_INPUT_SCALE - GELU_OUTPUT_SCALE)
-    return (_ring_signed(output, ELL).astype(np.float64) /
+    return (_ring_signed(selected, ELL).astype(np.float64) /
             float(1 << GELU_OUTPUT_SCALE))
 
 
@@ -1046,7 +1020,7 @@ class Graph:
             activated = self.mask_tokens(activated)
             self.record(f"block_{layer}.gelu", activated,
                         GELU_OUTPUT_SCALE if self.fixed else "float64",
-                        "physical_gelu_ell20_to_ell37" if self.fixed else "logical_gelu")
+                        "physical_symmetric_quartic_ell37" if self.fixed else "logical_gelu")
             second = self.linear(activated, block["ff2_weight"], block["ff2_bias"],
                                  GELU_OUTPUT_SCALE if self.fixed else 0,
                                  ACT_SCALE, 5 if self.fixed else WEIGHT_SCALE,

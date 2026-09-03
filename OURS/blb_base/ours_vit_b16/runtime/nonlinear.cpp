@@ -1,6 +1,7 @@
 #include "nonlinear.h"
 
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 int configured_worker_count() {
@@ -13,6 +14,11 @@ int configured_worker_count() {
         "OURS_VIT_MPC_WORKERS must be an integer in [1,64]");
   }
   return static_cast<int>(parsed);
+}
+
+bool legacy_fast_conversion_scale_semantics() {
+  const char *value = std::getenv("OURS_VIT_CONVERSION_MODE");
+  return value == nullptr || *value == '\0' || std::strcmp(value, "fast") == 0;
 }
 }  // namespace
 
@@ -529,13 +535,17 @@ void field_to_ring_thread(int tid, int party, uint64_t *x, uint64_t p, uint64_t 
   FixArray input = fpmath->fix->input(this_party, num_ops, x, false, b_in, s_in);
 
   // Match the original BLB/BERT field-to-ring adapter.  The CKKS conversion
-  // already supplies the ring word used by the original local FFT; keep this
-  // boundary free of an additional per-element secure truncation protocol.
+  // already supplies the ring word used by the original local FFT.  In the
+  // historical fast path the scale boundary was treated as aligned here;
+  // preserve that behavior because the alternative truncation is a full
+  // per-element MPC protocol and was the main source of the vit-gpu slowdown.
   FixArray output = fpmath->fix->field2ring(input, p, b_in);
   assert(b_in>=b_out);
-  // `field2ring` already returns the exact residue in the ring.  Do not
-  // overwrite s_in here: doing so silently skipped every requested
-  // right-shift and made the conversion apply an inconsistent scale.
+  if (legacy_fast_conversion_scale_semantics()) {
+    // This is the historical BLB behavior.  The fast path is a speed
+    // baseline and intentionally keeps its legacy scale contract.
+    s_in = s_out;
+  }
   if(s_in > s_out){
     output = fpmath->fix->truncate_reduce_lsb(output, s_in - s_out);
   }

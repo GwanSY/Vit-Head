@@ -35,7 +35,12 @@ def main() -> None:
     args = parser.parse_args()
 
     protocols = make_protocols(args.path, args.group_size)
-    ablation = "a4" if args.path == "linear" else "a2"
+    # Every curve point is executed by the same A4 binary and full attention
+    # boundary.  Softmax/ReLU-only layer 0 still needs a native Linear entry
+    # elsewhere in the 12-layer public plan so A4 validation proves that the
+    # binary is identical to the Linear curve.  Blocks 1..11 are not executed
+    # by the one-block profiler and therefore do not contaminate layer 0.
+    ablation = "a4"
     alpha = 1.0 / 197.0
     lines = [
         "OURS_VIT_HEAD_PLAN_V1",
@@ -43,7 +48,10 @@ def main() -> None:
         "layer,physical_head,original_head,protocol,alpha",
     ]
     for layer in range(LAYERS):
-        for physical_head, protocol in enumerate(protocols):
+        layer_protocols = protocols
+        if layer > 0 and "he_linear" not in protocols:
+            layer_protocols = ["softmax_mpc"] * (HEADS - 1) + ["he_linear"]
+        for physical_head, protocol in enumerate(layer_protocols):
             value = alpha if protocol == "he_linear" else 1.0
             lines.append(
                 f"{layer},{physical_head},{physical_head},{protocol},{value:.17g}")

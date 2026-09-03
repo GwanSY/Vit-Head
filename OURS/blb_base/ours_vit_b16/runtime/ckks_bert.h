@@ -118,6 +118,13 @@ public:
     FixArray a0_k_share;
     FixArray a0_v_share;
     bool a0_qkv_ready = false;
+    // A0-only observers for the two encrypted stages after normalization.
+    // AV is retained in the same packed per-Head layout as V; W_O is stored
+    // in token-major order before the block-input residual is added.  These
+    // shares are never read unless OURS_VIT_A0_TRACE=1.
+    FixArray a0_av_share;
+    FixArray a0_wo_share;
+    bool a0_av_wo_ready = false;
     // Retained for the ViT adapter only. The BERT path must not carry a V
     // ciphertext from Block 2's he1 context into Block 4's distinct he2
     // context; the official boundary exports/imports V through MPC.
@@ -129,6 +136,14 @@ public:
     vector<ours_vit::HeadProtocol> heterogeneous_protocols;
     vector<double> heterogeneous_alphas;
     ours_vit::Ablation heterogeneous_ablation = ours_vit::Ablation::A0;
+    // Paper ablation switch.  The default is the production packed path.
+    // Setting it false only splits otherwise identical public-plan groups and
+    // disables diagonal reuse; it never changes the Head assignment.
+    bool heterogeneous_group_packing_enabled = true;
+    // Validation-only observers used by the paired Packed/Unpacked trace.
+    FixArray heterogeneous_av_share;
+    FixArray heterogeneous_wo_share;
+    bool heterogeneous_av_wo_ready = false;
     vector<UnifiedCiphertext> a4_linear_qk_he1_cts;
     vector<UnifiedCiphertext> a4_linear_v_he1_cts;
     bool a4_linear_operands_ready = false;

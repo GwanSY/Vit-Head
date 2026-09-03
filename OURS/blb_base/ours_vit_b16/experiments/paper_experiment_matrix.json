@@ -1,0 +1,61 @@
+{
+  "format": "OURS_VIT_PAPER_EXPERIMENT_MATRIX_V1",
+  "claim_policy": {
+    "fixed_clear_is_secure_accuracy": false,
+    "unshaped_is_1Gbps_0p3ms": false,
+    "trace_timing_is_performance_evidence": false,
+    "communication_scope": "Alice_plus_Bob_aggregate",
+    "latency_statistics": ["mean", "sample_std", "p95", "min", "max"]
+  },
+  "p0": {
+    "a0_numerical_gate": {
+      "stages": ["Q", "K", "V", "QK", "Softmax", "AV", "WO",
+                 "FC1", "GELU", "FFN residual", "final LayerNorm",
+                 "logits"],
+      "required_status": "PASS",
+      "runner": "scripts/run_ours_a0_container.sh"
+    },
+    "three_path_curve": {
+      "paths": ["Softmax", "ReLU", "Linear"],
+      "group_sizes": [1, 2, 4, 6, 8, 12],
+      "expected_runs": 18,
+      "runner": "scripts/run_ours_three_path_curve.sh"
+    },
+    "secure_accuracy": {
+      "minimum_samples": 50,
+      "manifest": "ours_vit_b16/experiments/secure_manifest_50.csv",
+      "manifest_sha256": "d4b500ed21cda1d6f5a6a27e708256af45af23d3a02a6bb80ecb9736fb2b87c9",
+      "required_plans": ["All-Softmax", "final"],
+      "runner": "scripts/run_ours_secure_accuracy.sh"
+    },
+    "assignment": {
+      "artifact": "outputs/paper/head_assignment.json",
+      "finalizer": "ours_vit_b16/scripts/freeze_head_assignment.py",
+      "final_requires_a0_and_secure_50": true
+    },
+    "full12_budgets": {
+      "variants": ["All-Softmax", "Accuracy-first", "Balanced", "Performance-first"],
+      "suite": "ours_vit_b16/experiments/full12_budgets_candidate.csv",
+      "candidate_warning": "Plans remain non-final until A0 and secure-accuracy gates pass"
+    }
+  },
+  "p1": {
+    "methods": ["All-Softmax", "Random", "Sensitivity-only", "Cost-only", "Ours"],
+    "random_seeds_minimum": 5,
+    "same_count_budget_methods": ["Random", "Sensitivity-only", "Cost-only", "Ours"],
+    "all_softmax_role": "reference outside the non-Softmax count budget",
+    "runner": "scripts/run_ours_p1_secure_comparison.sh"
+  },
+  "packing": {
+    "assignment_must_match": true,
+    "variants": {"Unpacked": 0, "Packed": 1},
+    "performance_trace_separated": true,
+    "errors": ["QK", "Norm", "AV", "WO", "attention_residual", "logits"],
+    "runner": "scripts/run_ours_packing_ablation.sh"
+  },
+  "p2": {
+    "variants": ["A0", "A2", "A3", "A3+packing", "A4"],
+    "suite": "ours_vit_b16/experiments/p2_ablation_candidate.csv",
+    "runner": "scripts/run_ours_full12_suite.sh"
+  }
+}

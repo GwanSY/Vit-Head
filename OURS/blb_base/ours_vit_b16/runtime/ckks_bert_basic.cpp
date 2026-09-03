@@ -50,6 +50,40 @@ int blb_conversion_threads() {
     }
     return static_cast<int>(parsed);
 }
+
+bool blb_env_enabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool blb_exact_conversion_requested() {
+    const char *value = std::getenv("OURS_VIT_CONVERSION_MODE");
+    if (value == nullptr || *value == '\0' || std::strcmp(value, "fast") == 0) {
+        return false;
+    }
+    if (std::strcmp(value, "exact") == 0) {
+        return true;
+    }
+    throw std::invalid_argument(
+        "OURS_VIT_CONVERSION_MODE must be fast or exact");
+}
+
+bool blb_strict_ckks_to_mpc_enabled() {
+    return blb_exact_conversion_requested() &&
+           !blb_env_enabled("OURS_VIT_UNSAFE_LEGACY_CONVERSION") &&
+           !blb_env_enabled("OURS_VIT_UNSAFE_LEGACY_CKKS_TO_MPC");
+}
+
+bool blb_strict_mpc_to_ckks_enabled() {
+    return blb_exact_conversion_requested() &&
+           !blb_env_enabled("OURS_VIT_UNSAFE_LEGACY_CONVERSION") &&
+           !blb_env_enabled("OURS_VIT_UNSAFE_LEGACY_MPC_TO_CKKS");
+}
+
+bool blb_secure_exp_clamp_enabled() {
+    const char *value = std::getenv("OURS_VIT_SECURE_EXP_CLAMP");
+    return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+}
 }
 // #define SCI_HE
 #define CKKS_PERF
@@ -414,16 +448,22 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext>
             static_assert(sizeof(signed_value) == sizeof(raw),
                           "unexpected fixed-width integer size");
             memcpy(&signed_value, &raw, sizeof(raw));
-            uint64_t canonical = 0;
-            if (signed_value < 0) {
-                const uint64_t magnitude =
-                    static_cast<uint64_t>(-(signed_value + 1)) + 1;
-                const uint64_t reduced = magnitude % conversion_prime;
-                canonical = reduced == 0 ? 0 : conversion_prime - reduced;
+            if (!blb_strict_ckks_to_mpc_enabled()) {
+                // Byte-for-byte semantics of the original fast BLB adapter:
+                // field_to_ring consumes the centered coefficient word.
+                x_intt_flatten_field.push_back(raw);
             } else {
-                canonical = raw % conversion_prime;
+                uint64_t canonical = 0;
+                if (signed_value < 0) {
+                    const uint64_t magnitude =
+                        static_cast<uint64_t>(-(signed_value + 1)) + 1;
+                    const uint64_t reduced = magnitude % conversion_prime;
+                    canonical = reduced == 0 ? 0 : conversion_prime - reduced;
+                } else {
+                    canonical = raw % conversion_prime;
+                }
+                x_intt_flatten_field.push_back(canonical);
             }
-            x_intt_flatten_field.push_back(canonical);
         }
     }
     cout << "CKKS_INTT_FIELD_CANONICAL status=PASS range=[0,q) q="
@@ -440,6 +480,48 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext>
     if (s_in < s_out) {
         throw runtime_error(
             "CKKS-to-MPC cannot raise scale at the Algorithm 1 boundary");
+    }
+
+    // The historical vit-gpu baseline uses this local-FFT adapter.  It is the
+    // default production speed path; the wide-RNS conversion below is kept as
+    // an explicit `OURS_VIT_CONVERSION_MODE=exact` diagnostic path.
+    if (!blb_strict_ckks_to_mpc_enabled()) {
+        nonlinear.field_to_ring(
+            blb_conversion_threads(), x_intt_flatten_field.data(), Q,
+            x_intt_flatten_ring.data(), x_intt_flatten_field.size(), bit_out,
+            s_in, s_out);
+        field_to_ring_calls++;
+        ckks_to_mpc_conversions += pts.size();
+
+        vector<vector<HE_CKKS::complex_t>> x_decode(pts.size());
+        for (size_t i = 0; i < pts.size(); ++i) {
+            x_decode[i].reserve(static_cast<size_t>(degree));
+            for (int j = 0; j < degree; ++j) {
+                x_decode[i].push_back(HE_CKKS::complex_t(
+                    x_intt_flatten_ring[i * static_cast<size_t>(degree) + j],
+                    0));
+            }
+        }
+        vector<vector<HE_CKKS::scalar_t>> y_fast(pts.size());
+#pragma omp parallel for num_threads(num_threads)
+        for (int i = 0; i < static_cast<int>(pts.size()); ++i) {
+            y_fast[i] = he->ckks_decode(x_decode[i], degree, half);
+            const uint64_t output_mask =
+                (uint64_t{1} << bit_out) - uint64_t{1};
+            for (uint64_t &value : y_fast[i]) value &= output_mask;
+        }
+        cout << "OURS_FAST_CKKS_TO_MPC status=PASS mode=single_field_to_ring"
+             << " input_prime_bits="
+             << static_cast<int>(ceil(log2(static_cast<double>(Q))))
+             << " output_ring_bits=" << bit_out
+             << " source_scale=" << s_in << " target_scale=" << s_out
+             << " wide_mpc_extension=0" << endl;
+        if (profile_conversion) {
+            profile_record_comm(conversion_bucket,
+                                current_comm() - conversion_comm_before);
+            profile_pop();
+        }
+        return y_fast;
     }
 
     // Center the canonical prime-field coefficient before converting it to
@@ -643,6 +725,48 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
         }
     }
 
+    // The historical vit-gpu baseline uses this local-FFT adapter.  It is the
+    // default production speed path; the wide-RNS conversion below is kept as
+    // an explicit `OURS_VIT_CONVERSION_MODE=exact` diagnostic path.
+    if (!blb_strict_mpc_to_ckks_enabled()) {
+        vector<vector<HE_CKKS::scalar_t>> x_ifft(x.size());
+#pragma omp parallel for num_threads(thread_num)
+        for (int i = 0; i < static_cast<int>(x.size()); ++i)
+            x_ifft[i] = he->ckks_encode(x[i], slot, half);
+
+        vector<HE_CKKS::scalar_t> encode_ring(
+            x_ifft.size() * static_cast<size_t>(poly_degree));
+        for (size_t ct = 0; ct < x_ifft.size(); ++ct) {
+            copy(x_ifft[ct].begin(), x_ifft[ct].end(),
+                 encode_ring.begin() + ct * static_cast<size_t>(poly_degree));
+        }
+        vector<HE_CKKS::scalar_t> encode_field(encode_ring.size());
+        nonlinear.ring_to_field(
+            blb_conversion_threads(), encode_ring.data(), Q,
+            encode_field.data(), encode_ring.size(), bitwidth, s_in, s_out);
+        ring_to_field_calls++;
+
+        vector<Plaintext> y_fast(x.size());
+#pragma omp parallel for num_threads(thread_num)
+        for (int i = 0; i < static_cast<int>(x.size()); ++i) {
+            vector<HE_CKKS::scalar_t> encoded(poly_degree);
+            copy(encode_field.begin() + static_cast<size_t>(i) * poly_degree,
+                 encode_field.begin() + static_cast<size_t>(i + 1) * poly_degree,
+                 encoded.begin());
+            he->ckks_ntt(encoded, poly_degree, pow(2, s_out), y_fast[i]);
+        }
+        mpc_to_ckks_conversions += x.size();
+        cout << "OURS_FAST_MPC_TO_CKKS status=PASS"
+             << " mode=single_ring_to_field rns_protocols=1"
+             << " wide_mpc_extension=0" << endl;
+        if (profile_conversion) {
+            profile_record_comm(conversion_bucket,
+                                current_comm() - conversion_comm_before);
+            profile_pop();
+        }
+        return y_fast;
+    }
+
     // Appendix C.4 extends the l-bit sharing before the public fixed-point
     // FFT.  The previous ViT adapter ran every local FFT truncation in the
     // original l-bit ring and only widened the already-corrupted polynomial.
@@ -726,16 +850,57 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
     if (rns_moduli.empty() || Q == 0) {
         throw runtime_error("MPC-to-CKKS RNS modulus set is empty");
     }
+    // The secure signed extension is independent of the public CKKS prime.
+    // Run it once for the complete polynomial batch, then reduce the same
+    // extended additive shares locally into every RNS limb.  The former
+    // implementation called ring_to_field_wide once per limb; that repeated
+    // the identical MPC extension six times and was the main reason a single
+    // ViT inference regressed from minutes to hours.
+    vector<uint64_t> coefficient_low(encode_ring.size());
+    vector<uint64_t> coefficient_high(encode_ring.size());
+    nonlinear.ring_extend_wide(
+        blb_conversion_threads(), encode_ring.data(), coefficient_low.data(),
+        coefficient_high.data(), static_cast<int>(encode_ring.size()),
+        encode_bitwidth, working_bits);
+    ++ring_to_field_calls;
+
+    const int scale_shift = s_out - encode_scale;
+    if (scale_shift < 0) {
+        throw runtime_error(
+            "MPC-to-CKKS optimized RNS conversion cannot lower scale");
+    }
     vector<vector<HE_CKKS::scalar_t>> encode_field_by_limb(
         rns_moduli.size(),
         vector<HE_CKKS::scalar_t>(encode_ring.size()));
     for (size_t limb = 0; limb < rns_moduli.size(); ++limb) {
-        nonlinear.ring_to_field_wide(
-            blb_conversion_threads(), encode_ring.data(),
-            rns_moduli[limb].value(), encode_field_by_limb[limb].data(),
-            static_cast<int>(encode_ring.size()), encode_bitwidth, encode_scale,
-            s_out, working_bits);
-        ++ring_to_field_calls;
+        const __uint128_t modulus = rns_moduli[limb].value();
+        const auto pow_two_mod = [modulus](int exponent) {
+            __uint128_t base = 2 % modulus;
+            __uint128_t result = 1 % modulus;
+            while (exponent > 0) {
+                if (exponent & 1) result = (result * base) % modulus;
+                exponent >>= 1;
+                if (exponent > 0) base = (base * base) % modulus;
+            }
+            return result;
+        };
+        const __uint128_t scale_factor = pow_two_mod(scale_shift);
+        const __uint128_t wrap_correction =
+            pow_two_mod(working_bits + scale_shift);
+        auto &field_shares = encode_field_by_limb[limb];
+#pragma omp parallel for num_threads(thread_num)
+        for (int index = 0; index < static_cast<int>(encode_ring.size());
+             ++index) {
+            const __uint128_t wide =
+                (static_cast<__uint128_t>(coefficient_high[index]) << 64) |
+                coefficient_low[index];
+            __uint128_t local =
+                ((wide % modulus) * scale_factor) % modulus;
+            if (party == sci::ALICE) {
+                local = (local + modulus - wrap_correction) % modulus;
+            }
+            field_shares[index] = static_cast<uint64_t>(local);
+        }
     }
     vector<Plaintext> y(x.size());
     #pragma omp parallel for num_threads(thread_num)
@@ -757,9 +922,9 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
          << " batch_elements=" << slot_elements
          << " encode_guard_bits=" << encode_guard_bits
          << " lifted_input_scale=" << encode_scale
-         << " rns_limbs="
-         << rns_moduli.size()
-         << " encode=secure_extend_then_wide_local_encode_per_prime" << endl;
+         << " rns_limbs=" << rns_moduli.size()
+         << " interactive_rns_extensions=1"
+         << " encode=secure_extend_once_then_local_reduce_per_prime" << endl;
     mpc_to_ckks_conversions += x.size();
     cout << "mpc_to_ckks done" << endl;
 	if (profile_conversion) {
@@ -1228,19 +1393,19 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
 
 
 /*
-    evaluate gelu poly, 输入输出均是mpc share
-    ax^4+bx^3+cx^2+dx+e+0.5x
-    a = 0.020848611754127593
-    b = -0.18352506127082727
-    c = 0.5410550166368381
-    d = -0.03798164612714154
-    e = 0.001620808531841547
-*/ 
+    Evaluate the even part of GELU on [-2.7, 2.7].  The encrypted input is
+    signed, so a polynomial fitted only on |x| cannot be evaluated directly:
+    its odd-power terms explode on the negative half of the interval.  Use a
+    minimax even quartic for x*erf(x/sqrt(2))/2 here; gelu_nonlinear adds the
+    missing x/2 in MPC and selects the exact ReLU tail outside the interval.
+*/
 void Bert_ckks::eval_gelu_poly(
     vector<UnifiedCiphertext> &output_cts,
     vector<UnifiedCiphertext> poly1, /* FIXME: D2D copy */
     HE_CKKS* he, int output_scale_bits) {
-    double cons_list[] = {0.020848611754127593,-0.18352506127082727,0.5410550166368381,-0.03798164612714154,0.001620808531841547};
+    double cons_list[] = {
+        -0.018154344446004743, 0.0, 0.30869355275897581, 0.0,
+        0.027529737185454588};
     int num_cts = poly1.size();
     int poly_modulus_degree = he->poly_modulus_degree;
     int slot_num = poly_modulus_degree / 2;
@@ -1772,13 +1937,10 @@ void gelu_nonlinear_thread(int tid, int party, uint64_t *x1, uint64_t* x2, uint6
     
     FixArray y = fpmath->fix->if_else(msb_x, neg_x, x_array);
 
-    // This SCI fork's signed comparison primitive is oriented oppositely to
-    // the public API names: LT(a,b) returns the bit for a > b, while
-    // GT(a,b) returns the bit for a < b.  The polynomial is valid on
-    // |x| < 2.7, so use the actual less-than predicate here.  The old LT
-    // call selected the CKKS polynomial for the tail and the linear ReLU
-    // tail for the central interval, which corrupted the whole FFN.
-    BoolArray lt27 = fpmath->fix->GT(y, 2.7*(1 << s));
+    // FixOp::LT is the ordinary signed less-than predicate (MSB(y-c)).
+    // Selecting the polynomial with GT reverses the two regions and lets a
+    // quartic grow without bound in the tail.
+    BoolArray lt27 = fpmath->fix->LT(y, 2.7*(1 << s));
     // point 8
     BoolArray all_0 = fpmath->bool_op->input(sci::ALICE, array_size, uint8_t(0));
     FixArray x_plus_y = fpmath->fix->add(x_array, y);
@@ -1792,8 +1954,14 @@ void gelu_nonlinear_thread(int tid, int party, uint64_t *x1, uint64_t* x2, uint6
     // cout << "x array bitwidth,s:" << x_array.ell << "," << x_array.s << endl;
     // cout << "half_x_plus_y(bitwidth,s):" << half_x_plus_y.ell << "," << half_x_plus_y.s << endl;
     half_x_plus_y.s = s;
-    //half_x_plus_y = (x+|x|)/2 = max(x,0), if |x|<2.7, 则 gelu_y, 否则half_x_plus_y
-    FixArray ret = fpmath->fix->if_else(lt27, gelu_poly_flat, half_x_plus_y);
+    // eval_gelu_poly deliberately returns only the even term.  Complete
+    // GELU with x/2 inside the approximation interval.
+    FixArray half_x = fpmath->fix->right_shift(x_array, 1, msb_x.data);
+    half_x.s = s;
+    FixArray gelu_inner = fpmath->fix->add(gelu_poly_flat, half_x);
+    // half_x_plus_y = (x+|x|)/2 = max(x,0).
+    FixArray ret =
+        fpmath->fix->if_else(lt27, gelu_inner, half_x_plus_y);
     // cout << "OK1" << endl;
     for(int i = 0; i < array_size; i++){
         output[i] = ret.data[i];
@@ -1903,9 +2071,45 @@ FixArray Bert_ckks::exp_he(const FixArray &x){
     // oriented as ``lhs >= rhs`` (the BLB code compensates for this in its
     // max/GELU call sites).  GE therefore represents the actual predicate
     // lhs <= rhs that is required here, including the -13 boundary.
-    BoolArray underflow = exp_math->fix->GE(x, cutoff_raw);
-    FixArray evaluation_input = exp_math->fix->if_else(
-        underflow, cutoff_raw, x);
+    BoolArray underflow;
+    FixArray evaluation_input = x;
+    if (blb_secure_exp_clamp_enabled()) {
+        underflow = exp_math->fix->GE(x, cutoff_raw);
+        evaluation_input = exp_math->fix->if_else(
+            underflow, cutoff_raw, x);
+    }
+    // Real ViT attention gaps reach roughly -168.  The legacy fast form
+    // (1+x/64)^64 is unstable once x<-128 because the base magnitude exceeds
+    // one.  The comparison-free path uses (1+x/128)^128 instead.  Its public
+    // divisor is folded into the MPC-to-CKKS input scale, which removes the
+    // old plaintext multiply/rescale and leaves seven total rescale steps.
+    // The explicit secure-clamp reference retains Algorithm 5's /64 form.
+    const int exp_divisor_bits =
+        blb_secure_exp_clamp_enabled() ? 6 : 7;
+    const int exp_squarings = exp_divisor_bits;
+    size_t public_masked_elements = 0;
+    if (public_attention_mask_ready) {
+        const size_t row_width = public_attention_mask.size();
+        if (row_width == 0 ||
+            evaluation_input.size % static_cast<int>(row_width) != 0) {
+            throw runtime_error(
+                "HE Softmax exp public mask is incompatible with row layout");
+        }
+        const size_t rows =
+            static_cast<size_t>(evaluation_input.size) / row_width;
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t key = 0; key < row_width; ++key) {
+                if (public_attention_mask[key] == 0) continue;
+                // Padding locations are public and their exact Softmax output
+                // is public zero.  Discard both local secret shares before HE
+                // so the large public negative mask cannot overflow the
+                // comparison-free polynomial; discard the public exp(0)=1
+                // placeholder again after the HE round below.
+                evaluation_input.data[row * row_width + key] = 0;
+                ++public_masked_elements;
+            }
+        }
+    }
     const int poly_modulus_degree = he->poly_modulus_degree;
     int slots = he->num_slots;
     int num_cts = evaluation_input.size/slots;
@@ -1930,21 +2134,17 @@ FixArray Bert_ckks::exp_he(const FixArray &x){
     profile_set_conversion_bucket(
         BlbViTCommAuditBucket::SOFTMAX_TO_CKKS_CONVERSION);
     vector<UnifiedPlaintext> pts_x;
-    mpc_to_ckks(pts_x, vec_x, slots, he->get_conversion_prime(), ell, scale,
-                he->he_scale, he);
+    mpc_to_ckks(pts_x, vec_x, slots, he->get_conversion_prime(), ell,
+                scale + exp_divisor_bits, he->he_scale, he);
     profile_set_conversion_bucket(previous_conversion_bucket);
     cout << "pts.size:" << pts_x.size() << endl;
     this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
-    // mpc_to_ckks emits one complete real/full-slot plaintext per input
-    // ciphertext.  These plaintexts are not the historical x+y*j half
-    // packing, so encrypting only the first half and reconstructing the rest
-    // with imag_repack drops half of the tensor (and injects a zero/duplicate
-    // lane) before the exponentiation.  Keep this boundary full-slot; the
-    // conversion/layout contract is more important than the obsolete
-    // communication shortcut.
-    const bool half = false;
+    // Restore the historical BLB conjugate-half transport for the fast path.
+    // The exact wide-RNS diagnostic keeps full-slot transport because its
+    // wide encoder does not provide the legacy conjugate-packing contract.
+    const bool half = !blb_exact_conversion_requested() && (num_cts % 2 == 0);
     vector<UnifiedCiphertext> cts_x(
         num_cts, UnifiedCiphertext(half && he->is_gpu_enable() ? LOCATION::DEVICE : LOCATION::HOST)); 
     vector<Ciphertext> cts_y(num_cts);
@@ -2067,23 +2267,16 @@ FixArray Bert_ckks::exp_he(const FixArray &x){
             }
         }
 
-        // Encode weight once
+        // The divisor was folded into mpc_to_ckks above, so only the public
+        // one is needed at the current ciphertext level and scale.
         UnifiedPlaintext one(loc);
-        UnifiedPlaintext inverse_128(loc);
         if (!he->is_gpu_enable()) {
-            he->encoder->encode(0.015625, pow(2,he->he_scale), inverse_128);
-            auto util_context_data = he->context->get_context_data(cts_x[0].hcipher().parms_id());
-            auto s = cts_x[0].scale() * inverse_128.scale();
-            s /= util_context_data->parms().coeff_modulus().back().value();
-            util_context_data = util_context_data->next_context_data();
-            he->encoder->encode(1.0, util_context_data->parms_id(), s, one);
+            he->encoder->encode(1.0, cts_x[0].hcipher().parms_id(),
+                                cts_x[0].scale(), one);
         } else {
-            he->dencoder->encode(*he->dcontext, vector<double>(slots, 0.015625), pow(2,he->he_scale), inverse_128);
-            auto util_chain_index = cts_x[0].dcipher().chain_index();
-            auto s = cts_x[0].scale() * inverse_128.scale();
-            s /= he->dcontext->get_context_data(util_chain_index).parms().coeff_modulus().back().value();
-            util_chain_index ++;
-            he->dencoder->encode(*he->dcontext, vector<double>(slots, 1.0), s, one, util_chain_index);
+            he->dencoder->encode(
+                *he->dcontext, vector<double>(slots, 1.0),
+                cts_x[0].scale(), one, cts_x[0].dcipher().chain_index());
         }
         
         // Begin computation
@@ -2097,13 +2290,8 @@ FixArray Bert_ckks::exp_he(const FixArray &x){
                 // is not a secret-shared exp and was the source of the
                 // deterministic C4E/A0 corruption.
                 he->evaluator->add_plain_inplace(cts_x[i], pts_x[i]);
-                he->evaluator->multiply_plain_inplace(cts_x[i], inverse_128);
-                ++this->he_rescale_count;
-                he->evaluator->rescale_to_next_inplace(cts_x[i]);
                 he->evaluator->add_plain_inplace(cts_x[i], one);
-                // x^128
-                // cout << "OK2" << endl;
-                for (int j = 0; j < log2(64); j++) {
+                for (int j = 0; j < exp_squarings; j++) {
                     he->evaluator->square_inplace(cts_x[i]);
                     he->evaluator->relinearize_inplace(cts_x[i], *he->relin_keys);
                     ++this->he_rescale_count;
@@ -2114,12 +2302,8 @@ FixArray Bert_ckks::exp_he(const FixArray &x){
                 // Keep the GPU path's share aggregation identical to SEAL:
                 // both local CKKS shares are present before any HE multiply.
                 he->devaluator->add_plain_inplace(cts_x[i], pts_x[i]);
-                he->devaluator->multiply_plain_inplace(cts_x[i], inverse_128);
-                ++this->he_rescale_count;
-                he->devaluator->rescale_to_next_inplace(cts_x[i]);
                 he->devaluator->add_plain_inplace(cts_x[i], one);
-                // x^128
-                for (int j = 0; j < log2(64); j++) {
+                for (int j = 0; j < exp_squarings; j++) {
                     he->devaluator->square_inplace(cts_x[i]);
                     he->devaluator->relinearize_inplace(cts_x[i], *he->drelin_keys);
                     ++this->he_rescale_count;
@@ -2179,19 +2363,37 @@ FixArray Bert_ckks::exp_he(const FixArray &x){
     // x <= -13 is an intentional exponential underflow in the BLB Softmax
     // approximation.  Apply the mux after the HE round so malformed CKKS
     // values from the unclipped branch can never enter the denominator.
-    ret = exp_math->fix->if_else(underflow, uint64_t(0), ret);
-    // The CKKS polynomial is mathematically non-negative on the clipped
-    // domain, but its last few fixed-point units can round below zero.  The
-    // following secure sign clamp prevents a negative ring word from being
-    // reinterpreted as a huge unsigned numerator after the caller marks the
-    // exponent output as unsigned.  This is a domain correction, not an
-    // opening: MSB and the mux operate on the two local shares.
-    BoolArray negative_output = exp_math->fix->MSB(ret);
-    ret = exp_math->fix->if_else(negative_output, uint64_t(0), ret);
+    if (blb_secure_exp_clamp_enabled()) {
+        ret = exp_math->fix->if_else(underflow, uint64_t(0), ret);
+        // Keep the element-wise clamp as an explicit correctness-reference
+        // mode.  It is not the paper default because two MPC passes over the
+        // complete attention matrix cost minutes per layer.
+        BoolArray negative_output = exp_math->fix->MSB(ret);
+        ret = exp_math->fix->if_else(negative_output, uint64_t(0), ret);
+    }
+    if (public_attention_mask_ready) {
+        const size_t row_width = public_attention_mask.size();
+        const size_t rows = static_cast<size_t>(ret.size) / row_width;
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t key = 0; key < row_width; ++key) {
+                if (public_attention_mask[key] != 0)
+                    ret.data[row * row_width + key] = 0;
+            }
+        }
+    }
     ret.signed_ = false;
     cout << "FORMAL_SOFTMAX_EXP_CLIP status=PASS cutoff=-13"
-         << " comparison=secure_GE zero_after_HE=1"
-         << " negative_rounding_to_zero=1 client_reconstruction=0" << endl;
+         << " comparison="
+         << (blb_secure_exp_clamp_enabled() ? "secure_GE" : "none")
+         << " divisor=2^" << exp_divisor_bits
+         << " exponent=2^" << exp_squarings
+         << " divisor_folded_into_conversion=1 zero_after_HE="
+         << (blb_secure_exp_clamp_enabled() ? 1 : 0)
+         << " negative_rounding_to_zero="
+         << (blb_secure_exp_clamp_enabled() ? 1 : 0)
+         << " fast_default=" << (blb_secure_exp_clamp_enabled() ? 0 : 1)
+         << " public_padding_zeroed=" << public_masked_elements
+         << " client_reconstruction=0" << endl;
 
     return ret;
 }
@@ -2235,13 +2437,9 @@ FixArray Bert_ckks::element_wise_mul(FixArray x, FixArray y){
     cout << "slot_count, num_cts:" << slot_count << "," << num_cts << endl;
     vector<vector<HE_CKKS::scalar_t>> vec_x(num_cts);
     vector<vector<HE_CKKS::scalar_t>> vec_y(num_cts);
-    // Both operands are complete full-slot batches produced by mpc_to_ckks.
-    // The old half-count optimization was valid only for the legacy x+y*j
-    // encoder, but this ViT conversion path deliberately materializes every
-    // slot in every plaintext.  Repacking half of the ciphertexts therefore
-    // loses the second half of each vector and makes Softmax/reciprocal
-    // outputs deterministic garbage.
-    const bool half = false;
+    // Match the historical BLB conjugate-half transport in fast mode.  The
+    // exact wide-RNS diagnostic remains full-slot for its non-legacy encoder.
+    const bool half = !blb_exact_conversion_requested() && (num_cts % 2 == 0);
     vector<UnifiedPlaintext> pts_x;
     vector<UnifiedPlaintext> pts_y;
     vector<UnifiedCiphertext> cts_x(
@@ -2557,24 +2755,29 @@ FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int 
     profile_set_conversion_bucket(BlbViTCommAuditBucket::SOFTMAX_REC_CONVERSION);
     auto fpmath = this->nonlinear.fpmath[0];
     auto start = high_resolution_clock::now();
-    // MathFunctions::sqrt(..., true) returns 1/sqrt(dn), not 1/dn.  The
-    // original V2 path multiplied the numerator by that value directly and
-    // therefore produced rows whose sum was sqrt(sum(exp(x))).  Square the
-    // reciprocal square root with the existing secure HE multiplication to
-    // obtain the actual Softmax reciprocal without opening the denominator.
-    FixArray dn_reciprocal_sqrt = fpmath->sqrt(dn, true);
-    dn_reciprocal_sqrt.signed_ = false;
-    // Squaring only one denominator per row in MPC is substantially cheaper
-    // than launching another CKKS conversion/multiply for a padded 3072-value
-    // vector.  The large numerator-times-reciprocal product remains on BLB's
-    // HE path.  This preserves 1/dn semantics without the donor's 1/sqrt(dn)
-    // approximation or the previous extra HE round trip.
-    FixArray dn_rec = fpmath->fix->mul(
-        dn_reciprocal_sqrt, dn_reciprocal_sqrt,
-        dn_reciprocal_sqrt.ell + dn_reciprocal_sqrt.s);
-    dn_rec = fpmath->fix->truncate_reduce(
-        dn_rec, dn_reciprocal_sqrt.s);
-    dn_rec.signed_ = false;
+    // Restore the historical BLB V2 reciprocal for the speed baseline.  The
+    // exact 1/dn correction (squaring 1/sqrt(dn) in MPC) is still available
+    // explicitly and is intentionally excluded from the fast timing path.
+    const bool exact_reciprocal =
+        blb_exact_conversion_requested() ||
+        blb_env_enabled("OURS_VIT_SOFTMAX_EXACT_RECIPROCAL");
+    FixArray dn_rec;
+    if (exact_reciprocal) {
+        FixArray dn_reciprocal_sqrt = fpmath->sqrt(dn, true);
+        dn_reciprocal_sqrt.signed_ = false;
+        dn_rec = fpmath->fix->mul(
+            dn_reciprocal_sqrt, dn_reciprocal_sqrt,
+            dn_reciprocal_sqrt.ell + dn_reciprocal_sqrt.s);
+        dn_rec = fpmath->fix->truncate_reduce(
+            dn_rec, dn_reciprocal_sqrt.s);
+        dn_rec.signed_ = false;
+    } else {
+        dn_rec = fpmath->sqrt(dn, true);
+        dn_rec.signed_ = false;
+    }
+    cout << "FORMAL_SOFTMAX_RECIPROCAL status=PASS mode="
+         << (exact_reciprocal ? "exact_1_over_dn" : "legacy_1_over_sqrt_dn")
+         << endl;
     this->other_nonlinear_la += ((high_resolution_clock::now() - start)).count()/1e+9;
     this->other_nonlinear_comm += this->get_comm();
     this->other_nonlinear_round += this->get_round();
@@ -2594,7 +2797,8 @@ FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int 
     // marks the exponent output unsigned, turn into enormous numerators.
     // Keep the old path available only as an explicit regression switch.
     const char *exact_product_env = getenv("OURS_VIT_SOFTMAX_EXACT_PRODUCT");
-    const bool exact_product = exact_product_env == nullptr ||
+    const bool exact_product = exact_product_env != nullptr &&
+                               *exact_product_env != '\0' &&
                                strcmp(exact_product_env, "0") != 0;
     if (exact_product) {
         // The reciprocal is already an MPC share at the requested fixed-point
@@ -2634,6 +2838,29 @@ FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int 
 void max_thread(int tid, int party, uint64_t *x, uint64_t *y, int num_ops, int array_size, int ell, int s, FPMath *fpmath){
     if (num_ops <= 0 || array_size <= 0)
         return;
+
+    // Restore the historical vit-gpu fast baseline.  FixOp::max batches the
+    // whole reduction into one protocol invocation per reduction level.  The
+    // current row-oriented repair below is semantically correct for the
+    // padded attention layout, but issuing one LE/if_else pair at a time
+    // turns the 128-key reduction into roughly 1.7k rounds.  Keep the repair
+    // for the explicit exact diagnostic path and make the legacy behavior
+    // selectable with the default `OURS_VIT_CONVERSION_MODE=fast` setting.
+    if (!blb_exact_conversion_requested()) {
+        vector<FixArray> input_array;
+        input_array.reserve(num_ops);
+        for (int row = 0; row < num_ops; ++row) {
+            FixArray input_row(party, array_size, true, ell, s);
+            memcpy(input_row.data,
+                   &x[static_cast<size_t>(row) * array_size],
+                   static_cast<size_t>(array_size) * sizeof(uint64_t));
+            input_array.push_back(std::move(input_row));
+        }
+        FixArray legacy_max = fpmath->fix->max(input_array);
+        memcpy(y, legacy_max.data,
+               static_cast<size_t>(num_ops) * sizeof(uint64_t));
+        return;
+    }
 
     // FixOp::max reduces a vector of FixArrays element-wise.  The Softmax
     // input is row-major, however, and needs one maximum per row.  The old

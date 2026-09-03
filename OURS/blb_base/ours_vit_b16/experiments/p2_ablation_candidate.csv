@@ -1,0 +1,6 @@
+name,ablation,packing,head_plan,secure_accuracy_json
+A0 All-Softmax,a0,1,/home/dm/mind/Vit-Head/OURS/blb_base/outputs/a3_a4_review/plans/a3_all_softmax_full12.txt,
+A2 Selected,a2,1,/home/dm/mind/Vit-Head/OURS/blb_base/outputs/a1_a2_review/a2_softmax11_relu1_head_plan.txt,
+A3 Selected selective conversion,a3,0,/home/dm/mind/Vit-Head/OURS/blb_base/outputs/a1_a2_review/a2_softmax11_relu1_head_plan.txt,
+A3 plus packing,a3,1,/home/dm/mind/Vit-Head/OURS/blb_base/outputs/a1_a2_review/a2_softmax11_relu1_head_plan.txt,
+A4 Full native CKKS Linear,a4,1,/home/dm/mind/Vit-Head/OURS/blb_base/outputs/a4_pair_review/head_plan.txt,

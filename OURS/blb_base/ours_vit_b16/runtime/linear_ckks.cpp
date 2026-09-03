@@ -4060,7 +4060,6 @@ void Linear_ckks::softmax_v(
     #pragma omp parallel for num_threads(PACKING_NUM/2)
     for (int packing_ind = 0; packing_ind < PACKING_NUM/2; packing_ind++) {
         if (!pair_is_active(packing_ind)) continue;
-        int rot_count = 0;
 
         // cout << "packing_ind: " << packing_ind << endl;
         // FIXME: pack softmax_s2 according to gazelle
@@ -4073,9 +4072,13 @@ void Linear_ckks::softmax_v(
             for (int i = 0; i < num_diag; i++) {
                 // one rotation_by_one_depth3 contains 2 rotations
                 vector<Ciphertext> temp_mult(2);
-                if(rot_count<rot_ours){
+                // The rotation budget applies independently to every V
+                // feature ciphertext.  Reusing the counter across ct_ind
+                // silently skipped all rotations for the second feature
+                // block (for ViT, ct_ind=1), while the corresponding
+                // diagonal weights still expected rotated V slots.
+                if(i < rot_ours){
                     temp_mult = rotation_by_one_depth3(he, data, V[packing_ind * num_matrix_per_col + ct_ind], i);
-                    rot_count++;
                 }
                 else{
                     temp_mult[0]=(V[packing_ind * num_matrix_per_col + ct_ind]);
@@ -4120,7 +4123,6 @@ void Linear_ckks::softmax_v(
                          V[reference_v_index].dcipher().chain_index());
     for (int packing_ind = 0; packing_ind < PACKING_NUM/2; packing_ind++) {
         if (!pair_is_active(packing_ind)) continue;
-        int rot_count = 0;
         int num_diag = data.slot_count / data.image_size / 2;
         int num_matrix_per_col = data.filter_w / num_diag; // 1 or 2
 
@@ -4135,14 +4137,16 @@ void Linear_ckks::softmax_v(
             for (int i = 0; i < num_diag; i++) {
                 UnifiedCiphertext temp1(loc);
                 UnifiedCiphertext temp2(loc);
-                if(rot_count < rot_ours){
+                // See the host path above: each feature ciphertext needs its
+                // own complete rotation schedule; a shared counter corrupts
+                // the later feature blocks deterministically.
+                if(i < rot_ours){
                     UnifiedCiphertext ct1(loc);
                     UnifiedCiphertext ct2(loc);
                     he->devaluator->rotate_vector(V[packing_ind * num_matrix_per_col + ct_ind], i, *(he->dgal_keys), ct1);
                     he->devaluator->rotate_vector(V[packing_ind * num_matrix_per_col + ct_ind], -(data.image_size - i), *(he->dgal_keys), ct2);
                     he->devaluator->multiply(ct1, softmax_s2[packing_ind][0][i], temp1);
                     he->devaluator->multiply(ct2, softmax_s2[packing_ind][1][i], temp2);
-                    rot_count++;
                 } else {
                     he->devaluator->multiply(V[packing_ind * num_matrix_per_col + ct_ind], softmax_s2[packing_ind][0][i], temp1);
                     he->devaluator->multiply(V[packing_ind * num_matrix_per_col + ct_ind], softmax_s2[packing_ind][1][i], temp2);

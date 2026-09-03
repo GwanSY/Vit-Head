@@ -836,7 +836,8 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         }
         for (int begin = 0; begin < PACKING_NUM;) {
             int end = begin + 1;
-            while (end < PACKING_NUM &&
+            while (heterogeneous_group_packing_enabled &&
+                   end < PACKING_NUM &&
                    heterogeneous_protocols[end] ==
                        heterogeneous_protocols[begin]) {
                 ++end;
@@ -1945,6 +1946,28 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
     const int mpc_head_count = count(mpc_heads.begin(), mpc_heads.end(), true);
     const int linear_head_count =
         count(linear_heads.begin(), linear_heads.end(), true);
+    const bool heterogeneous_trace =
+        getenv("OURS_VIT_HETERO_ATTENTION_TRACE") != nullptr &&
+        string(getenv("OURS_VIT_HETERO_ATTENTION_TRACE")) == "1";
+    vector<Ciphertext> heterogeneous_mpc_av_observer;
+    vector<Ciphertext> heterogeneous_linear_av_observer;
+    auto snapshot_observer_ciphertexts = [](
+        HE_CKKS *he, const vector<UnifiedCiphertext> &source,
+        vector<Ciphertext> &destination, const char *stage) {
+        destination.resize(source.size());
+        for (size_t i = 0; i < source.size(); ++i) {
+            if (source[i].location() == LOCATION::DEVICE) {
+                UnifiedCiphertext::to_host(
+                    *he->dcontext, source[i].dcipher(), *he->context,
+                    destination[i]);
+            } else if (source[i].location() == LOCATION::HOST) {
+                destination[i] = source[i].hcipher();
+            } else {
+                throw runtime_error(string(stage) +
+                                    ": observer location is invalid");
+            }
+        }
+    };
     int linear_pair_count = 0;
     for (int pair = 0; pair < PACKING_NUM / 2; ++pair)
         linear_pair_count +=
@@ -2000,7 +2023,8 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         const int import_scale_bits = he->he_scale;
         for (int begin = 0; begin < PACKING_NUM;) {
             int end = begin + 1;
-            while (end < PACKING_NUM &&
+            while (heterogeneous_group_packing_enabled &&
+                   end < PACKING_NUM &&
                    heterogeneous_protocols[end] ==
                        heterogeneous_protocols[begin])
                 ++end;
@@ -2106,8 +2130,13 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
                  << current_comm() - conversion_comm_start
                  << " rounds="
                  << current_round() - conversion_round_start
-                 << " packing=head_pair_half_mask"
-                 << " grouped_call=1 dynamic_selection=0" << endl;
+                 << " packing="
+                 << (heterogeneous_group_packing_enabled
+                         ? "head_pair_half_mask"
+                         : "disabled_per_head")
+                 << " grouped_call="
+                 << (heterogeneous_group_packing_enabled ? 1 : 0)
+                 << " dynamic_selection=0" << endl;
             begin = end;
         }
     }
@@ -2242,7 +2271,8 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         const auto softmax_v_profile_start = high_resolution_clock::now();
         vector<vector<vector<UnifiedCiphertext>>> packed_qk;
         linear.preprocess_softmax_s1_ct_ct(
-            he, mpc_qk_cts, av_data, packed_qk, &mpc_heads, true);
+            he, mpc_qk_cts, av_data, packed_qk, &mpc_heads,
+            heterogeneous_group_packing_enabled);
         const auto &level_reference = [&]() -> const UnifiedCiphertext & {
             for (int pair = 0; pair < PACKING_NUM / 2; ++pair)
                 if (mpc_heads[2 * pair] || mpc_heads[2 * pair + 1])
@@ -2265,6 +2295,10 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             v_ct_count, UnifiedCiphertext(he->backend()));
         linear.softmax_v(he, packed_qk, mpc_v_cts, av_data, av_result,
                          0.25, &mpc_heads, true);
+        if (heterogeneous_trace)
+            snapshot_observer_ciphertexts(
+                he, av_result, heterogeneous_mpc_av_observer,
+                "heterogeneous_mpc_av");
         if (profile_enabled_)
             profile_record_he(
                 BlbViTProfileStage::SOFTMAX_V,
@@ -2438,11 +2472,15 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         vector<vector<vector<UnifiedCiphertext>>> packed_qk;
         linear.preprocess_softmax_s1_ct_ct(
             he, a4_linear_qk_he1_cts, av_data, packed_qk, &linear_heads,
-            true);
+            heterogeneous_group_packing_enabled);
         vector<UnifiedCiphertext> av_result(
             v_ct_count, UnifiedCiphertext(he->backend()));
         linear.softmax_v(he, packed_qk, a4_linear_v_he1_cts, av_data,
                          av_result, 1.0, &linear_heads, false);
+        if (heterogeneous_trace)
+            snapshot_observer_ciphertexts(
+                he, av_result, heterogeneous_linear_av_observer,
+                "heterogeneous_linear_av");
         if (profile_enabled_)
             profile_record_he(
                 BlbViTProfileStage::SOFTMAX_V,
@@ -2496,6 +2534,69 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
              << " active_heads=" << linear_head_count
              << " active_pairs=" << linear_pair_count
              << " execution_domain=he1_native" << endl;
+    }
+
+    if (heterogeneous_trace) {
+        auto export_av_observer = [&](HE_CKKS *he,
+                                      vector<Ciphertext> &alice_ciphertexts,
+                                      bool enabled,
+                                      const char *stage) -> FixArray {
+            if (!enabled)
+                return FixArray(party, tokens * COMMON_DIM, true, NL_ELL,
+                                NL_SCALE);
+            vector<Ciphertext> transport(v_ct_count);
+            vector<Plaintext> points(v_ct_count);
+            if (party == BOB) {
+                recv_encrypted_vector(he->context, io, transport);
+                for (int i = 0; i < v_ct_count; ++i)
+                    he->decryptor->decrypt(transport[i], points[i]);
+            } else {
+                if (alice_ciphertexts.size() !=
+                    static_cast<size_t>(v_ct_count))
+                    throw runtime_error(string(stage) +
+                                        ": observer source mismatch");
+                transport = std::move(alice_ciphertexts);
+                prepare_host_conversion_from_actual_scale(
+                    *this, transport, kFormalConversionScaleBits, he, stage);
+                mask_ckks_to_mpc_inplace(transport, points, he);
+                send_encrypted_vector(io, transport);
+            }
+            auto pieces = ckks_to_mpc(
+                points, he->poly_modulus_degree, he->get_Q(points.front()),
+                NL_ELL, NL_SCALE, he, false);
+            FixArray packed(party, v_ct_count * slot, true, NL_ELL,
+                            NL_SCALE);
+            size_t offset = 0;
+            for (const auto &piece : pieces) {
+                if (piece.size() != static_cast<size_t>(slot) ||
+                    offset + piece.size() > static_cast<size_t>(packed.size))
+                    throw runtime_error(string(stage) +
+                                        ": observer decode mismatch");
+                copy(piece.begin(), piece.end(), packed.data + offset);
+                offset += piece.size();
+            }
+            if (offset != static_cast<size_t>(packed.size))
+                throw runtime_error(string(stage) +
+                                    ": observer decode incomplete");
+            cout << "OURS_HETERO_ENCRYPTED_OBSERVER status=PASS layer="
+                 << layer_id << " stage=" << stage
+                 << " ciphertexts=" << v_ct_count
+                 << " feeds_secure_graph=0 timing_eligible=0" << endl;
+            return packed;
+        };
+        FixArray mpc_av = export_av_observer(
+            linear.he2, heterogeneous_mpc_av_observer, mpc_head_count > 0,
+            "heterogeneous_mpc_av");
+        FixArray linear_av = export_av_observer(
+            linear.he1, heterogeneous_linear_av_observer,
+            linear_head_count > 0, "heterogeneous_linear_av");
+        if (mpc_head_count > 0 && linear_head_count > 0)
+            heterogeneous_av_share =
+                nonlinear.fpmath[0]->fix->add(mpc_av, linear_av);
+        else if (mpc_head_count > 0)
+            heterogeneous_av_share = std::move(mpc_av);
+        else
+            heterogeneous_av_share = std::move(linear_av);
     }
 
     if (party == sci::ALICE) {
@@ -2644,6 +2745,22 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         } else {
             result = std::move(linear_contribution);
         }
+    }
+    if (heterogeneous_trace) {
+        if (result.size != attention_input_residual_share.size ||
+            result.ell != attention_input_residual_share.ell ||
+            result.s != attention_input_residual_share.s)
+            throw runtime_error("heterogeneous W_O observer shape mismatch");
+        heterogeneous_wo_share = FixArray(
+            party, result.size, result.signed_, result.ell, result.s);
+        for (int i = 0; i < result.size; ++i)
+            heterogeneous_wo_share.data[i] =
+                result.data[i] - attention_input_residual_share.data[i];
+        heterogeneous_av_wo_ready = true;
+        cout << "OURS_HETERO_WO_OBSERVER status=PASS layer=" << layer_id
+             << " elements=" << result.size
+             << " operation=local_share_subtract_public_boundary"
+             << " feeds_secure_graph=0 timing_eligible=0" << endl;
     }
     attention_v_ready = false;
     attention_input_residual_ready = false;
@@ -3230,6 +3347,74 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         use_he_v ? 0 : num_cts_ln, UnifiedCiphertext(LOCATION::HOST));
     vector<UnifiedCiphertext> enc_attention_residual(
         num_cts_ln, UnifiedCiphertext(LOCATION::HOST));
+    const bool a0_trace =
+        getenv("OURS_VIT_A0_TRACE") != nullptr &&
+        string(getenv("OURS_VIT_A0_TRACE")) == "1";
+    auto capture_a0_encrypted_stage = [&] (
+        vector<UnifiedCiphertext> *alice_ciphertexts,
+        int expected_ciphertexts, const char *stage) -> FixArray {
+        if (!a0_trace)
+            throw runtime_error("A0 encrypted observer called while disabled");
+        if (expected_ciphertexts <= 0)
+            throw runtime_error(string("A0 observer ciphertext count is invalid: ") +
+                                stage);
+        vector<Ciphertext> transport(expected_ciphertexts);
+        vector<Plaintext> points(expected_ciphertexts);
+        if (party == BOB) {
+            recv_encrypted_vector(he->context, io, transport);
+            for (int i = 0; i < expected_ciphertexts; ++i)
+                he->decryptor->decrypt(transport[i], points[i]);
+        } else {
+            if (alice_ciphertexts == nullptr ||
+                alice_ciphertexts->size() !=
+                    static_cast<size_t>(expected_ciphertexts)) {
+                throw runtime_error(string("A0 observer source mismatch: ") +
+                                    stage);
+            }
+            for (int i = 0; i < expected_ciphertexts; ++i) {
+                const auto &source = alice_ciphertexts->at(i);
+                if (source.location() == LOCATION::DEVICE) {
+                    // Copy the diagnostic view back to SEAL without moving or
+                    // relabelling the production ciphertext consumed below.
+                    UnifiedCiphertext::to_host(
+                        *he->dcontext, source.dcipher(), *he->context,
+                        transport[i]);
+                } else if (source.location() == LOCATION::HOST) {
+                    transport[i] = source.hcipher();
+                } else {
+                    throw runtime_error(string("A0 observer location is invalid: ") +
+                                        stage);
+                }
+            }
+            prepare_host_conversion_from_actual_scale(
+                *this, transport, kFormalConversionScaleBits, he, stage);
+            mask_ckks_to_mpc_inplace(transport, points, he);
+            send_encrypted_vector(io, transport);
+        }
+        auto pieces = ckks_to_mpc(
+            points, he->poly_modulus_degree, he->get_Q(points.front()),
+            NL_ELL, NL_SCALE, he, false);
+        FixArray packed(party, expected_ciphertexts * slot, true, NL_ELL,
+                        NL_SCALE);
+        size_t offset = 0;
+        for (const auto &piece : pieces) {
+            if (piece.size() != static_cast<size_t>(slot) ||
+                offset + piece.size() > static_cast<size_t>(packed.size)) {
+                throw runtime_error(string("A0 observer decode mismatch: ") +
+                                    stage);
+            }
+            copy(piece.begin(), piece.end(), packed.data + offset);
+            offset += piece.size();
+        }
+        if (offset != static_cast<size_t>(packed.size))
+            throw runtime_error(string("A0 observer is incomplete: ") + stage);
+        cout << "OURS_A0_ENCRYPTED_OBSERVER status=PASS stage=" << stage
+             << " ciphertexts=" << expected_ciphertexts
+             << " elements=" << packed.size
+             << " production_path=0 intermediate_reconstruction=1"
+             << " feeds_secure_graph=0" << endl;
+        return packed;
+    };
     if (use_he_v && party == sci::ALICE) {
         enc_v = std::move(attention_v_he_cts);
     }
@@ -3270,6 +3455,15 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
              << " v_transport=" << (use_he_v ? "HE_at_Alice" : "MPC_to_CKKS")
              << " imag_repack=0" << endl;
         cout << "send_encrypted_vector done" << endl;
+        if (a0_trace) {
+            a0_av_share = capture_a0_encrypted_stage(
+                nullptr, num_cts_ln, "block_0_av");
+            a0_wo_share = bsgs_output_to_token_major(
+                capture_a0_encrypted_stage(
+                    nullptr, num_cts_ln, "block_0_wo"),
+                linear.data_lin2, "a0_wo_observer_to_token");
+            a0_av_wo_ready = true;
+        }
         if (profile_enabled_)
             profile_switch(BlbViTProfileStage::OUTPUT_PROJECTION);
         if (use_bert_half_packing && !enc_x_avg_half.empty()) {
@@ -3702,6 +3896,9 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                 chrono::duration<double, milli>(high_resolution_clock::now() -
                                                 softmax_v_profile_start)
                     .count());
+        if (a0_trace)
+            a0_av_share = capture_a0_encrypted_stage(
+                &softmax_V_result, num_cts_ln, "block_0_av");
         // softmax_V_result's pack may be changed
         data = linear.data_lin2;
         cout << "OK6" << endl;
@@ -3724,6 +3921,13 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                 chrono::duration<double, milli>(
                     high_resolution_clock::now() - output_projection_profile_start)
                     .count());
+        if (a0_trace) {
+            a0_wo_share = bsgs_output_to_token_major(
+                capture_a0_encrypted_stage(
+                    &h3, num_cts_ln, "block_0_wo"),
+                linear.data_lin2, "a0_wo_observer_to_token");
+            a0_av_wo_ready = true;
+        }
         // encode weight once
         int L = data.image_size;
         vector<double> inv_D(slot, 1.0/768);
