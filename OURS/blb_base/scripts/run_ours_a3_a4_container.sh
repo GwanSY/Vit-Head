@@ -250,7 +250,13 @@ docker run --rm --pull=never --name "$container_name" \
 # the immutable outer binding after a successful container exit so collectors
 # can prove exactly which image and fixed plan produced the measurements.
 {
-  echo "outer_selection=dynamic_immediately_before_container_start"
+  if [[ -n "${OURS_VIT_PHYSICAL_GPUS:-}" ]]; then
+    echo "outer_selection=fixed_external_pair"
+  else
+    echo "outer_selection=dynamic_immediately_before_container_start"
+  fi
+  echo "physical_gpus=$gpu_csv"
+  echo "container_visible_gpus=0,1"
   echo "image=$image"
   echo "image_id=$image_id"
   echo "plan=$head_plan"

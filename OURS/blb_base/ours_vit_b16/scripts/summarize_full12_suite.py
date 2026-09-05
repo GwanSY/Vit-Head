@@ -104,6 +104,12 @@ def main() -> None:
                 raise ValueError(f"ablation mismatch: {run}")
             environment = fields(run / "environment.txt")
             selection = fields(run / "gpu_selection.txt")
+            # The restored historical binary omits attention_packing from its
+            # party metadata; the launcher selection file is the run-level
+            # source of truth for this setting.
+            attention_packing = selection.get("attention_packing")
+            if attention_packing not in {"packed", "unpacked"}:
+                raise ValueError(f"run provenance lacks attention_packing: {run}")
             cohort_binary.add(environment.get("binary_sha256"))
             cohort_model.add(environment.get("model_sha256"))
             cohort_input.add(environment.get("input_sha256"))

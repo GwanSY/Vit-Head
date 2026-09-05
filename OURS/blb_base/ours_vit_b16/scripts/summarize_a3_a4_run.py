@@ -32,6 +32,17 @@ def main() -> None:
 
     metadata = [key_values((run / f"run_metadata_party{party}.txt").read_text(
         encoding="utf-8")) for party in (1, 2)]
+    # Older immutable binaries record the packing mode in the launcher
+    # provenance, but not in run_metadata_party*.txt.  Use that authoritative
+    # per-run selection record as a compatibility fallback; do not infer it
+    # from the head assignment.
+    selection = key_values((run / "gpu_selection.txt").read_text(
+        encoding="utf-8"))
+    selected_packing = selection.get("attention_packing")
+    if selected_packing not in {"packed", "unpacked"}:
+        raise ValueError("run provenance lacks attention_packing")
+    for row in metadata:
+        row.setdefault("attention_packing", selected_packing)
     invariant_metadata = (
         "protocol", "ablation", "head_plan", "model", "architecture",
         "logical_tokens", "physical_tokens", "layers",

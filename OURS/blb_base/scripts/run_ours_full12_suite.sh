@@ -16,21 +16,48 @@ if [[ ! -f "$suite" || ! "$tag" =~ ^[A-Za-z0-9._-]+$ ||
   exit 2
 fi
 
-mapfile -t selected_gpus < <(
-  nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.free \
-    --format=csv,noheader,nounits |
-  awk -F, '$2 + 0 <= 5 && $4 + 0 >= 70000 {
-              print $1 + 0, $3 + 0, $4 + 0
-            }' |
-  sort -k2,2n -k3,3nr |
-  awk 'NR <= 2 {print $1}'
-)
-if [[ ${#selected_gpus[@]} -ne 2 ||
-      "${selected_gpus[0]}" == "${selected_gpus[1]}" ]]; then
-  echo "need two distinct idle GPUs with at least 70000 MiB free" >&2
-  exit 3
+if [[ -n "${OURS_VIT_PHYSICAL_GPUS:-}" ]]; then
+  if [[ ! "$OURS_VIT_PHYSICAL_GPUS" =~ ^[0-9]+,[0-9]+$ ]]; then
+    echo "OURS_VIT_PHYSICAL_GPUS must be two comma-separated GPU indices" >&2
+    exit 2
+  fi
+  IFS=, read -r -a selected_gpus <<< "$OURS_VIT_PHYSICAL_GPUS"
+  if [[ "${selected_gpus[0]}" == "${selected_gpus[1]}" ]]; then
+    echo "OURS_VIT_PHYSICAL_GPUS must contain two distinct GPUs" >&2
+    exit 2
+  fi
+  mapfile -t eligible_gpus < <(
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.free \
+      --format=csv,noheader,nounits |
+    awk -F, '$2 + 0 <= 5 && $3 + 0 >= 70000 {print $1 + 0}'
+  )
+  for selected_gpu in "${selected_gpus[@]}"; do
+    found=0
+    for eligible_gpu in "${eligible_gpus[@]}"; do
+      [[ "$selected_gpu" == "$eligible_gpu" ]] && found=1
+    done
+    if [[ "$found" != 1 ]]; then
+      echo "pre-bound GPU $selected_gpu is not idle with at least 70000 MiB free" >&2
+      exit 3
+    fi
+  done
+else
+  mapfile -t selected_gpus < <(
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.free \
+      --format=csv,noheader,nounits |
+    awk -F, '$2 + 0 <= 5 && $4 + 0 >= 70000 {
+                print $1 + 0, $3 + 0, $4 + 0
+              }' |
+    sort -k2,2n -k3,3nr |
+    awk 'NR <= 2 {print $1}'
+  )
+  if [[ ${#selected_gpus[@]} -ne 2 ||
+        "${selected_gpus[0]}" == "${selected_gpus[1]}" ]]; then
+    echo "need two distinct idle GPUs with at least 70000 MiB free" >&2
+    exit 3
+  fi
+  export OURS_VIT_PHYSICAL_GPUS=${selected_gpus[0]},${selected_gpus[1]}
 fi
-export OURS_VIT_PHYSICAL_GPUS=${selected_gpus[0]},${selected_gpus[1]}
 
 base="outputs/a3_a4_review/full12-$tag"
 host_base="$root/$base"
@@ -42,8 +69,13 @@ while IFS=$'\t' read -r name ablation packing plan; do
     relative="$base/$slug/run-$suffix"
     host="$root/$relative"
     if [[ -f "$host/status.txt" ]]; then
-      echo "OURS_FULL12_RESUME status=SKIP name=$name repeat=$repeat"
-      continue
+      if grep -q '^alice_rc=0$' "$host/status.txt" &&
+         grep -q '^bob_rc=0$' "$host/status.txt"; then
+        echo "OURS_FULL12_RESUME status=SKIP name=$name repeat=$repeat"
+        continue
+      fi
+      mv "$host" "$host.failed-$(date +%s)"
+      echo "OURS_FULL12_RESUME status=RETRY name=$name repeat=$repeat reason=prior_failure"
     fi
     if [[ -e "$host" ]]; then
       echo "incomplete run already exists (preserved): $host" >&2
