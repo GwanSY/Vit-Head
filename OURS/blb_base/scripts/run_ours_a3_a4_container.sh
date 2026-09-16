@@ -12,12 +12,24 @@ output_dir=$3
 blocks=$4
 scope=${5:-attention}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-# Keep the historical ~8-minute full-12 vit-gpu implementation as the
-# reproducible default.  New images remain opt-in through OURS_DOCKER_IMAGE.
-image=${OURS_DOCKER_IMAGE:-ours:fast-preserved-20260901}
+image=${OURS_DOCKER_IMAGE:-ours:restored-fast-20260903d}
 port=${OURS_VIT_PORT:-31003}
+backend=${OURS_VIT_BACKEND:-gpu}
+network_mode=${OURS_VIT_NETWORK_MODE:-netem}
+min_free_memory=${OURS_VIT_MIN_FREE_MEMORY_MIB:-70000}
+max_gpu_utilization=${OURS_VIT_MAX_GPU_UTILIZATION_PERCENT:-5}
+if [[ "$backend" != cpu && "$backend" != gpu ]]; then
+  echo "OURS_VIT_BACKEND must be cpu or gpu" >&2
+  exit 2
+fi
 packing=${OURS_VIT_GROUP_PACKING:-1}
-conversion_mode=${OURS_VIT_CONVERSION_MODE:-fast}
+gpu_direct_plaintext=${BLB_VIT_GPU_DIRECT_PLAINTEXT:-1}
+gpu_linear_streams=${BLB_VIT_GPU_LINEAR_STREAMS:-8}
+allow_busy_gpus=${OURS_VIT_ALLOW_BUSY_GPUS:-0}
+allow_shared_gpu=${OURS_VIT_ALLOW_SHARED_GPU:-0}
+binary_override=${OURS_VIT_BINARY_OVERRIDE:-$root/build/container-gpu/bin/ours_vit_b16_main}
+phantom_library_override=${OURS_VIT_PHANTOM_LIBRARY_OVERRIDE:-$root/build/container-gpu/extern/phantom/lib/libPhantom.so}
+cuda_gdb_command_file=${BLB_VIT_CUDA_GDB_COMMAND_FILE:-}
 
 if [[ "$ablation" == a0 &&
       "${OURS_VIT_FORMAL_A0_BASELINE:-0}" != 1 ]]; then
@@ -52,12 +64,60 @@ if [[ "$packing" != 0 && "$packing" != 1 ]]; then
   echo "OURS_VIT_GROUP_PACKING must be 0 (Unpacked) or 1 (Packed)" >&2
   exit 2
 fi
-if [[ "$conversion_mode" != fast && "$conversion_mode" != exact ]]; then
-  echo "OURS_VIT_CONVERSION_MODE must be fast or exact" >&2
+if [[ "$gpu_direct_plaintext" != 0 && "$gpu_direct_plaintext" != 1 ]]; then
+  echo "BLB_VIT_GPU_DIRECT_PLAINTEXT must be 0 or 1" >&2
   exit 2
 fi
-if [[ "$output_dir" != outputs/a3_a4_review/* ]]; then
-  echo "OUTPUT_DIR must be below outputs/a3_a4_review" >&2
+if [[ ! "$gpu_linear_streams" =~ ^([1-9]|1[0-6])$ ]]; then
+  echo "BLB_VIT_GPU_LINEAR_STREAMS must be an integer in [1, 16]" >&2
+  exit 2
+fi
+if [[ "$allow_busy_gpus" != 0 && "$allow_busy_gpus" != 1 ]]; then
+  echo "OURS_VIT_ALLOW_BUSY_GPUS must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$allow_shared_gpu" != 0 && "$allow_shared_gpu" != 1 ]]; then
+  echo "OURS_VIT_ALLOW_SHARED_GPU must be 0 or 1" >&2
+  exit 2
+fi
+for override in "$binary_override" "$phantom_library_override"; do
+  if [[ -n "$override" && ("$override" != /* || ! -f "$override") ]]; then
+    echo "binary/library override must be an existing absolute file" >&2
+    exit 2
+  fi
+done
+if [[ -n "$binary_override" && ! -x "$binary_override" ]]; then
+  echo "OURS_VIT_BINARY_OVERRIDE is not executable: $binary_override" >&2
+  exit 2
+fi
+if [[ -n "$cuda_gdb_command_file" ]]; then
+  if [[ "$cuda_gdb_command_file" != /* || ! -f "$cuda_gdb_command_file" ]]; then
+    echo "BLB_VIT_CUDA_GDB_COMMAND_FILE must be an existing absolute path" >&2
+    exit 2
+  fi
+fi
+docker_extra_mounts=()
+if [[ -n "$cuda_gdb_command_file" ]]; then
+  docker_extra_mounts+=(
+    --mount
+    "type=bind,src=$cuda_gdb_command_file,dst=/workspace/OURS/a4_mismatch_cuda_gdb.cmd,readonly"
+  )
+fi
+if [[ -n "$binary_override" ]]; then
+  docker_extra_mounts+=(
+    --mount
+    "type=bind,src=$binary_override,dst=/workspace/OURS/build/gpu/bin/ours_vit_b16_main,readonly"
+  )
+fi
+if [[ -n "$phantom_library_override" ]]; then
+  docker_extra_mounts+=(
+    --mount
+    "type=bind,src=$phantom_library_override,dst=/opt/ours/lib/libPhantom.so,readonly"
+  )
+fi
+if [[ "$output_dir" != outputs/* ||
+      "/$output_dir/" == *"/../"* ]]; then
+  echo "OUTPUT_DIR must be below outputs/" >&2
   exit 2
 fi
 if [[ "$head_plan" != /* ]]; then head_plan="$root/$head_plan"; fi
@@ -81,6 +141,8 @@ if [[ -e "$host_output_dir" ]]; then
 fi
 mkdir -p "$host_output_dir"
 checkpoint_dir=$(readlink -f "$root/checkpoints/vit_b16")
+host_model=${OURS_VIT_MODEL:-$checkpoint_dir/bolt_model.txt}
+host_model=$(readlink -f "$host_model")
 input_dir=$(readlink -f "$root/inputs/vit_b16")
 host_input=${OURS_VIT_INPUT:-$input_dir/bob_image.txt}
 host_input=$(readlink -f "$host_input")
@@ -94,7 +156,7 @@ image_id=$(docker image inspect "$image" --format '{{.Id}}')
 # Run the independent FP32/fixed-clear head-reorder oracle on the host.  The
 # resulting hash binding is checked by both secure parties before sockets open.
 python3 -B "$root/ours_vit_b16/scripts/verify_head_reorder.py" \
-  --model "$checkpoint_dir/bolt_model.txt" \
+  --model "$host_model" \
   --input "$host_input" \
   --head-plan "$head_plan" \
   --output "$host_output_dir/head_reorder_oracle.json" \
@@ -106,7 +168,7 @@ binding="$host_output_dir/reorder_binding.txt"
 {
   echo "format=OURS_VIT_REORDER_BINDING_V1"
   echo "status=PASS"
-  echo "model_sha256=$(sha256sum "$checkpoint_dir/bolt_model.txt" | awk '{print $1}')"
+  echo "model_sha256=$(sha256sum "$host_model" | awk '{print $1}')"
   echo "input_sha256=$(sha256sum "$host_input" | awk '{print $1}')"
   echo "attention_packing=$([[ "$packing" == 1 ]] && echo packed || echo unpacked)"
   echo "plan_sha256=$(sha256sum "$head_plan" | awk '{print $1}')"
@@ -123,9 +185,14 @@ if [[ "$ablation" == a0 ]]; then
   runtime_head_plan=""
 fi
 
-# Select immediately before docker run.  Two distinct GPUs are required so the
-# result remains comparable to the BLB two-party/two-GPU baseline.  Prefer the
-# least allocated cards; no physical index is embedded in code or the image.
+# CPU execution exposes no GPU. GPU execution honors the configured pair.
+docker_device_args=()
+gpu_csv=""
+container_alice_gpu_id=""
+container_bob_gpu_id=""
+container_visible_gpus=""
+party_topology=cpu
+if [[ "$backend" == gpu ]]; then
 nvidia-smi --query-gpu=index,name,uuid,driver_version,memory.total,utilization.gpu,memory.used,memory.free \
   --format=csv,noheader > "$host_output_dir/gpu_telemetry_before_run.txt"
 if [[ -n "${OURS_VIT_PHYSICAL_GPUS:-}" ]]; then
@@ -137,7 +204,10 @@ if [[ -n "${OURS_VIT_PHYSICAL_GPUS:-}" ]]; then
   mapfile -t currently_eligible < <(
     nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.free \
       --format=csv,noheader,nounits |
-    awk -F, '$2 + 0 <= 5 && $4 + 0 >= 70000 {print $1 + 0}'
+    awk -F, -v allow_busy="$allow_busy_gpus" -v min_free="$min_free_memory" -v max_util="$max_gpu_utilization" \
+      '($4 + 0 >= min_free && (allow_busy == 1 || $2 + 0 <= max_util)) {
+         print $1 + 0
+       }'
   )
   for selected_gpu in "${selected_gpus[@]}"; do
     eligible=0
@@ -145,42 +215,90 @@ if [[ -n "${OURS_VIT_PHYSICAL_GPUS:-}" ]]; then
       [[ "$selected_gpu" == "$candidate_gpu" ]] && eligible=1
     done
     if [[ "$eligible" != 1 ]]; then
-      echo "fixed cohort GPU $selected_gpu no longer meets the idle/free-memory threshold" >&2
-      exit 3
+      echo "fixed cohort GPU $selected_gpu busy: requires utilization <=${max_gpu_utilization}% (unless allow_busy=1) and free memory >=${min_free_memory} MiB; no secure run started" >&2
+      exit 75
     fi
   done
 else
   mapfile -t selected_gpus < <(
     nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.free \
       --format=csv,noheader,nounits |
-    awk -F, '$2 + 0 <= 5 && $4 + 0 >= 70000 {
+    awk -F, -v allow_busy="$allow_busy_gpus" -v min_free="$min_free_memory" -v max_util="$max_gpu_utilization" \
+      '$4 + 0 >= min_free && (allow_busy == 1 || $2 + 0 <= max_util) {
                 print $1 + 0, $3 + 0, $4 + 0
               }' |
     sort -k2,2n -k3,3nr |
     awk 'NR <= 2 {print $1}'
   )
 fi
-if [[ ${#selected_gpus[@]} -ne 2 ||
-      "${selected_gpus[0]}" == "${selected_gpus[1]}" ]]; then
-  echo "need two distinct idle GPUs (utilization <=5%, memory.free >=70000 MiB)" >&2
+if [[ ${#selected_gpus[@]} -ne 2 ]]; then
+  echo "need two selected GPUs (memory.free >=70000 MiB)" >&2
+  exit 3
+fi
+if [[ "${selected_gpus[0]}" == "${selected_gpus[1]}" &&
+      "$allow_shared_gpu" != 1 ]]; then
+  echo "shared physical GPU requires OURS_VIT_ALLOW_SHARED_GPU=1" >&2
   exit 3
 fi
 gpu_csv=${selected_gpus[0]},${selected_gpus[1]}
-gpu_request="\"device=$gpu_csv\""
+if [[ "${selected_gpus[0]}" == "${selected_gpus[1]}" ]]; then
+  gpu_request="device=${selected_gpus[0]}"
+  party_topology=shared_physical_gpu
+  container_visible_gpus=0,0
+else
+  gpu_request="\"device=$gpu_csv\""
+  party_topology=separate_physical_gpus
+  container_visible_gpus=0,1
+fi
+gpu_uuid_for_index() {
+  awk -F, -v target="$1" '
+    function trim(value) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      return value
+    }
+    trim($1) + 0 == target { print trim($3); exit }
+  ' "$host_output_dir/gpu_telemetry_before_run.txt"
+}
+container_alice_gpu_id=$(gpu_uuid_for_index "${selected_gpus[0]}")
+container_bob_gpu_id=$(gpu_uuid_for_index "${selected_gpus[1]}")
+if [[ -z "$container_alice_gpu_id" || -z "$container_bob_gpu_id" ]]; then
+  echo "cannot resolve selected GPU UUIDs from NVIDIA telemetry" >&2
+  exit 3
+fi
+docker_device_args+=(--gpus "$gpu_request")
+else
+  docker_device_args+=(--env NVIDIA_VISIBLE_DEVICES=void --env CUDA_VISIBLE_DEVICES=)
+fi
 container_name="ours-${ablation}-${scope}-$(date +%Y%m%d-%H%M%S)-$$"
 {
   echo "selection=$([[ -n "${OURS_VIT_PHYSICAL_GPUS:-}" ]] && echo fixed_by_paired_ablation || echo dynamic_immediately_before_container_start)"
+  echo "backend=$backend"
   echo "physical_gpus=$gpu_csv"
-  echo "container_cuda_devices=0,1"
-  echo "party_topology=separate_physical_gpus"
-  echo "eligibility=utilization_le_5_percent_and_memory_free_ge_70000_MiB"
+  echo "physical_gpu_uuids=$container_alice_gpu_id,$container_bob_gpu_id"
+  echo "container_cuda_devices=$container_visible_gpus"
+  echo "party_topology=$party_topology"
+  if [[ "$allow_busy_gpus" == 1 ]]; then
+    echo "eligibility=explicit_busy_gpu_override_memory_free_ge_${min_free_memory}_MiB"
+  else
+    echo "eligibility=utilization_le_${max_gpu_utilization}_percent_and_memory_free_ge_${min_free_memory}_MiB"
+  fi
+  echo "allow_busy_gpus=$allow_busy_gpus"
   echo "image=$image"
   echo "image_id=$image_id"
   echo "plan=$head_plan"
   echo "plan_sha256=$(sha256sum "$head_plan" | awk '{print $1}')"
   echo "input=$host_input"
   echo "input_sha256=$(sha256sum "$host_input" | awk '{print $1}')"
-  echo "conversion_mode=$conversion_mode"
+  echo "conversion_path=see_edge_cloud_contract_and_run_metadata"
+  echo "gpu_direct_plaintext=$gpu_direct_plaintext"
+  echo "gpu_linear_streams=$gpu_linear_streams"
+  echo "attention_diagonal_kernel=complete_v1"
+  echo "allow_shared_gpu=$allow_shared_gpu"
+  echo "binary_override=${binary_override:-image_payload}"
+  echo "phantom_library_override=${phantom_library_override:-image_payload}"
+  if [[ -n "$binary_override" ]]; then
+    echo "binary_override_sha256=$(sha256sum "$binary_override" | awk '{print $1}')"
+  fi
   date --iso-8601=ns
 } > "$host_output_dir/gpu_selection.txt"
 
@@ -209,15 +327,20 @@ elif [[ "$scope" == full ]]; then
 fi
 timeout_seconds=${BLB_VIT_TIMEOUT_SECONDS:-$timeout_seconds}
 if [[ "${OURS_VIT_CAPTURE_ATTENTION_TRACE:-0}" == 1 ]]; then
-  if [[ ("$scope" != attention && "$scope" != logits) || "$blocks" != 1 ]]; then
-    echo "OURS_VIT_CAPTURE_ATTENTION_TRACE requires attention/logits scope and BLOCKS=1" >&2
+  if [[ ("$scope" != attention && "$scope" != logits) ||
+        ("$blocks" != 1 && !("$ablation" == a0 && "$scope" == logits && "$blocks" == 2)) ]]; then
+    echo "OURS_VIT_CAPTURE_ATTENTION_TRACE requires a one-block diagnostic or A0 two-block logits" >&2
     exit 2
   fi
-  diagnostic_env+=(
-    OURS_VIT_STOP_AFTER_ATTENTION=1
-    OURS_VIT_HETERO_ATTENTION_TRACE=1
-    OURS_VIT_HETERO_ATTENTION_TRACE_DIR="$output_dir"
-  )
+  if [[ "$ablation" == a0 ]]; then
+    diagnostic_env+=(OURS_VIT_A0_TRACE=1 OURS_VIT_A0_TRACE_DIR="$output_dir")
+  else
+    diagnostic_env+=(
+      OURS_VIT_STOP_AFTER_ATTENTION=1
+      OURS_VIT_HETERO_ATTENTION_TRACE=1
+      OURS_VIT_HETERO_ATTENTION_TRACE_DIR="$output_dir"
+    )
+  fi
   echo "OURS_DIAGNOSTIC_TRACE enabled=1 feeds_secure_graph=0 timing_eligible=0"
 fi
 
@@ -226,25 +349,34 @@ fi
 # preparing the host-side reorder oracle.
 docker run --rm --pull=never --name "$container_name" \
   --network=none --cap-add=NET_ADMIN --ipc=host \
-  --gpus "$gpu_request" \
+  "${docker_device_args[@]}" \
   --mount "type=bind,src=$review_dir,dst=/workspace/OURS/outputs/a3_a4_review" \
+  --mount "type=bind,src=$host_output_dir,dst=/workspace/OURS/$output_dir" \
   --mount "type=bind,src=$checkpoint_dir,dst=/workspace/OURS/checkpoints/vit_b16,readonly" \
+  --mount "type=bind,src=$host_model,dst=/workspace/OURS/runtime_model.txt,readonly" \
   --mount "type=bind,src=$input_dir,dst=/workspace/OURS/inputs/vit_b16,readonly" \
   --mount "type=bind,src=$host_input,dst=/workspace/OURS/runtime_input.txt,readonly" \
   --mount "type=bind,src=$head_plan,dst=$container_plan,readonly" \
+  --mount "type=bind,src=$root/scripts/run_ours_vit_b16.sh,dst=/workspace/OURS/scripts/run_ours_vit_b16.sh,readonly" \
+  "${docker_extra_mounts[@]}" \
   --mount "type=bind,src=/usr/local/cuda-12.3,dst=/usr/local/cuda-12.3,readonly" \
   --workdir /workspace/OURS "$image_id" env \
   OURS_VIT_ABLATION="$ablation" \
   OURS_VIT_HEAD_PLAN="$runtime_head_plan" \
   OURS_VIT_GROUP_PACKING="$packing" \
-  OURS_VIT_CONVERSION_MODE="$conversion_mode" \
+  BLB_VIT_GPU_DIRECT_PLAINTEXT="$gpu_direct_plaintext" \
+  BLB_VIT_GPU_LINEAR_STREAMS="$gpu_linear_streams" \
+  BLB_VIT_OMP_THREADS="${BLB_VIT_OMP_THREADS:-64}" \
+  BLB_VIT_CUDA_GDB_COMMAND_FILE="${cuda_gdb_command_file:+/workspace/OURS/a4_mismatch_cuda_gdb.cmd}" \
   OURS_VIT_PREVALIDATED_REORDER_BINDING="$output_dir/reorder_binding.txt" \
   BLB_VIT_INPUT=/workspace/OURS/runtime_input.txt \
-  OURS_VIT_NETWORK_MODE=netem \
+  BLB_VIT_MODEL=/workspace/OURS/runtime_model.txt \
+  OURS_VIT_NETWORK_MODE="$network_mode" \
   BLB_VIT_STOP_AFTER_BLOCK="$blocks" \
   BLB_VIT_TIMEOUT_SECONDS="$timeout_seconds" \
   "${diagnostic_env[@]}" \
-  scripts/run_ours_vit_b16.sh gpu "$output_dir" "$port" 0 1
+  scripts/run_ours_vit_b16.sh "$backend" "$output_dir" "$port" \
+    "$container_alice_gpu_id" "$container_bob_gpu_id"
 
 # The inner BLB runner writes its own GPU audit to the same filename. Append
 # the immutable outer binding after a successful container exit so collectors
@@ -255,13 +387,26 @@ docker run --rm --pull=never --name "$container_name" \
   else
     echo "outer_selection=dynamic_immediately_before_container_start"
   fi
+  echo "backend=$backend"
   echo "physical_gpus=$gpu_csv"
-  echo "container_visible_gpus=0,1"
+  echo "physical_gpu_uuids=$container_alice_gpu_id,$container_bob_gpu_id"
+  echo "container_visible_gpus=$container_visible_gpus"
+  echo "party_topology=$party_topology"
   echo "image=$image"
   echo "image_id=$image_id"
   echo "plan=$head_plan"
   echo "plan_sha256=$(sha256sum "$head_plan" | awk '{print $1}')"
   echo "attention_packing=$([[ "$packing" == 1 ]] && echo packed || echo unpacked)"
+  echo "allow_busy_gpus=$allow_busy_gpus"
+  echo "gpu_direct_plaintext=$gpu_direct_plaintext"
+  echo "gpu_linear_streams=$gpu_linear_streams"
+  echo "attention_diagonal_kernel=complete_v1"
+  echo "allow_shared_gpu=$allow_shared_gpu"
+  echo "binary_override=${binary_override:-image_payload}"
+  echo "phantom_library_override=${phantom_library_override:-image_payload}"
+  if [[ -n "$binary_override" ]]; then
+    echo "binary_override_sha256=$(sha256sum "$binary_override" | awk '{print $1}')"
+  fi
 } >> "$host_output_dir/gpu_selection.txt"
 
 if [[ "$scope" == full && ("$ablation" == a3 || "$ablation" == a4) ]]; then

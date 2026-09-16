@@ -51,6 +51,10 @@ public:
     void gt_p_sub_part1(int nthreads, uint64_t* input, uint64_t p, uint64_t* output, int size, int ell, int s_in, int s_out);
     void gt_p_sub_part2(int nthreads, uint64_t* input, uint64_t* output, int size, int ell, int s_in, int s_out);
     void field_to_ring(int nthreads, uint64_t* input, uint64_t p, uint64_t* output, int size, int bitwidth, int s_in, int s_out);
+    void centered_field_to_ring_wide(int nthreads, const uint64_t* input,
+                                    uint64_t p, uint64_t* output_low,
+                                    uint64_t* output_high, int size,
+                                    int target_bitwidth);
     void ring_to_field(int nthreads, uint64_t* input, uint64_t p, uint64_t* output, int size, int bitwidth, int s_in, int s_out);
     void ring_to_field_wide(int nthreads, uint64_t* input, uint64_t p,
                             uint64_t* output, int size, int bitwidth,

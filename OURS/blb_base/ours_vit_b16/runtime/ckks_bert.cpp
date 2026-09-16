@@ -198,6 +198,25 @@ void import_target_scale(Bert_ckks &owner,
          << endl;
 }
 
+void import_broadcast_scale(
+    Bert_ckks &owner, const vector<vector<HE_CKKS::scalar_t>> &shares,
+    int slot, int ell, int input_scale, int target_scale, HE_CKKS *he,
+    vector<UnifiedPlaintext> &destination, const char *stage) {
+    if (shares.empty()) throw runtime_error("empty broadcast conversion");
+    // LayerNorm explicitly copies one inverse sigma across all features.
+    // This is a public layout invariant, not secret-dependent deduplication.
+    for (const auto &share : shares)
+        if (share != shares.front())
+            throw runtime_error(string("invalid LayerNorm broadcast layout: ") + stage);
+    import_target_scale(owner, {shares.front()}, slot, ell, input_scale,
+                        target_scale, he, destination, stage);
+    const UnifiedPlaintext prototype = destination.front();
+    destination.resize(shares.size(), prototype);
+    cout << "FORMAL_BROADCAST_IMPORT stage=" << stage
+         << " converted_ciphertexts=1 expanded_ciphertexts=" << shares.size()
+         << " secret_dependent_selection=0" << endl;
+}
+
 void require_uniform_unified_metadata(
     const vector<UnifiedCiphertext> &ciphertexts, const char *stage) {
     if (ciphertexts.empty()) {
@@ -946,9 +965,14 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
     // cout << "mpc_to_ckks1 comm:" << this->get_comm() << endl;
     // cout << "mpc_to_ckks1 round:" << this->get_round() << endl;
     if (!raw_input) {
-        mpc_to_ckks(pts_sigma_flat, vec_sigma_flat, slot_count,
+        if (pre_norm_attention_output_only) {
+            import_broadcast_scale(*this, vec_sigma_flat, slot_count, bitwidth,
+                s, he->he_scale, he, pts_sigma_flat, "qkv_inv_sigma_input");
+        } else {
+            mpc_to_ckks(pts_sigma_flat, vec_sigma_flat, slot_count,
                     he->get_conversion_prime(),
                     bitwidth, s, he->he_scale, he);
+        }
     }
     // cout << "mpc_to_ckks2 comm:" << this->get_comm() << endl;
     // cout << "mpc_to_ckks2 round:" << this->get_round() << endl;
@@ -969,17 +993,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         use_bert_half_packing ? pts_sigma_flat.size() / 2 : 0,
         UnifiedCiphertext(LOCATION::HOST));
     if (party == BOB) {
-        if (!use_bert_half_packing) {
-            #pragma omp parallel for
-            for (size_t i = 0; i < num_cts; ++i) {
-                he->encryptor->encrypt(pts_x_flat_avg[i],
-                                       cts_x_flat_full[i]);
-                if (!raw_input) {
-                    he->encryptor->encrypt(pts_sigma_flat[i],
-                                           cts_sigma_flat_full[i]);
-                }
-            }
-        } else {
+        if (use_bert_half_packing) {
             #pragma omp parallel for
             for(size_t i=0;i<num_cts/2;i++){
                 he->encryptor->encrypt(pts_x_flat_avg[i], cts_x_flat_half[i]);
@@ -989,9 +1003,9 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         cout << "send_encrypted_vector" << endl;
 			// test_util();
         if (!use_bert_half_packing) {
-            send_encrypted_vector(io, cts_x_flat_full);
+            he->encrypt_send(pts_x_flat_avg, cts_x_flat_full);
             if (!raw_input)
-                send_encrypted_vector(io, cts_sigma_flat_full);
+                he->encrypt_send(pts_sigma_flat, cts_sigma_flat_full);
             cout << (raw_input ? "RAW_INPUT_TRANSFER_LAYOUT"
                                : "FORMAL_TRANSFER_LAYOUT stage=ln_attention_input")
                  << " status=PASS layout=ordinary_full_slot cts="
@@ -1025,6 +1039,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                     }
                 }
             } else {
+                raw_qk_cts.resize((qk_ct_count + 1) / 2);
+                raw_v_cts.resize((v_ct_count + 1) / 2);
+                raw_qk_pts.resize(raw_qk_cts.size());
+                raw_v_pts.resize(raw_v_cts.size());
                 recv_encrypted_vector(he->context, io, raw_qk_cts);
                 recv_encrypted_vector(he->context, io, raw_v_cts);
             }
@@ -1223,7 +1241,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         }
 
         // start computation
-        #pragma omp parallel for
+        // GPU consumers below run on the caller's per-thread CUDA stream.
+        // Keep these short launches on that stream; an OpenMP join does not
+        // wait for GPU work enqueued by a worker.
+        #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<cts_x_flat.size();i++){
             /*
                 get x_avg and sigma, compute (x_avg * w) * sigma + b
@@ -1364,8 +1385,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 linear.pp_1[layer_id],
                 data,
                 q_k_v,
-                a0_trace && !raw_input ? &a0_qkv_ciphertexts : nullptr,
-                heterogeneous_ablation >= ours_vit::Ablation::A3
+                a0_trace && !raw_input ? &a0_qkv_ciphertexts : nullptr
             );
         }
         cout << "qkv_scale:" << log2(q_k_v[0].scale()) << endl;
@@ -1649,6 +1669,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 prepare_host_conversion_from_actual_scale(
                     *this, raw_qk_cts, kFormalConversionScaleBits, he,
                     "layer0_qk");
+                pack_real_ckks_pairs(raw_qk_cts, he);
                 mask_ckks_to_mpc_inplace(raw_qk_cts, raw_qk_pts, he);
                 send_encrypted_vector(io, raw_qk_cts);
                 // The official BLB Block-2 boundary exports both QK and V from
@@ -1658,6 +1679,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 prepare_host_conversion_from_actual_scale(
                     *this, raw_v_cts, kFormalConversionScaleBits, he,
                     "layer0_v");
+                pack_real_ckks_pairs(raw_v_cts, he);
                 mask_ckks_to_mpc_inplace(raw_v_cts, raw_v_pts, he);
                 send_encrypted_vector(io, raw_v_cts);
             }
@@ -1828,14 +1850,12 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             const auto previous_conversion_bucket = profile_conversion_bucket();
             profile_set_conversion_bucket(
                 BlbViTCommAuditBucket::QK_TO_SOFTMAX_CONVERSION);
-            output_vector = ckks_to_mpc(
-                raw_qk_pts, degree, he->get_Q(raw_qk_pts[0]), NL_ELL, NL_SCALE,
-                he, false);
+            output_vector = ckks_pairs_to_mpc(
+                raw_qk_pts, qk_ct_count, NL_ELL, NL_SCALE, he);
             profile_set_conversion_bucket(
                 BlbViTCommAuditBucket::OTHER_CONVERSION);
-            auto v_vector = ckks_to_mpc(
-                raw_v_pts, degree, he->get_Q(raw_v_pts[0]), NL_ELL,
-                ATTENTION_V_SCALE, he, false);
+            auto v_vector = ckks_pairs_to_mpc(
+                raw_v_pts, v_ct_count, NL_ELL, ATTENTION_V_SCALE, he);
             output_vector.insert(output_vector.end(),
                                  make_move_iterator(v_vector.begin()),
                                  make_move_iterator(v_vector.end()));
@@ -2271,8 +2291,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         const auto softmax_v_profile_start = high_resolution_clock::now();
         vector<vector<vector<UnifiedCiphertext>>> packed_qk;
         linear.preprocess_softmax_s1_ct_ct(
-            he, mpc_qk_cts, av_data, packed_qk, &mpc_heads,
-            heterogeneous_group_packing_enabled);
+            he, mpc_qk_cts, av_data, packed_qk, &mpc_heads);
         const auto &level_reference = [&]() -> const UnifiedCiphertext & {
             for (int pair = 0; pair < PACKING_NUM / 2; ++pair)
                 if (mpc_heads[2 * pair] || mpc_heads[2 * pair + 1])
@@ -2439,40 +2458,53 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
                         .to_device(*he->context, *he->dcontext);
             }
         }
-        // As above, consume the selector's public level once on the compact
-        // native operands.  QK and V remain encrypted in he1; this is a CKKS
-        // modulus switch, not a conversion or a surrogate computation.
-        uint64_t blb_fast_modswitches = 0;
+        // Diagonal extraction consumes the selector level. Align V only
+        // after extraction so the final W_O level is not dropped twice.
+        vector<vector<vector<UnifiedCiphertext>>> packed_qk;
+        linear.preprocess_softmax_s1_ct_ct(
+            he, a4_linear_qk_he1_cts, av_data, packed_qk, &linear_heads);
+        // Align against the actual packed operands, after the selector has
+        // consumed its level. Modulus switching preserves values and scales.
+        size_t common_limbs =
+            a4_linear_v_he1_cts[reference_v].coeff_modulus_size();
         for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
             if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
                 continue;
-            for (int local = 0; local < qk_cts_per_pair; ++local) {
-                auto &ciphertext = a4_linear_qk_he1_cts[
-                    pair * qk_cts_per_pair + local];
-                if (ciphertext.location() == LOCATION::HOST)
-                    he->evaluator->mod_switch_to_next_inplace(ciphertext);
-                else
-                    he->devaluator->mod_switch_to_next_inplace(ciphertext);
-                ++blb_fast_modswitches;
-            }
-            for (int local = 0; local < v_cts_per_pair; ++local) {
-                auto &ciphertext = a4_linear_v_he1_cts[
-                    pair * v_cts_per_pair + local];
-                if (ciphertext.location() == LOCATION::HOST)
-                    he->evaluator->mod_switch_to_next_inplace(ciphertext);
-                else
-                    he->devaluator->mod_switch_to_next_inplace(ciphertext);
-                ++blb_fast_modswitches;
-            }
+            for (const auto &diagonals : packed_qk[pair])
+                for (const auto &ciphertext : diagonals)
+                    common_limbs = min(common_limbs,
+                                       ciphertext.coeff_modulus_size());
+            for (int local = 0; local < v_cts_per_pair; ++local)
+                common_limbs = min(common_limbs,
+                    a4_linear_v_he1_cts[pair * v_cts_per_pair + local]
+                        .coeff_modulus_size());
         }
-        cout << "OURS_BLB_FAST_AV_LEVEL status=PASS layer=" << layer_id
-             << " context=he1 mod_switch_only=" << blb_fast_modswitches
-             << " extra_rescales=0 extra_multiplies=0"
-             << " client_decrypt_reencrypt=0 mpc_reference=0" << endl;
-        vector<vector<vector<UnifiedCiphertext>>> packed_qk;
-        linear.preprocess_softmax_s1_ct_ct(
-            he, a4_linear_qk_he1_cts, av_data, packed_qk, &linear_heads,
-            heterogeneous_group_packing_enabled);
+        if (common_limbs < 2)
+            throw runtime_error("A4 packed AV lacks the final W_O level");
+        auto align_av_level = [&](UnifiedCiphertext &ciphertext) {
+            while (ciphertext.coeff_modulus_size() > common_limbs) {
+                if (ciphertext.location() == LOCATION::HOST)
+                    he->evaluator->mod_switch_to_next_inplace(ciphertext);
+                else
+                    he->devaluator->mod_switch_to_next_inplace(ciphertext);
+            }
+        };
+        for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
+            if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
+                continue;
+            for (auto &diagonals : packed_qk[pair])
+                for (auto &ciphertext : diagonals)
+                    align_av_level(ciphertext);
+            for (int local = 0; local < v_cts_per_pair; ++local)
+                align_av_level(a4_linear_v_he1_cts[
+                    pair * v_cts_per_pair + local]);
+        }
+        cout << "OURS_A4_AV_LEVEL status=PASS layer=" << layer_id
+             << " coeff_modulus_size=" << common_limbs
+             << " packing=complete_diagonal"
+             << " heterogeneous_head_grouping="
+             << (heterogeneous_group_packing_enabled ? 1 : 0)
+             << endl;
         vector<UnifiedCiphertext> av_result(
             v_ct_count, UnifiedCiphertext(he->backend()));
         linear.softmax_v(he, packed_qk, a4_linear_v_he1_cts, av_data,
@@ -2826,11 +2858,7 @@ FixArray Bert_ckks::linear2_from_mpc(const FixArray &input,
     vector<Ciphertext> output_pts_host;
     vector<Plaintext> output_pts(output_num_cts);
     if (party == BOB) {
-        #pragma omp parallel for
-        for (size_t i = 0; i < input_cts.size(); ++i) {
-            he->encryptor->encrypt(pts[i], input_cts[i]);
-        }
-        send_encrypted_vector(io, input_cts);
+        he->encrypt_send(pts, input_cts);
         if (final_he_logits_diagnostic) {
             vector<Ciphertext> diagnostic_cts(output_num_cts);
             recv_encrypted_vector(he->context, io, diagnostic_cts);
@@ -3026,13 +3054,8 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
     vector<Plaintext> output_pts(num_cts);
     auto transfer_start = high_resolution_clock::now();
     if (party == BOB) {
-        #pragma omp parallel for
-        for (size_t i = 0; i < num_cts; ++i) {
-            he->encryptor->encrypt(x_pts[i], x_cts[i]);
-            he->encryptor->encrypt(sigma_pts[i], sigma_cts[i]);
-        }
-        send_encrypted_vector(io, x_cts);
-        send_encrypted_vector(io, sigma_cts);
+        he->encrypt_send(x_pts, x_cts);
+        he->encrypt_send(sigma_pts, sigma_cts);
         vector<Ciphertext> output_cts(num_cts);
         recv_encrypted_vector(he->context, io, output_cts);
         #pragma omp parallel for
@@ -3323,7 +3346,8 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                                 attention_v_share.ell, attention_v_share.s,
                                 he->he_scale, he, v_share_pts, "attention_v");
     }
-    import_target_scale(*this, attention_residual_vector, slot,
+    if (!pre_norm_attention_output_only)
+      import_target_scale(*this, attention_residual_vector, slot,
                             attention_input_residual_share.ell,
                             attention_input_residual_share.s, he->he_scale,
                             he, attention_residual_pts,
@@ -3346,7 +3370,8 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
     vector<UnifiedCiphertext> enc_v(
         use_he_v ? 0 : num_cts_ln, UnifiedCiphertext(LOCATION::HOST));
     vector<UnifiedCiphertext> enc_attention_residual(
-        num_cts_ln, UnifiedCiphertext(LOCATION::HOST));
+        pre_norm_attention_output_only ? 0 : num_cts_ln,
+        UnifiedCiphertext(LOCATION::HOST));
     const bool a0_trace =
         getenv("OURS_VIT_A0_TRACE") != nullptr &&
         string(getenv("OURS_VIT_A0_TRACE")) == "1";
@@ -3419,21 +3444,13 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         enc_v = std::move(attention_v_he_cts);
     }
     if (party==BOB){
-        #pragma omp parallel for
-        for(int i=0;i<(use_bert_half_packing ? enc_softmax_half.size()
-                                             : enc_softmax.size());i++){
-            he->encryptor->encrypt(
-                softmax_output_pack_pts[i],
-                use_bert_half_packing ? enc_softmax_half[i] : enc_softmax[i]);
-        }
-        if (!use_he_v) {
+        if (use_bert_half_packing) {
             #pragma omp parallel for
-            for(int i=0;i<num_cts_ln;i++){
-                he->encryptor->encrypt(v_share_pts[i], enc_v[i]);
-            }
+            for (size_t i = 0; i < enc_softmax_half.size(); ++i)
+                he->encryptor->encrypt(softmax_output_pack_pts[i], enc_softmax_half[i]);
         }
         #pragma omp parallel for
-        for(int i=0;i<num_cts_ln;i++){
+        for(int i=0;i<enc_attention_residual.size();i++){
             he->encryptor->encrypt(attention_residual_pts[i],
                                    enc_attention_residual[i]);
         }
@@ -3443,15 +3460,16 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         if (use_bert_half_packing) {
             send_encrypted_vector(io, enc_softmax_half);
         } else {
-            send_encrypted_vector(io, enc_softmax);
+            he->encrypt_send(softmax_output_pack_pts, enc_softmax);
         }
         if (!use_he_v) {
-            send_encrypted_vector(io, enc_v);
+            he->encrypt_send(v_share_pts, enc_v);
         }
-        send_encrypted_vector(io, enc_attention_residual);
+        if (!enc_attention_residual.empty())
+            send_encrypted_vector(io, enc_attention_residual);
         cout << "FORMAL_TRANSFER_LAYOUT stage=softmax_v_input status=PASS"
              << " layout=ordinary_full_slot softmax_cts=" << num_cts_softmax
-             << " v_cts=" << enc_v.size() << " residual_cts=" << num_cts_ln
+             << " v_cts=" << enc_v.size() << " residual_cts=" << enc_attention_residual.size()
              << " v_transport=" << (use_he_v ? "HE_at_Alice" : "MPC_to_CKKS")
              << " imag_repack=0" << endl;
         cout << "send_encrypted_vector done" << endl;
@@ -3602,7 +3620,8 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         if (!use_he_v) {
             recv_encrypted_vector(he->context, io, enc_v);
         }
-        recv_encrypted_vector(he->context, io, enc_attention_residual);
+        if (!enc_attention_residual.empty())
+            recv_encrypted_vector(he->context, io, enc_attention_residual);
         this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
 
         // In the HE-V path, perform the existing share additions and the
@@ -3753,12 +3772,13 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         if (!use_he_v) {
             require_uniform_metadata(enc_v, "attention_v");
         }
-        require_uniform_metadata(enc_attention_residual,
-                                 "attention_residual");
+        if (!enc_attention_residual.empty())
+            require_uniform_metadata(enc_attention_residual,
+                                     "attention_residual");
         const double imported_scale = ldexp(1.0, he->he_scale);
         if (use_he_v) {
-            const double residual_relative_error =
-                abs(enc_attention_residual.front().scale() - imported_scale) /
+            const double residual_relative_error = enc_attention_residual.empty()
+                ? 0.0 : abs(enc_attention_residual.front().scale() - imported_scale) /
                 imported_scale;
             const double softmax_v_relative_error =
                 abs(enc_softmax.front().scale() - enc_v.front().scale()) /
@@ -3774,6 +3794,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
             vector<const vector<UnifiedCiphertext> *> imported_ciphertext_vectors = {
                 &enc_softmax, &enc_attention_residual, &enc_v};
             for (const auto *entry : imported_ciphertext_vectors) {
+                if (entry->empty()) continue;
                 const double relative_error =
                     abs(entry->front().scale() - imported_scale) /
                     imported_scale;
@@ -3841,7 +3862,8 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         }
         cout << "OK4" << endl;
         vector<vector<vector<UnifiedCiphertext>>> pack_softmax_ct;
-        linear.preprocess_softmax_s1_ct_ct(he, enc_softmax, data, pack_softmax_ct);
+        linear.preprocess_softmax_s1_ct_ct(
+            he, enc_softmax, data, pack_softmax_ct);
         if (pack_softmax_ct.empty() || pack_softmax_ct.front().empty() ||
             pack_softmax_ct.front().front().empty()) {
             throw runtime_error("formal Softmax*V diagonal packing is empty");
@@ -3954,6 +3976,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         // begin computation
         cout << "OK7" << endl;
         // Add the actual encrypted block-input residual before LayerNorm.
+        if (!pre_norm_attention_output_only) {
         if (h3.size() != enc_attention_residual.size()) {
             throw runtime_error(
                 "formal attention residual ciphertext count mismatch");
@@ -4006,15 +4029,18 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
              << " target_limbs=" << residual_target_limbs
              << " cts=" << enc_attention_residual.size()
              << " value_lift=real_1" << endl;
+        }
         if (!he->is_gpu_enable()) {
             for(int i=0;i<h3.size();i++){
-                he->evaluator->add_inplace(h3[i], enc_attention_residual[i]);
+                if (!pre_norm_attention_output_only)
+                    he->evaluator->add_inplace(h3[i], enc_attention_residual[i]);
                 ++this->he_rescale_count;
                 he->evaluator->rescale_to_next_inplace(h3[i]);
             }
         } else {
             for(int i=0;i<h3.size();i++){
-                he->devaluator->add_inplace(h3[i], enc_attention_residual[i]);
+                if (!pre_norm_attention_output_only)
+                    he->devaluator->add_inplace(h3[i], enc_attention_residual[i]);
                 ++this->he_rescale_count;
                 he->devaluator->rescale_to_next_inplace(h3[i]);
             }
@@ -4024,11 +4050,8 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         attention_v_he_cts.clear();
         cout << "OK1" << endl;
         if (pre_norm_attention_output_only) {
-            // ViT is pre-norm: expose h3 immediately after the original
-            // Softmax*V -> output projection -> residual CKKS path.  The
-            // conversion is exactly Algorithm 1; no LayerNorm protocol is
-            // skipped elsewhere because this branch is the model's residual
-            // boundary, not an optimization.
+            // ViT's residual already has the destination MPC scale. Add
+            // those shares after conversion instead of importing them to HE.
             vector<Ciphertext> h3_full(h3.size());
             for (size_t i = 0; i < h3.size(); ++i) {
                 if (he->is_gpu_enable()) {
@@ -4381,8 +4404,14 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
             throw runtime_error("formal ViT attention residual is incomplete");
         }
         map<char*,FixArray> result;
-        result["residual"] = bsgs_output_to_token_major(
+        FixArray residual = bsgs_output_to_token_major(
             packed, linear.data_lin2, "vit_attention_residual_to_token");
+        const uint64_t mask = (uint64_t{1} << bitwidth) - 1;
+        for (int i = 0; i < residual.size; ++i)
+            residual.data[i] = (residual.data[i] + attention_input_residual_share.data[i]) & mask;
+        result["residual"] = residual;
+        cout << "VIT_RESIDUAL_LOCAL_ADD stage=attention status=PASS saved_import_cts="
+             << num_cts_ln << " communication=0" << endl;
         this->conversion_comm += this->get_comm();
         this->conversion_round += this->get_round();
         return result;
@@ -4561,9 +4590,15 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
     import_target_scale(*this, vec_x_flat_avg, slot_count, bitwidth, s,
                             he->he_scale, he, pts_x_flat_avg,
                             "ln1_centered_input");
-    import_target_scale(*this, vec_sigma_flat, slot_count, bitwidth, s,
+    if (pre_norm_ffn_residual_from_external) {
+        import_broadcast_scale(*this, vec_sigma_flat, slot_count, bitwidth, s,
                             he->he_scale, he, pts_sigma_flat,
                             "ln1_inv_sigma_input");
+    } else {
+        import_target_scale(*this, vec_sigma_flat, slot_count, bitwidth, s,
+                            he->he_scale, he, pts_sigma_flat,
+                            "ln1_inv_sigma_input");
+    }
     this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
     // cout << "mpc_to_ckks comm:" << this->get_comm() << endl;
     // cout << "mpc_to_ckks round:" << this->get_round() << endl;
@@ -4605,13 +4640,8 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
                  << " sigma_cts=" << cts_sigma_flat_half.size()
                  << " imag_repack=1 source=Figure10_Block5" << endl;
         } else {
-            #pragma omp parallel for
-            for(size_t i=0;i<cts_x_flat.size();i++){
-                he->encryptor->encrypt(pts_x_flat_avg[i], cts_x_flat[i]);
-                he->encryptor->encrypt(pts_sigma_flat[i], cts_sigma_flat[i]);
-            }
-            send_encrypted_vector(io, cts_x_flat);
-            send_encrypted_vector(io, cts_sigma_flat);
+            he->encrypt_send(pts_x_flat_avg, cts_x_flat);
+            he->encrypt_send(pts_sigma_flat, cts_sigma_flat);
             cout << "FORMAL_TRANSFER_LAYOUT stage=ln_ffn_input status=PASS"
                  << " layout=ordinary_full_slot x_cts=" << cts_x_flat.size()
                  << " sigma_cts=" << cts_sigma_flat.size()
@@ -4643,12 +4673,16 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
                 he->decryptor->decrypt(output_cts_half[i], output_pts_half[i]);
             }
         } else {
+            pre_gelu_cts.resize((gelu_cts_size + 1) / 2);
+            output_cts.resize((gelu_cts_size + 1) / 2);
             recv_encrypted_vector(he->context, io, pre_gelu_cts);
+            pre_gelu_pts.resize(pre_gelu_cts.size());
             #pragma omp parallel for
             for (int i = 0; i < pre_gelu_cts.size(); ++i) {
                 he->decryptor->decrypt(pre_gelu_cts[i], pre_gelu_pts[i]);
             }
             recv_encrypted_vector(he->context, io, output_cts);
+            output_pts.resize(output_cts.size());
             #pragma omp parallel for
             for(int i=0;i<output_cts.size();i++){
                 he->decryptor->decrypt(output_cts[i], output_pts[i]);
@@ -4817,7 +4851,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
              << endl;
 
         // get x_avg and sigma, compute (x_avg * sigma) * w + b
-        #pragma omp parallel for
+        #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<cts_x_flat.size();i++){
             if (!he->is_gpu_enable()) {
                 // x and sigma share the input scale.  Form that ct-ct
@@ -4894,7 +4928,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
         cout << "linear2 done" << endl;
         cout << "scale:" << log2(linear3_output[0].scale()) << endl;
 
-        #pragma omp parallel for
+        #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<linear3_output.size();i++){
             if (!he->is_gpu_enable()) {
             ++this->he_rescale_count;
@@ -4938,7 +4972,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
         */
         vector<UnifiedCiphertext> gelu_output;
         eval_gelu_poly(gelu_output, linear3_output, he,
-                       kFormalConversionScaleBits);
+                       kGeluConversionScaleBits);
         this->he_compute_la += ((high_resolution_clock::now() - start)).count()/1e+9;
         
         if (he->is_gpu_enable()) {
@@ -4978,7 +5012,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
             mask_ckks_to_mpc_inplace(pre_gelu_cts_half, pre_gelu_pts_half, he);
             send_encrypted_vector(io, pre_gelu_cts_half);
             prepare_host_conversion_from_actual_scale(
-                *this, output_cts_half, kFormalConversionScaleBits, he,
+                *this, output_cts_half, kGeluConversionScaleBits, he,
                 "ffn1_gelu");
             mask_ckks_to_mpc_inplace(output_cts_half, output_pts_half, he);
             send_encrypted_vector(io, output_cts_half);
@@ -4993,19 +5027,21 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
             prepare_host_conversion_from_actual_scale(
                 *this, pre_gelu_cts, kFormalConversionScaleBits, he,
                 "ffn1_pre_gelu");
+            pack_real_ckks_pairs(pre_gelu_cts, he);
             mask_ckks_to_mpc_inplace(pre_gelu_cts, pre_gelu_pts, he);
             send_encrypted_vector(io, pre_gelu_cts);
             prepare_host_conversion_from_actual_scale(
-                *this, output_cts, kFormalConversionScaleBits, he,
+                *this, output_cts, kGeluConversionScaleBits, he,
                 "ffn1_gelu");
+            pack_real_ckks_pairs(output_cts, he);
             mask_ckks_to_mpc_inplace(output_cts, output_pts, he);
             send_encrypted_vector(io, output_cts);
             cout << "FORMAL_TRANSFER_LAYOUT stage=ln_ffn_output status=PASS"
-                 << " layout=ordinary_full_slot residual_cts="
+                 << " layout=adjacent_real_imag residual_cts="
                  << normalized_residual_cts.size()
                  << " pre_gelu_cts=" << pre_gelu_cts.size()
                  << " gelu_cts=" << output_cts.size()
-                 << " masked_algorithm1=1 half_decode=0 intermediate_tensor_opened=0"
+                 << " masked_algorithm1=1 half_decode=1 intermediate_tensor_opened=0"
                  << " source=ViT_original_path" << endl;
         }
         this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
@@ -5060,12 +5096,10 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
             output_pts_half, poly_modulus_degree,
             he->get_Q(output_pts_half[0]), bitwidth, s, he, true);
     } else {
-        vec_pre_gelu = ckks_to_mpc(
-            pre_gelu_pts, poly_modulus_degree,
-            he->get_Q(pre_gelu_pts[0]), bitwidth, s, he, false);
-        vec_output = ckks_to_mpc(
-            output_pts, poly_modulus_degree,
-            he->get_Q(output_pts[0]), bitwidth, s, he, false);
+        vec_pre_gelu = ckks_pairs_to_mpc(
+            pre_gelu_pts, gelu_cts_size, bitwidth, s, he);
+        vec_output = ckks_pairs_to_mpc(
+            output_pts, gelu_cts_size, bitwidth, s, he);
     }
     
     this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
@@ -5190,7 +5224,8 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
     import_target_scale(*this, h6, slot, bitwidth, s, he->he_scale,
                             he, h6_pts, "ffn2_gelu_input");
     vector<UnifiedPlaintext> residual_pts;
-    import_target_scale(*this, residual_share, slot, bitwidth, s,
+    if (!pre_norm_ffn_output_only)
+      import_target_scale(*this, residual_share, slot, bitwidth, s,
                             he->he_scale, he, residual_pts,
                             "ffn2_residual_input");
     this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
@@ -5208,7 +5243,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
     vector<UnifiedCiphertext> enc_h6_half(
         num_cts_gelu % 2 == 0 ? num_cts_gelu / 2 : 0,
         UnifiedCiphertext(LOCATION::HOST));
-    vector<UnifiedCiphertext> enc_residual(num_cts_ln,
+    vector<UnifiedCiphertext> enc_residual(pre_norm_ffn_output_only ? 0 : num_cts_ln,
                                            UnifiedCiphertext(LOCATION::HOST));
     if (party==BOB){
         if (use_bert_half_packing) {
@@ -5222,24 +5257,20 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
             send_encrypted_vector(io, enc_h6_half);
             cout << "FORMAL_TRANSFER_LAYOUT stage=ffn2_input status=PASS"
                  << " layout=xyj_half_slot h6_cts=" << enc_h6_half.size()
-                 << " residual_cts=" << num_cts_ln
+                 << " residual_cts=" << enc_residual.size()
                  << " imag_repack=1 source=Figure10_Block1" << endl;
         } else {
-            #pragma omp parallel for
-            for(int i=0;i<enc_h6.size();i++){
-                he->encryptor->encrypt(h6_pts[i], enc_h6[i]);
-            }
-            send_encrypted_vector(io, enc_h6);
+            he->encrypt_send(h6_pts, enc_h6);
             cout << "FORMAL_TRANSFER_LAYOUT stage=ffn2_input status=PASS"
                  << " layout=ordinary_full_slot h6_cts=" << enc_h6.size()
-                 << " residual_cts=" << num_cts_ln
+                 << " residual_cts=" << enc_residual.size()
                  << " imag_repack=0 source=ViT_original_path" << endl;
         }
         #pragma omp parallel for
-        for (int i = 0; i < num_cts_ln; ++i) {
+        for (int i = 0; i < enc_residual.size(); ++i) {
             he->encryptor->encrypt(residual_pts[i], enc_residual[i]);
         }
-        send_encrypted_vector(io, enc_residual);
+        if (!enc_residual.empty()) send_encrypted_vector(io, enc_residual);
         cout << "send_encrypted_vector done" << endl;
         if (!pre_norm_ffn_output_only && !enc_x_avg_half.empty()) {
             recv_encrypted_vector(he->context, io, enc_x_avg_half);
@@ -5279,7 +5310,8 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         } else {
             recv_encrypted_vector(he->context, io, enc_h6);
         }
-        recv_encrypted_vector(he->context, io, enc_residual);
+        if (!enc_residual.empty())
+            recv_encrypted_vector(he->context, io, enc_residual);
         this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
         
         NVTX_PUSH("L4-LN1", true);
@@ -5342,22 +5374,24 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         cout << "h7.size():" << h7.size() << ", should be:" << num_cts_ln << endl;
         cout << "scale:" << log2(h7[0].scale()) << endl;
 
-        if (h7.size() != enc_residual.size()) {
+        if (!pre_norm_ffn_output_only && h7.size() != enc_residual.size()) {
             throw runtime_error("formal FFN2 residual ciphertext count mismatch");
         }
         require_uniform_unified_metadata(enc_h6, "ffn2_gelu_input");
-        require_uniform_unified_metadata(enc_residual,
-                                         "ffn2_residual_input");
+        if (!enc_residual.empty())
+            require_uniform_unified_metadata(enc_residual,
+                                             "ffn2_residual_input");
         const double imported_scale = ldexp(1.0, he->he_scale);
         if (abs(enc_h6.front().scale() - imported_scale) / imported_scale >
                 1e-12 ||
-            abs(enc_residual.front().scale() - imported_scale) /
+            (!enc_residual.empty() && abs(enc_residual.front().scale() - imported_scale) /
                     imported_scale >
-                1e-12) {
+                1e-12)) {
             throw runtime_error(
                 "formal FFN2 high-scale Algorithm-2 import was not preserved");
         }
-        align_unified_to_cipher_metadata(linear, he, enc_residual, h7,
+        if (!enc_residual.empty())
+          align_unified_to_cipher_metadata(linear, he, enc_residual, h7,
                                          "ffn2_residual");
 
         // Encode weight once
@@ -5423,7 +5457,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
              << endl;
 
         // begin computation
-        for(int i=0;i<h7.size();i++){
+        for(int i=0;i<enc_residual.size();i++){
             if (!he->is_gpu_enable()) {
             he->evaluator->add_inplace(h7[i], enc_residual[i]);
             } else {
@@ -5433,9 +5467,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         ffn_residual_ready = false;
         cout << "OK1" << endl;
         if (pre_norm_ffn_output_only) {
-            // ViT's second residual is h7 = FFN2(GELU(FFN1(LN2(h3)))) + h3.
-            // Export h7 at the same original Algorithm-1 boundary and leave
-            // the final LayerNorm to the ViT driver.
+            // Export FFN2 first; its same-scale MPC residual is added below.
             vector<Ciphertext> h7_full(h7.size());
             for (size_t i = 0; i < h7.size(); ++i) {
                 if (he->is_gpu_enable()) {
@@ -5493,7 +5525,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         }
         cout << "OK2" << endl;
         // 2. X_avg, scale=s*3
-        #pragma omp parallel for
+        #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<num_cts_ln;i++){
             if (!he->is_gpu_enable()) {
                 he->evaluator->multiply_plain_inplace(X_avg[i], inv_D_p);
@@ -5509,7 +5541,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         */ 
         cout << "h7.scale:" << log2(h7[0].scale()) << endl;
         cout << "X_avg.scale:" << log2(X_avg[0].scale()) << endl;
-        #pragma omp parallel for
+        #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<num_cts_ln;i++){
             if (!he->is_gpu_enable()) {
             he->evaluator->multiply_plain_inplace(h7[i],scale_up);
@@ -5548,7 +5580,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
              << centered_input_limbs
              << " explicit_mod_switches=" << centered_mod_switches
              << " final_rescale=0" << endl;
-        #pragma omp parallel for
+        #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<num_cts_ln;i++){
             if (!he->is_gpu_enable()) {
             he->evaluator->square_inplace(sigma[i]);
@@ -5811,8 +5843,14 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
             throw runtime_error("formal ViT FFN residual is incomplete");
         }
         map<char*,FixArray> result;
-        result["residual"] = bsgs_output_to_token_major(
+        FixArray residual = bsgs_output_to_token_major(
             packed, data, "vit_ffn_residual_to_token");
+        const uint64_t mask = (uint64_t{1} << bitwidth) - 1;
+        for (int i = 0; i < residual.size; ++i)
+            residual.data[i] = (residual.data[i] + ffn_residual_share.data[i]) & mask;
+        result["residual"] = residual;
+        cout << "VIT_RESIDUAL_LOCAL_ADD stage=ffn status=PASS saved_import_cts="
+             << num_cts_ln << " communication=0" << endl;
         this->conversion_comm += this->get_comm();
         this->conversion_round += this->get_round();
         return result;

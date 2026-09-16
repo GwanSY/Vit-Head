@@ -125,6 +125,11 @@ add_executable(ours_vit_hetero_plan_test
 )
 target_link_libraries(ours_vit_hetero_plan_test LIB_VIT_OURS_CKKS)
 
+add_executable(ours_vit_edge_cloud_test
+    "${OURS_VIT_RUNTIME}/edge_cloud_runtime_test.cpp"
+)
+target_link_libraries(ours_vit_edge_cloud_test LIB_VIT_OURS_CKKS)
+
 add_executable(ours_vit_a0_conversion_selftest
     "${OURS_VIT_RUNTIME}/a0_conversion_selftest.cpp"
 )
@@ -134,6 +139,11 @@ add_executable(ours_vit_conversion_test
     "${OURS_VIT_RUNTIME}/conversion_test.cpp"
 )
 target_link_libraries(ours_vit_conversion_test LIB_VIT_OURS_CKKS)
+
+add_executable(ours_vit_row_max_test
+    "${OURS_VIT_RUNTIME}/secure_row_max_test.cpp"
+)
+target_link_libraries(ours_vit_row_max_test LIB_VIT_OURS_CKKS)
 
 add_test_BOLT(bolt_bert_large)
 # add_executable(BOLT_WE_BERT "bolt_bert_word_elimination.cpp")

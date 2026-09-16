@@ -1,4 +1,5 @@
 #include "he.h"
+#include "wide_fft_math.h"
 #include <cstring>
 #include <limits>
 
@@ -215,38 +216,10 @@ WideComplex wide_sub(const WideComplex &lhs, const WideComplex &rhs,
 
 WideComplex wide_mul_root(const WideComplex &value, const complex<uint64_t> &root,
                           int width, int root_scale) {
-    if (width <= 1 || width >= 127 || root_scale <= 0 ||
-        width + root_scale >= 255) {
-        throw std::invalid_argument("wide CKKS FFT product width is invalid");
-    }
-    // A root is a signed fixed-point integer at `root_scale` bits.  The
-    // product must therefore be retained for width+root_scale bits before
-    // the arithmetic right shift.  Reducing it to Z_(2^width) first loses
-    // exactly the high root_scale bits that become the top width bits after
-    // the shift; that made l=43 Encode/Decode non-additive at the paper's
-    // high CKKS scales.
-    const int product_bits = width + root_scale;
-    const ProductScalar product_mask = product_mask_for_bits(product_bits);
-    // The input is a signed value in Z_(2^width).  Multiply signed magnitudes
-    // modulo the product ring so a negative share is never interpreted as a
-    // large positive integer. The three-limb product retains all bits needed
-    // before the fixed-point right shift.
-    const ProductScalar real_value_real = product_signed_multiply(
-        value.real, width, signed_public_word(root.real()), product_bits);
-    const ProductScalar real_value_imag = product_signed_multiply(
-        value.imag, width, signed_public_word(root.imag()), product_bits);
-    const ProductScalar imag_value_real = product_signed_multiply(
-        value.real, width, signed_public_word(root.imag()), product_bits);
-    const ProductScalar imag_value_imag = product_signed_multiply(
-        value.imag, width, signed_public_word(root.real()), product_bits);
-    const ProductScalar real = product_and(
-        product_sub(real_value_real, real_value_imag), product_mask);
-    const ProductScalar imag = product_and(
-        product_add(imag_value_real, imag_value_imag), product_mask);
-    return {product_arithmetic_right_shift(real, product_bits, root_scale,
-                                            width),
-            product_arithmetic_right_shift(imag, product_bits, root_scale,
-                                            width)};
+    const auto product = ours_vit::multiply_fft_root(
+        value.real, value.imag, signed_public_word(root.real()),
+        signed_public_word(root.imag()), width, root_scale);
+    return {product.first, product.second};
 }
 
 vector<WideComplex> wide_fft_forward(

@@ -1,0 +1,116 @@
+
+{
+
+  "paths": {
+    // 模型权重文本；离线明文评估和安全端到端运行使用此模型。
+    "model": "checkpoints/vit_b16/bolt_model.txt",
+    // 模型结构与导出信息清单，用于离线模型说明及结果记录。
+    "model_manifest": "checkpoints/vit_b16/manifest.json",
+    // 图像预处理参数清单（尺寸、均值、标准差）；可与 model_manifest 指向同一文件。
+    "preprocess_manifest": "checkpoints/vit_b16/manifest.json",
+    // 带标签的公开图像 CSV；从中划分选头校准集和独立测试集。
+    "public_manifest": "../../datasets/imagenet2012/val/validation_manifest.csv",
+    // 公开图像根目录；public_manifest 中的相对图像路径基于此目录。
+    "image_root": "../../datasets/imagenet2012/val",
+    // 训练用完整 attention 实测成本与逐层锚点 CSV；不能混入验证组合。
+    "allocator_costs": "outputs/research2/inputs/allocator_costs.csv",
+    // 补充探针成本 CSV；文件名虽为 training_costs，实际按 probe_manifest 划分训练/验证。
+    "supplemental_costs": "outputs/research2/inputs/training_costs.csv",
+    // 固定成本探针清单，记录组合、train/heldout 划分及对应头计划路径。
+    "probe_manifest": "outputs/research2/inputs/probe_manifest.csv",
+    // 统一实验根目录，安全运行请放在 outputs/ 下；run.log、配置快照、offline/、costs/、secure/ 集中于此。
+    "output_dir": "outputs/research2/experiment_01"
+  },
+  // 允许的 Top-1 准确率下降预算；单位是百分点（pp），不是相对下降比例。
+  "accuracy": {
+    // 相对全 Softmax baseline 的最大允许降幅；可改为 [1, 2, 3] 等非负、不重复列表。每个预算分别选头。
+    "budgets_pp": [0.1, 0.5, 1.0],
+    // 旧方法对照表使用的预算；null 自动取 budgets_pp 最大值，显式填写时必须在预算列表中。
+    "comparison_budget_pp": null
+  },
+  // 离线选头与独立测试的数据规模；起始位置均从 0 开始计数。
+  "data": {
+    // 选头校准图像数；1000 张对应 0.1 pp 的经验准确率分辨率。
+    "calibration_count": 1000,
+    // 校准集在 public_manifest 中的起始数据行（不包含表头）。
+    "calibration_start": 0,
+    // 独立准确率测试图像数；不参与头组合选择。
+    "heldout_count": 1000,
+    // 独立测试集起始行；null 表示 calibration_start + calibration_count，避免与校准集重叠。
+    "heldout_start": null
+  },
+  // 离线明文搜索参数；当前使用 NumPy 多进程，不由 secure.backend 切换为 GPU 明文搜索。
+  "search": {
+    // 离线明文评估的工作进程数。
+    "workers": 8,
+    // 每个工作进程的评估批大小；越大通常占用越多内存。
+    "batch_size": 8,
+    // 组合搜索中保留的 Pareto 状态数量上限；控制搜索规模。
+    "max_frontier": 1024,
+    // 进入完整明文模型验证的候选数量上限。
+    "max_candidates": 24,
+    // 单头扰动代理评分中 logits 相对误差项的权重。
+    "logit_weight": 0.25
+  },
+  // 安全成本回归与缺失测量处理；不会把预测值冒充实测值。
+  "cost_model": {
+    // 成本回归的岭正则系数。
+    "cost_ridge": 0.001,
+    // true 时生成缺失成本报告；仍须满足成本验证条件才能继续选头，不是跳过验证。
+    "allow_missing_probes": true
+  },
+  // 旧方法对照和小范围 DP/穷举对照的参数。
+  "comparisons": {
+    // 随机对照的随机种子，用于复现实验。
+    "random_seed": 20260905,
+    // 随机头组合对照的重复次数，必须为正整数。
+    "random_repeats": 20,
+    // 小范围 DP/穷举对照所选 Transformer 层，编号从 0 开始。
+    "oracle_layer": 0,
+    // 小范围对照参与的原始头编号（从 0 开始）；现有实现要求 4–6 个头。
+    "oracle_heads": [0, 1, 2, 3]
+  },
+  // 完整 12 层安全推理参数；costs 也复用设备/镜像/执行模式，但其组合和层数由测量任务决定。
+  "secure": {
+    // 端到端后端：gpu 或 cpu；CPU 不开放 GPU。当前成本采集仅支持 gpu + netem。
+    "backend": "gpu",
+    // 物理 GPU 编号；双方共享这一张卡，不自动换卡。默认 7；CPU 后端忽略此设备选择。
+    "gpu_id": 7,
+    // 端到端两方物理卡：[云端, 端侧]；null 沿用 gpu_id 单卡，不自动换卡。
+    "gpu_pair": null,
+    // 现有 Docker 镜像名称或 tag，启动时解析为不可变 image ID。
+    "image": "ours:restored-fast-20260903d",
+    // 主机编译二进制覆盖镜像内程序；null 使用镜像自带程序。当前 costs 需提供主机二进制以核对哈希。
+    "binary_override": "build/container-gpu/bin/ours_vit_b16_main",
+    // 主机 Phantom 动态库覆盖路径；null 使用镜像内的库。
+    "phantom_library_override": "build/container-gpu/extern/phantom/lib/libPhantom.so",
+    // 单张已预处理的 ViT 输入文本；secure 阶段用它测量一次完整端到端推理。
+    "input": "inputs/vit_b16/bob_image.txt",
+    // 异构头分组 packing：0 关闭，1 开启；当前成本回归要求为 0。
+    "group_packing": 0,
+    // GPU 直接明文编码开关：0/1，仅 GPU 后端使用。
+    "gpu_direct_plaintext": 1,
+    // GPU 线性计算流数（1–16）；仅 GPU 后端使用。
+    "gpu_linear_streams": 8,
+    // 每方 OpenMP 线程数（1–64）；不会改变实现中固定的 64 个 MPC worker。
+    "omp_threads": 64,
+    // 基础通信端口；需为派生 worker 端口预留空间（当前会用到 port + 290）。
+    "port": 31003,
+    // 每方安全运行超时秒数；21600 为 6 小时。
+    "timeout_seconds": 21600,
+    // 离线导出的 head_assignment.json；非空时优先读取其中的 ablation/head_plan，覆盖下面两个字段。
+    "assignment": null,
+    // 单次安全运行目录（相对 blb_base/ 或绝对路径，须在 outputs/ 下）；null 自动使用实验根目录/secure/run_NNN。
+    "output_dir": null,
+    // assignment 为空时生效：a0 全 Softmax baseline；a2/a3/a4 为现有消融/异构运行模式，需固定头计划。
+    "ablation": "a0",
+    // assignment 为空时使用的固定头计划；a0 可为 null，自动用全 Softmax 计划；其他模式必须填写。
+    "head_plan": null,
+    // 启动 GPU 测量要求的最低空闲显存，单位 MiB；默认 70000，低于门槛时返回 blocked。
+    "min_free_memory_mib": 70000,
+    // 启动 GPU 测量允许的最大利用率（0–100）；默认 5，超过门槛时返回 blocked。
+    "max_gpu_utilization_percent": 5,
+    // netem：现有 1 Gbps / 0.3 ms RTT 网络整形；none：不整形，其计时不可混入当前正式成本表。
+    "network_mode": "netem"
+  }
+}

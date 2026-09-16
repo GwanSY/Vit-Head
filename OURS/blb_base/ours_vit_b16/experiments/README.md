@@ -1,4 +1,9 @@
-# OURS ViT-B/16 paper experiments
+# OURS ViT-B/16 experiments
+
+Current entry: `python3 -B scripts/run_vit.py` (from `blb_base/`). It reads
+`HAP-ViT.json` by default. See [configuration and stages](RESEARCH2.md).
+The sections below document historical cohorts in `scripts/legacy/`.
+
 
 This directory defines the formal experiment cohorts without changing the
 `vit_b16` baseline tree. All formal performance runners require two physical
@@ -22,16 +27,16 @@ Important claim boundaries:
 Run from `OURS/blb_base` after rebuilding the immutable `ours` image:
 
 ```bash
-scripts/run_ours_a0_container.sh outputs/paper/a0/<run-id>
-scripts/run_ours_three_path_curve.sh <run-tag>
-scripts/run_ours_secure_accuracy.sh a3 <all-softmax-plan> \
+scripts/legacy/run_ours_a0_container.sh outputs/paper/a0/<run-id>
+scripts/legacy/run_ours_three_path_curve.sh <run-tag>
+scripts/legacy/run_ours_secure_accuracy.sh a3 <all-softmax-plan> \
   ours_vit_b16/experiments/secure_manifest_50.csv <tag> 50
-scripts/run_ours_packing_ablation.sh a3 <fixed-plan> <tag> 3
-scripts/run_ours_full12_suite.sh \
+scripts/legacy/run_ours_packing_ablation.sh a3 <fixed-plan> <tag> 3
+scripts/legacy/run_ours_full12_suite.sh \
   ours_vit_b16/experiments/full12_budgets_candidate.csv <tag> 3
-scripts/run_ours_full12_suite.sh \
+scripts/legacy/run_ours_full12_suite.sh \
   ours_vit_b16/experiments/p2_ablation_candidate.csv <tag> 3
-scripts/run_ours_p1_secure_comparison.sh \
+scripts/legacy/run_ours_p1_secure_comparison.sh \
   <p1-plan-manifest.json> \
   ours_vit_b16/experiments/secure_manifest_50.csv <tag> 50
 ```

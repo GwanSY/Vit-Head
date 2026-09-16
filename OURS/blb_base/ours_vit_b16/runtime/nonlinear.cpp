@@ -16,10 +16,6 @@ int configured_worker_count() {
   return static_cast<int>(parsed);
 }
 
-bool legacy_fast_conversion_scale_semantics() {
-  const char *value = std::getenv("OURS_VIT_CONVERSION_MODE");
-  return value == nullptr || *value == '\0' || std::strcmp(value, "fast") == 0;
-}
 }  // namespace
 
 NonLinear::NonLinear(int party, string address, int port){
@@ -534,18 +530,8 @@ void field_to_ring_thread(int tid, int party, uint64_t *x, uint64_t p, uint64_t 
   // cout << "in field_to_ring, b_out, s_in, s_out:" << b_out << "," << s_in << "," << s_out << endl;
   FixArray input = fpmath->fix->input(this_party, num_ops, x, false, b_in, s_in);
 
-  // Match the original BLB/BERT field-to-ring adapter.  The CKKS conversion
-  // already supplies the ring word used by the original local FFT.  In the
-  // historical fast path the scale boundary was treated as aligned here;
-  // preserve that behavior because the alternative truncation is a full
-  // per-element MPC protocol and was the main source of the vit-gpu slowdown.
   FixArray output = fpmath->fix->field2ring(input, p, b_in);
   assert(b_in>=b_out);
-  if (legacy_fast_conversion_scale_semantics()) {
-    // This is the historical BLB behavior.  The fast path is a speed
-    // baseline and intentionally keeps its legacy scale contract.
-    s_in = s_out;
-  }
   if(s_in > s_out){
     output = fpmath->fix->truncate_reduce_lsb(output, s_in - s_out);
   }
@@ -957,6 +943,81 @@ void NonLinear::ring_extend(int nthreads, uint64_t* input, uint64_t* output,
     for (auto &thread : threads) {
         thread.join();
     }
+}
+
+static void centered_field_to_ring_wide_thread(
+    const uint64_t* input, uint64_t p, uint64_t* output_low,
+    uint64_t* output_high, int size, int target_bitwidth, FPMath* math) {
+    auto* fix = math->fix;
+    const bool sender = fix->party == sci::ALICE;
+    const uint64_t center = (p - 1) / 2;
+    const int field_bits = 64 - __builtin_clzll(p);
+    const __uint128_t mask = (__uint128_t{1} << target_bitwidth) - 1;
+    vector<uint64_t> shifted(size);
+    vector<uint8_t> wrap(size);
+    for (int i = 0; i < size; ++i)
+        shifted[i] = sender ? (input[i] + center) % p : input[i];
+    fix->aux->wrap_computation_prime(
+        shifted.data(), wrap.data(), size, field_bits, p);
+
+    // If w = wa XOR wb is the prime wrap, convert q*w directly into
+    // the wide ring using full-width random OT pads. This avoids a second
+    // comparison to extend an intermediate narrow-ring sharing.
+    unique_ptr<emp::block[]> pad0(new emp::block[size]);
+    vector<__uint128_t> correction(size);
+    if (sender) {
+        unique_ptr<emp::block[]> pad1(new emp::block[size]);
+        fix->otpack->iknp_straight->send_ot_rm_cc(
+            pad0.get(), pad1.get(), size);
+        for (int i = 0; i < size; ++i) {
+            __uint128_t r0, r1;
+            memcpy(&r0, &pad0[i], sizeof(r0));
+            memcpy(&r1, &pad1[i], sizeof(r1));
+            correction[i] = (r0 - r1 + (wrap[i] ? -__uint128_t(p)
+                                                               : p)) & mask;
+            const __uint128_t value =
+                (shifted[i] - __uint128_t(p) * wrap[i] + r0 - center) & mask;
+            output_low[i] = uint64_t(value);
+            output_high[i] = uint64_t(value >> 64);
+        }
+        fix->iopack->io->send_data(correction.data(), size * sizeof(__uint128_t));
+    } else {
+        unique_ptr<bool[]> choice(new bool[size]);
+        for (int i = 0; i < size; ++i) choice[i] = wrap[i] != 0;
+        fix->otpack->iknp_straight->recv_ot_rm_cc(
+            pad0.get(), choice.get(), size);
+        fix->iopack->io->recv_data(correction.data(), size * sizeof(__uint128_t));
+        for (int i = 0; i < size; ++i) {
+            __uint128_t r;
+            memcpy(&r, &pad0[i], sizeof(r));
+            const __uint128_t value =
+                (shifted[i] - r - (choice[i] ? correction[i] : 0)) & mask;
+            output_low[i] = uint64_t(value);
+            output_high[i] = uint64_t(value >> 64);
+        }
+    }
+}
+
+void NonLinear::centered_field_to_ring_wide(
+    int nthreads, const uint64_t* input, uint64_t p, uint64_t* output_low,
+    uint64_t* output_high, int size, int target_bitwidth) {
+    if (nthreads <= 0 || nthreads > active_workers_ || size <= 0 ||
+        p < 3 || p >= (uint64_t{1} << 63) || !(p & 1) ||
+        target_bitwidth <= 64 - __builtin_clzll(p) || target_bitwidth > 127)
+        throw invalid_argument("invalid centered wide field conversion");
+    for (int i = 0; i < size; ++i)
+        if (input[i] >= p) throw invalid_argument("noncanonical field share");
+    vector<thread> workers;
+    const int chunk = size / nthreads;
+    for (int i = 0; i < nthreads; ++i) {
+        const int offset = i * chunk;
+        const int count = i == nthreads - 1 ? size - offset : chunk;
+        if (count)
+            workers.emplace_back(centered_field_to_ring_wide_thread,
+                input + offset, p, output_low + offset, output_high + offset,
+                count, target_bitwidth, fpmath[i]);
+    }
+    for (auto& worker : workers) worker.join();
 }
 
 static void ring_extend_wide_thread(int tid, int party, uint64_t *input,

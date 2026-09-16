@@ -46,15 +46,45 @@ BFV_TRACE_ARRAYS = "bfv_accumulators.npz"
 
 class TokenReader:
     def __init__(self, path: Path):
-        self.tokens = path.read_text(encoding="utf-8").split()
+        # The canonical ViT-B/16 text is about 1.1 GB. Keeping every token in
+        # a Python list more than doubles its resident size and can terminate
+        # a valid offline clear-model calibration. Stream lines instead; all
+        # numerical arrays are still materialized in the model dictionary as
+        # before.
+        self._handle = path.open("r", encoding="utf-8")
+        self._tokens = (
+            token for line in self._handle for token in line.split())
+        self._lookahead: str | None = None
         self.index = 0
 
     def take(self) -> str:
-        if self.index >= len(self.tokens):
-            raise ValueError("unexpected end of canonical text file")
-        value = self.tokens[self.index]
+        if self._lookahead is not None:
+            value = self._lookahead
+            self._lookahead = None
+        else:
+            try:
+                value = next(self._tokens)
+            except StopIteration:
+                self._handle.close()
+                raise ValueError("unexpected end of canonical text file") from None
         self.index += 1
         return value
+
+    def has_more(self) -> bool:
+        if self._lookahead is not None:
+            return True
+        try:
+            self._lookahead = next(self._tokens)
+        except StopIteration:
+            self._handle.close()
+            return False
+        return True
+
+    def __del__(self) -> None:
+        try:
+            self._handle.close()
+        except AttributeError:
+            pass
 
     def expect(self, value: str) -> None:
         got = self.take()
@@ -71,9 +101,10 @@ class TokenReader:
 
     def vector(self, name: str, count: int) -> np.ndarray:
         self.expect(name)
-        values = np.asarray([float(self.take()) for _ in range(count)],
-                            dtype=np.float64)
-        return values
+        # Build large weight vectors directly in NumPy. A Python float list
+        # is another multi-gigabyte transient for the ViT-B/16 matrices.
+        return np.fromiter((float(self.take()) for _ in range(count)),
+                           dtype=np.float64, count=count)
 
 
 def load_model(path: Path) -> dict[str, Any]:
@@ -158,7 +189,7 @@ def _load_model_after_magic(path: Path, magic: str) -> dict[str, Any]:
     model["classifier_weight"] = reader.vector("classifier_weight", model["classes"] * dim).reshape(model["classes"], dim)
     model["classifier_bias"] = reader.vector("classifier_bias", model["classes"])
     reader.expect("end")
-    if reader.index != len(reader.tokens):
+    if reader.has_more():
         raise ValueError("unexpected data after canonical model terminator")
     if model["norm_order"] != "pre":
         raise ValueError("only checkpoint-declared pre-LayerNorm is supported")
@@ -173,7 +204,7 @@ def load_input(path: Path) -> np.ndarray:
     channels = reader.integer("channels")
     image = reader.vector("pixels", channels * size * size).reshape(channels, size, size)
     reader.expect("end")
-    if reader.index != len(reader.tokens):
+    if reader.has_more():
         raise ValueError("unexpected data after canonical input terminator")
     return image
 
@@ -704,12 +735,14 @@ class Graph:
                  capture_bfv_accumulators: bool = False,
                  block_limit: int | None = None,
                  head_plan: list[list[tuple[str, float]]] | None = None,
-                 stop_after_attention: bool = False):
+                 stop_after_attention: bool = False,
+                 record_values: bool = True):
         self.model = model
         self.fixed = fixed
         if capture_bfv_accumulators and not fixed:
             raise ValueError("BFV accumulator capture requires the fixed graph")
         self.capture_bfv_accumulators = capture_bfv_accumulators
+        self.record_values = bool(record_values)
         model_layers = int(model["layers"])
         self.executed_layers = (model_layers if block_limit is None
                                 else int(block_limit))
@@ -769,6 +802,8 @@ class Graph:
 
     def record(self, name: str, value: np.ndarray, scale: int | str,
                packing: str) -> np.ndarray:
+        if not self.record_values:
+            return value
         self.records[name] = {
             "shape": list(value.shape),
             "scale": scale,
@@ -952,6 +987,106 @@ class Graph:
                     "physical_token_major_wo" if self.fixed
                     else "logical_token_major_wo")
         return projected
+
+    def attention_batch(self, value: np.ndarray,
+                        block: dict[str, np.ndarray], layer: int) -> np.ndarray:
+        """Clear floating Attention for a leading batch dimension.
+
+        Offline candidate/validation passes need thousands of clear forward
+        evaluations.  This is algebraically the same path as ``attention``
+        with ``fixed=False``; it only lets NumPy share the projection and
+        token-matrix work across a small batch.  The secure/fixed path stays
+        on the original single-example implementation.
+        """
+        if self.fixed or self.physical != self.logical:
+            raise ValueError("batched reference requires the logical clear graph")
+        if value.ndim != 3:
+            raise ValueError("batched attention expects batch, token, channel")
+        head_dim = int(self.model["dim"]) // int(self.model["heads"])
+        q = self.linear(value, block["wq"], block["q_bias"], 0, 0)
+        k = self.linear(value, block["wk"], block["k_bias"], 0, 0)
+        v = self.linear(value, block["wv"], block["v_bias"], 0, 0)
+        batch = value.shape[0]
+        qh = q.reshape(batch, self.logical, self.model["heads"], head_dim)
+        qh = qh.transpose(0, 2, 1, 3)
+        kh = k.reshape(batch, self.logical, self.model["heads"], head_dim)
+        kh = kh.transpose(0, 2, 1, 3)
+        vh = v.reshape(batch, self.logical, self.model["heads"], head_dim)
+        vh = vh.transpose(0, 2, 1, 3)
+        scores = np.matmul(qh, np.swapaxes(kh, -1, -2)) / math.sqrt(head_dim)
+        baseline_probability = softmax(scores)
+        probability = np.empty_like(baseline_probability)
+        for head, (protocol, alpha) in enumerate(self.head_plan[layer]):
+            if protocol == "softmax_mpc":
+                weights = baseline_probability[:, head]
+            elif protocol == "relu_norm_mpc":
+                positive = np.maximum(scores[:, head], 0.0)
+                denominator = positive.sum(axis=-1, keepdims=True,
+                                           dtype=np.float64)
+                weights = np.divide(
+                    positive, denominator, out=np.zeros_like(positive),
+                    where=denominator != 0.0)
+            elif protocol == "he_linear":
+                weights = float(alpha) * scores[:, head]
+            else:
+                raise AssertionError(f"unhandled head protocol {protocol}")
+            probability[:, head] = weights
+        context = np.matmul(probability, vh)
+        joined = context.transpose(0, 2, 1, 3).reshape(
+            batch, self.logical, self.model["dim"])
+        return self.linear(joined, block["wo"], block["bo"], 0, 0)
+
+    def run_batch(self, pixels: np.ndarray) -> tuple[np.ndarray, dict[str, dict[str, Any]]]:
+        """Run the clear graph for a small batch without retaining records."""
+        if self.fixed:
+            raise ValueError("run_batch is an offline clear-only helper")
+        if self.physical != self.logical:
+            raise ValueError("batched reference requires logical token layout")
+        batch_pixels = np.asarray(pixels, dtype=np.float64)
+        if batch_pixels.ndim != 4:
+            raise ValueError("batched pixels must have shape [B,C,H,W]")
+        if batch_pixels.shape[0] <= 0:
+            raise ValueError("batched pixels cannot be empty")
+        patches = np.stack([
+            patchify(image, int(self.model["patch_size"]))
+            for image in batch_pixels
+        ])
+        patch_tokens = self.linear(
+            patches, self.model["patch_weight"], self.model["patch_bias"],
+            0, 0)
+        batch = batch_pixels.shape[0]
+        hidden = np.zeros(
+            (batch, self.logical, self.model["dim"]), dtype=np.float64)
+        hidden[:, 0] = self.model["class_token"]
+        hidden[:, 1:] = patch_tokens
+        hidden += self.model["position"][None, :, :]
+        for layer, block in enumerate(
+                self.model["blocks"][:self.executed_layers]):
+            normalized = self.norm(
+                hidden, block["ln1_weight"], block["ln1_bias"],
+                f"block_{layer}.ln1_affine")
+            attn = self.attention_batch(normalized, block, layer)
+            hidden = hidden + attn
+            if self.stop_after_attention:
+                break
+            normalized = self.norm(
+                hidden, block["ln2_weight"], block["ln2_bias"],
+                f"block_{layer}.ln2_affine")
+            first = self.linear(
+                normalized, block["ff1_weight"], block["ff1_bias"], 0, 0)
+            activated = 0.5 * first * (
+                1.0 + _erf(first / math.sqrt(2.0)))
+            second = self.linear(
+                activated, block["ff2_weight"], block["ff2_bias"], 0, 0)
+            hidden = hidden + second
+        hidden = self.norm(
+            hidden, self.model["final_ln_weight"], self.model["final_ln_bias"],
+            "final_ln_affine")
+        cls = hidden[:, :1]
+        logits = self.linear(
+            cls, self.model["classifier_weight"],
+            self.model["classifier_bias"], 0, 0)
+        return logits.reshape(batch, -1), {}
 
     def run(self, pixels: np.ndarray) -> tuple[np.ndarray, dict[str, dict[str, Any]]]:
         patches = patchify(pixels, int(self.model["patch_size"]))

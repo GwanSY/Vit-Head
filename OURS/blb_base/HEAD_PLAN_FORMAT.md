@@ -1,10 +1,21 @@
 # Public offline head assignment and runtime plan
 
-`head_assignment.json` is the A2 calibration/audit artifact. It binds the
-model SHA-256, four-or-more public samples, per-head FP32/fixed-clear
-relative-L2 disturbance, the threshold, measured path cost, final global
-logit guard, physical reorder, and `private_dynamic_branch=false`. It is
-generated once before inference and is never changed from a private input.
+`head_assignment.json` produced by the offline cost-aware allocator is the
+deployment/audit artifact. It binds the
+model SHA-256, public calibration/validation manifests, all 144 per-head
+path/alpha choices, the sparse measured cost source, clear-model validation,
+physical reorder, and `private_dynamic_branch=false`. Detailed isolated
+candidate metrics are stored in the referenced CSV. It is generated once
+before inference and is never changed from a private input.
+
+The phase-two experiment emits fixed JSON/plan pairs for `all_softmax`,
+`random`, `accuracy_only`, `balanced`, and `performance_first`. Each contains
+flat `layer`, `head`, `selected_path`, and `alpha_h` rows and references its
+materialized fixed `OURS_VIT_HEAD_PLAN_V1` plan. The singular
+`head_assignment.json` is an explicit copy of the Accuracy-only deployment
+default; the JSON files are offline evidence. The existing C++ secure entry
+point consumes the referenced fixed `OURS_VIT_HEAD_PLAN_V1` plan and does not
+run the allocator or a plaintext model during inference.
 
 The secure C++ runtime consumes the deliberately smaller materialized
 `head_plan.txt` referenced by that JSON. Keeping selection evidence out of the

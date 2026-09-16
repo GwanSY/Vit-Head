@@ -48,6 +48,7 @@ def main() -> None:
         "logical_tokens", "physical_tokens", "layers",
         "executed_transformer_blocks", "partial_run",
         "selective_conversion", "blb_fast_attention_packing",
+        "heterogeneous_head_grouping",
         "attention_packing",
         "native_ckks_linear",
         "client_decrypt_reencrypt", "mpc_linear_surrogate", "backend",
@@ -62,7 +63,8 @@ def main() -> None:
             meta.get("executed_transformer_blocks") != "12" or
             meta.get("selective_conversion") != "1" or
             meta.get("attention_packing") not in {"packed", "unpacked"} or
-            meta.get("blb_fast_attention_packing") !=
+            meta.get("blb_fast_attention_packing") not in {"0", "1"} or
+            meta.get("heterogeneous_head_grouping") !=
                 ("1" if meta.get("attention_packing") == "packed" else "0") or
             meta.get("client_decrypt_reencrypt") != "0" or
             meta.get("mpc_linear_surrogate") != "0"):

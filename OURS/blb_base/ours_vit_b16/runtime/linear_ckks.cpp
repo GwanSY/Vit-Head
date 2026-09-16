@@ -668,6 +668,9 @@ MaterializedLinearMetadata materialize_linear_plaintexts(
     require_uniform_cipher_metadata(inputs, "BSGS2");
     auto input_context = host_context_data_for(he, inputs.front(), "BSGS2");
     if (params.device_semantic_packed) {
+        const std::size_t cached_target_chain = params.target_chain;
+        const double cached_input_scale = params.input_scale;
+        const double cached_bias_scale = params.bias_scale;
         const double expected_bias_scale =
             inputs.front().scale() * params.weight_scale;
         if (input_context->chain_index() != params.target_chain ||
@@ -675,8 +678,32 @@ MaterializedLinearMetadata materialize_linear_plaintexts(
                                1e-12) ||
             !ckks_scales_close(expected_bias_scale, params.bias_scale,
                                1e-12)) {
-            throw std::runtime_error(
-                "BSGS2: Phantom semantic packing metadata does not match input");
+            // The semantic device vectors do not carry a SEAL context or a
+            // CKKS level.  The original fast path cached the level/scale from
+            // the baseline diagonal-reuse schedule, while the validation-only
+            // full-diagonal schedule can legally consume a different public
+            // modulus level before entering BSGS2.  Adopt the actual input
+            // metadata before encoding the semantic vectors.  This is a
+            // metadata alignment at the existing ct-pt boundary; it does not
+            // add a conversion, decrypt/re-encrypt, or evaluator operation.
+            params.target_chain = input_context->chain_index();
+            params.input_scale = inputs.front().scale();
+            params.bias_scale = expected_bias_scale;
+            std::cout << "CKKS_DIRECT_METADATA_ALIGN op=BSGS2 status=ADJUST"
+                      << " cached_chain=" << cached_target_chain
+                      << " actual_chain=" << params.target_chain
+                      << " cached_input_scale_bits="
+                      << std::log2(cached_input_scale)
+                      << " actual_input_scale_bits="
+                      << std::log2(params.input_scale)
+                      << " cached_bias_scale_bits="
+                      << std::log2(cached_bias_scale)
+                      << " actual_bias_scale_bits="
+                      << std::log2(params.bias_scale)
+                      << " context=existing_he_context"
+                      << " semantic_values=unchanged"
+                      << " client_decrypt_reencrypt=0"
+                      << std::endl;
         }
         std::cout << "CKKS_PLAIN_MATERIALIZE op=BSGS2 input_chain="
                   << input_context->chain_index() << " input_scale_bits="
@@ -1417,8 +1444,7 @@ void Linear_ckks::linear_1(
 		PreprocessParams_1 &pp,
 		const FCMetadata &data,
         vector<UnifiedCiphertext> &output,
-        vector<UnifiedCiphertext> *a0_qkv_observer,
-        bool use_blb_fast_attention_packing) {
+        vector<UnifiedCiphertext> *a0_qkv_observer) {
 
     cout << "input_cts.size: " << input_cts.size() << endl;
     const auto loc = input_cts[0].location();
@@ -1484,8 +1510,7 @@ void Linear_ckks::linear_1(
 		profile_switch_callback(profile_context, 1);
 	const auto qkt_profile_start = high_resolution_clock::now();
     bert_cipher_cipher_cross_packing(
-        he, data, Cipher_plain_results, output,
-        use_blb_fast_attention_packing);
+        he, data, Cipher_plain_results, output);
 	if (profile_he_callback != nullptr)
 		profile_he_callback(profile_context, 1,
 			chrono::duration<double, milli>(high_resolution_clock::now() -
@@ -2967,8 +2992,7 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
 	HE_CKKS* he,
 	const FCMetadata &data,
 	vector<UnifiedCiphertext> Cipher_plain_result, /* FIXME: D2D copy */
-	vector<UnifiedCiphertext> &results,
-    bool use_blb_fast_attention_packing) {
+	vector<UnifiedCiphertext> &results) {
     // Official BLB BERT schedule (commit 25e8d86): this is the number of
     // rotations per attention head used by the paper's packed QK^T path.
     // Keep the schedule tied to the BERT dimensions; a generic sequence
@@ -2985,16 +3009,9 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
             throw std::invalid_argument("unsupported BLB BERT hidden dimension");
         }
     } else if (data.image_size == 256) {
-        if (use_blb_fast_attention_packing) {
-            // Exact schedule used by the measured <8 minute BLB ViT run.
-            // It is deliberately isolated from the full diagonal schedule
-            // retained for A0 numerical diagnosis.
-            rot_ours = 244 / 2;
-        } else {
-            const int packed_feature_ciphertexts =
-                data.image_size * data.filter_w * 2 / data.slot_count;
-            rot_ours = packed_feature_ciphertexts * data.image_size * 2;
-        }
+        const int packed_feature_ciphertexts =
+            data.image_size * data.filter_w * 2 / data.slot_count;
+        rot_ours = packed_feature_ciphertexts * data.image_size * 2;
     } else {
         throw std::invalid_argument(
             "unsupported BLB physical token count for packed QK");
@@ -3017,26 +3034,8 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
         he->dencoder->encode(*he->dcontext, pt_1, pow(2, he->he_scale),
                              mask_1, Cipher_plain_result[0].dcipher().chain_index());
     }
-    UnifiedPlaintext blb_final_mask(loc);
     vector<UnifiedPlaintext> cross_masks;
-    if (use_blb_fast_attention_packing) {
-        const vector<double> all_one(data.slot_count, 1.0);
-        if (loc == LOCATION::HOST) {
-            auto context = he->context->get_context_data(
-                Cipher_plain_result[0].hcipher().parms_id());
-            if (!context || !context->next_context_data() ||
-                !context->next_context_data()->next_context_data())
-                throw runtime_error("BLB QK final-mask level is absent");
-            context = context->next_context_data()->next_context_data();
-            he->encoder->encode(all_one, context->parms_id(),
-                                pow(2, he->he_scale), blb_final_mask);
-        } else {
-            he->dencoder->encode(
-                *he->dcontext, all_one, pow(2, he->he_scale),
-                blb_final_mask,
-                Cipher_plain_result[0].dcipher().chain_index() + 2);
-        }
-    } else if (loc == LOCATION::HOST) {
+    if (loc == LOCATION::HOST) {
         cross_masks.assign(data.image_size * 2, UnifiedPlaintext(loc));
         auto util_context_data =
             he->context->get_context_data(Cipher_plain_result[0].hcipher().parms_id());
@@ -3148,10 +3147,7 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
 
         #pragma omp parallel for num_threads(16)
         for (int i = 0; i < data.image_size * 2; i++) {
-            if (use_blb_fast_attention_packing) {
-                he->evaluator->multiply_plain_inplace(
-                    rotation_results[i], blb_final_mask);
-            } else {
+            {
                 const int local_rotation = std::ceil(std::log2(
                     data.slot_count / data.image_size / 2));
                 for (int k = 0; k < local_rotation; ++k) {
@@ -3194,8 +3190,16 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
     }
     } else {
     // ******************** GPU ********************
+    const int qk_streams = min(PACKING_NUM / 2, direct_device_plaintext_streams());
+#ifdef BLB_HAS_HE_GPU
+    const auto qk_ready = cudaStreamSynchronize(cudaStreamPerThread);
+    if (qk_ready != cudaSuccess)
+        throw runtime_error("QK input stream synchronization failed");
+    vector<int> qk_errors(PACKING_NUM / 2, static_cast<int>(cudaSuccess));
+#pragma omp parallel for num_threads(qk_streams) if(qk_streams > 1)
+#endif
     for (int packing_index = 0; packing_index < PACKING_NUM/2; packing_index++) {
-        int rot_count = 0; /* FIXME: 0 */
+        int rot_count = 0;
         vector<UnifiedCiphertext> rotation_results(data.image_size * 2, UnifiedCiphertext(loc));
         for (int l = 0; l < temp_result_size; l++) {
             // FIXME: Assume that Cipher_plain_result won't be reuesd
@@ -3241,10 +3245,7 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
         // cout << "part 2 ok" << endl;
 
         for (int i = 0; i < data.image_size * 2; i++) {
-            if (use_blb_fast_attention_packing) {
-                he->devaluator->multiply_plain_inplace(
-                    rotation_results[i], blb_final_mask);
-            } else {
+            {
                 const int local_rotation = std::ceil(std::log2(
                     data.slot_count / data.image_size / 2));
                 for (int k = 0; k < local_rotation; ++k) {
@@ -3281,8 +3282,18 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
                 he->devaluator->add_inplace(results[packing_index * num_cts_per_res + i], rotation_results[num_col_per_ct * i + j + data.image_size]);
             }
         }
-        // cout << "part 4 ok" << endl;
+        // Wait before per-head temporary ciphertexts leave this worker.
+#ifdef BLB_HAS_HE_GPU
+        qk_errors[packing_index] = static_cast<int>(
+            cudaStreamSynchronize(cudaStreamPerThread));
+#endif
     }
+#ifdef BLB_HAS_HE_GPU
+    for (int error : qk_errors)
+        if (error != static_cast<int>(cudaSuccess))
+            throw runtime_error("QK worker stream synchronization failed");
+#endif
+    cout << "CKKS_DEVICE_STREAMS op=QK streams=" << qk_streams << endl;
     }
     ct_ct_multiply_count += static_cast<uint64_t>(PACKING_NUM / 2) *
         temp_result_size * data.image_size * 2;
@@ -3290,7 +3301,7 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
         data.image_size * 2;
     rotation_count += static_cast<uint64_t>(PACKING_NUM / 2) *
         std::min(rot_ours, temp_result_size * data.image_size * 2);
-    if (!use_blb_fast_attention_packing) {
+    {
         rotation_count += static_cast<uint64_t>(PACKING_NUM / 2) *
             data.image_size * 2 *
             static_cast<uint64_t>(std::ceil(std::log2(
@@ -3305,12 +3316,10 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
             std::min(rot_ours, temp_result_size * data.image_size * 2);
     }
     cout << "num rotations: " << num_rot << endl;
-    cout << "OURS_BLB_QK_PACKING status=PASS mode="
-         << (use_blb_fast_attention_packing ? "baseline_fast" : "full_diagonal")
+    cout << "OURS_BLB_QK_PACKING status=EXECUTED mode=complete_diagonal"
          << " rotation_cap=" << rot_ours
          << " mpc_surrogate=0 client_decrypt_reencrypt=0"
-         << " a0_numerical_validation="
-         << (use_blb_fast_attention_packing ? "PENDING" : "ELIGIBLE")
+         << " a0_numerical_validation=PENDING"
          << endl;
     cout << "bert_cipher_cipher_cross_packing done" << endl;
 }
@@ -4212,7 +4221,7 @@ void Linear_ckks::softmax_v(
         const int num_matrix_per_col =
             data.filter_w / (data.slot_count / data.image_size / 2);
         softmax_v_rotation_count += static_cast<uint64_t>(2 * active_pairs) *
-            std::min(rot_ours, data.image_size * num_matrix_per_col);
+            num_matrix_per_col * std::min(rot_ours, data.image_size);
     }
     const int num_matrix_per_col =
         data.filter_w / (data.slot_count / data.image_size / 2);
@@ -4223,8 +4232,8 @@ void Linear_ckks::softmax_v(
     if (post_av_rescale)
         ct_pt_multiply_count += active_pairs * result_per_pair;
     const uint64_t av_rotations =
-        2 * static_cast<uint64_t>(active_pairs) *
-        std::min(rot_ours, data.image_size * num_matrix_per_col);
+        2 * static_cast<uint64_t>(active_pairs) * num_matrix_per_col *
+        std::min(rot_ours, data.image_size);
     rotation_count += av_rotations;
     if (COMMON_DIM != 1024)
         softmax_v_rotation_count += av_rotations;
@@ -4301,8 +4310,7 @@ void Linear_ckks::preprocess_softmax_s1_ct_ct(
     const vector<UnifiedCiphertext> &matrix, 
     const FCMetadata &data,
     vector<vector<vector<UnifiedCiphertext>>> &s2_pack,
-    const vector<bool> *active_heads,
-    bool use_blb_fast_attention_packing) {
+    const vector<bool> *active_heads) {
     int num_diag = data.image_size;
     int num_diag_per_ct = data.slot_count / data.image_size / 2;
     if (matrix.empty() || num_diag <= 0 || num_diag_per_ct <= 0 ||
@@ -4344,32 +4352,6 @@ void Linear_ckks::preprocess_softmax_s1_ct_ct(
             2, vector<UnifiedCiphertext>(
                 num_diag, UnifiedCiphertext(loc))
     ));
-    if (use_blb_fast_attention_packing) {
-        // Preserve the exact diagonal reuse used by the measured BLB ViT
-        // baseline.  Pair filtering remains assignment-aware, so ciphertexts
-        // for inactive head pairs are neither required nor touched.
-        for (int packing_ind = 0; packing_ind < PACKING_NUM / 2;
-             ++packing_ind) {
-            if (!pair_is_active(packing_ind)) continue;
-            auto &weight_matrix = s2_pack[packing_ind];
-            for (int diag_ind = 0; diag_ind < num_diag; ++diag_ind) {
-                const int cts_ind = packing_ind * ciphertexts_per_pair +
-                                    diag_ind / num_diag_per_ct;
-                weight_matrix[0][diag_ind] = matrix[cts_ind];
-                weight_matrix[1][diag_ind] = matrix[cts_ind];
-            }
-        }
-        uint64_t active_pairs = 0;
-        for (int pair = 0; pair < PACKING_NUM / 2; ++pair)
-            active_pairs += pair_is_active(pair) ? 1 : 0;
-        cout << "OURS_BLB_AV_PACKING status=PASS mode=baseline_fast"
-             << " active_pairs=" << active_pairs
-             << " softmax_cts=" << matrix.size()
-             << " extra_mask_multiplies=0 extra_rescales=0"
-             << " mpc_surrogate=0 client_decrypt_reencrypt=0"
-             << " a0_numerical_validation=PENDING" << endl;
-        return;
-    }
     // Each imported Softmax ciphertext holds num_diag_per_ct diagonals in
     // token-sized blocks.  Select one block, split the ordinary and wrapping
     // token rotations, move that block to the first block of each packed

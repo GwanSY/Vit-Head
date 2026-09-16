@@ -165,26 +165,289 @@ int main(int argc, char **argv) {
   args.arg("m", linear_scale_cycle,
            "0=conversion, 1=ct-pt scale cycle, 2=public imported LayerNorm "
            "affine, 3=public native-CKKS LayerNorm affine, "
-           "4=public packed QKV/QK, 5=public packed Softmax*V");
+           "4=public packed QKV/QK, 5=public packed Softmax*V, "
+           "6=public GELU range regression, 7=public centered wide conversion, "
+           "8=public compact masked Softmax, 9=public real-pair conversion, "
+           "10=public full-range integer-lift import");
   args.parse(argc, argv);
   if ((party != sci::ALICE && party != sci::BOB) || port <= 0 ||
       (device_backend != 0 && device_backend != 1))
     throw invalid_argument(
         "usage: r=1|2 p=PORT [ip=ADDRESS] [d=0|1] [m=0|1]");
-  if (linear_scale_cycle < 0 || linear_scale_cycle > 5)
-    throw invalid_argument("m must be 0, 1, 2, 3, 4, or 5");
+  if (linear_scale_cycle < 0 || linear_scale_cycle > 10)
+    throw invalid_argument("m must be in [0, 10]");
 
   sci::NetIO io(party == sci::ALICE ? nullptr : address.c_str(), port);
   const vector<int> coefficient_bits =
-      linear_scale_cycle == 4
+      linear_scale_cycle == 8
+          ? vector<int>{60, 40, 40, 40, 40, 40, 40, 40, 60}
+          : linear_scale_cycle == 4
           ? vector<int>{60, 35, 60, 60, 60, 60, 60, 60}
-          : vector<int>{60, 60, 60, 60, 60, 60, 60};
-  const int he_scale = linear_scale_cycle == 4
+          : (linear_scale_cycle == 6
+                 ? vector<int>{60, 32, 60, 60, 60, 60, 60, 60}
+                 : vector<int>{60, 60, 60, 60, 60, 60, 60});
+  const int he_scale = linear_scale_cycle == 8 ? 40 : linear_scale_cycle == 4
                            ? 44
                            : (linear_scale_cycle == 5 ? 43 : kCkksScale);
   HE_CKKS he(party, &io, kDegree,
              coefficient_bits, 40, he_scale,
              device_backend ? LOCATION::DEVICE : LOCATION::HOST);
+  if (linear_scale_cycle == 10) {
+    Bert_ckks adapter(party, &io, address, port + 1);
+    const int count = 3;
+    vector<vector<uint64_t>> local(count, vector<uint64_t>(he.num_slots));
+    vector<vector<int64_t>> expected(count, vector<int64_t>(he.num_slots));
+    const array<int64_t, 9> endpoints = {
+        0, 1, -1, (int64_t{1} << 36) - 1, -(int64_t{1} << 36),
+        int64_t{1} << 30, -(int64_t{1} << 30), 4096, -4096};
+    for (int ct = 0; ct < count; ++ct) {
+      for (size_t i = 0; i < he.num_slots; ++i) {
+        const uint64_t index = ct * he.num_slots + i;
+        expected[ct][i] = i % 2 == 0 ? endpoints[(i / 2) % endpoints.size()]
+            : signed_ring((index + 7) * 0xbf58476d1ce4e5b9ULL);
+        const uint64_t share = (index + 1) * 0x9e3779b97f4a7c15ULL & ring_mask();
+        local[ct][i] = party == sci::ALICE ? share
+            : (uint64_t(expected[ct][i]) - share) & ring_mask();
+      }
+    }
+    const auto before = adapter.current_comm();
+    auto plains = adapter.mpc_to_ckks(local, he.num_slots,
+        he.get_conversion_prime(), kBits, kScale, kCkksScale, &he, false);
+    const auto conversion_bytes = adapter.current_comm() - before;
+    vector<Ciphertext> cts(count);
+    double max_error_raw = 0;
+    int failed = 0;
+    if (party == sci::BOB) {
+      he.encrypt_send(plains, cts);
+      recv_encrypted_vector(he.context, &io, cts);
+      for (int ct = 0; ct < count; ++ct) {
+        Plaintext plain;
+        vector<complex<double>> decoded;
+        he.decryptor->decrypt(cts[ct], plain);
+        he.encoder->decode(plain, decoded);
+        for (size_t i = 0; i < he.num_slots; ++i) {
+          const double error = abs(ldexp(decoded[i].real(), kScale) - expected[ct][i]);
+          if (!isfinite(error) || error > 2) ++failed;
+          max_error_raw = max(max_error_raw, error);
+        }
+      }
+      io.send_data(&failed, sizeof(failed));
+      io.send_data(&max_error_raw, sizeof(max_error_raw));
+    } else {
+      recv_encrypted_vector(he.context, &io, cts);
+      for (int ct = 0; ct < count; ++ct)
+        he.evaluator->add_plain_inplace(cts[ct], plains[ct]);
+      send_encrypted_vector(&io, cts);
+      io.recv_data(&failed, sizeof(failed));
+      io.recv_data(&max_error_raw, sizeof(max_error_raw));
+    }
+    cout << "A0_PUBLIC_INTEGER_LIFT status=" << (failed ? "FAIL" : "PASS")
+         << " max_abs_error_raw=" << max_error_raw
+         << " tested=" << count * he.num_slots
+         << " full_signed_input_bits=" << kBits
+         << " conversion_send_bytes=" << conversion_bytes << endl;
+    return failed ? 1 : 0;
+  }
+  if (linear_scale_cycle == 9) {
+    Bert_ckks adapter(party, &io, address, port + 1);
+    const auto id = he.context->last_context_data()->parms_id();
+    vector<Ciphertext> ciphertexts(3);
+    vector<Plaintext> shares;
+    for (int ct = 0; ct < 3; ++ct) {
+      vector<complex<double>> values(he.num_slots);
+      for (size_t i = 0; i < values.size(); ++i)
+        values[i] = {double(int(i % 257) - 128) / 4.0 + 3 * ct,
+                     double(int(i % 13) - 6)};
+      if (party == sci::BOB) {
+        Plaintext plain;
+        he.encoder->encode(values, id, ldexp(1.0, 49), plain);
+        he.encryptor->encrypt(plain, ciphertexts[ct]);
+      }
+    }
+    if (party == sci::BOB) {
+      send_encrypted_vector(&io, ciphertexts);
+      ciphertexts.resize(2);
+      recv_encrypted_vector(he.context, &io, ciphertexts);
+      shares.resize(ciphertexts.size());
+      for (size_t i = 0; i < ciphertexts.size(); ++i)
+        he.decryptor->decrypt(ciphertexts[i], shares[i]);
+    } else {
+      recv_encrypted_vector(he.context, &io, ciphertexts);
+      adapter.pack_real_ckks_pairs(ciphertexts, &he);
+      adapter.mask_ckks_to_mpc_inplace(ciphertexts, shares, &he);
+      send_encrypted_vector(&io, ciphertexts);
+    }
+    const auto result = adapter.ckks_pairs_to_mpc(shares, 3, kBits, kScale, &he);
+    FixArray local(party, 3 * he.num_slots, true, kBits, kScale);
+    for (int ct = 0; ct < 3; ++ct)
+      copy(result[ct].begin(), result[ct].end(), local.data + ct * he.num_slots);
+    auto opened = adapter.nonlinear.fpmath[0]->fix->output(sci::PUBLIC, local);
+    int64_t max_error = 0;
+    for (int ct = 0; ct < 3; ++ct)
+      for (size_t i = 0; i < he.num_slots; ++i) {
+        const int64_t expected = (int64_t(i % 257) - 128) * 1024 + 3 * ct * 4096;
+        max_error = max(max_error, int64_t(llabs(signed_ring(opened.data[ct * he.num_slots + i]) - expected)));
+      }
+    cout << "A0_PUBLIC_REAL_PAIRS status=" << (max_error <= 4 ? "PASS" : "FAIL")
+         << " max_abs_error_raw=" << max_error
+         << " source_cts=3 packed_cts=2 nonzero_imaginary_input=1" << endl;
+    return max_error <= 4 ? 0 : 1;
+  }
+  if (linear_scale_cycle == 8) {
+    Bert_ckks adapter(party, &io, address, port + 1);
+    adapter.linear.he_softmax = &he;
+    adapter.pre_norm_attention_output_only = true;
+    adapter.linear.data_lin1_0.image_size = 256;
+    adapter.public_attention_mask.assign(256, -10000);
+    fill_n(adapter.public_attention_mask.begin(), 197, 0);
+    adapter.public_attention_mask_ready = true;
+    FixArray input(party, 256 * 256, true, kBits, kScale);
+    for (int row = 0; row < 256; ++row) {
+      for (int key = 0; key < 256; ++key) {
+        const int64_t value = key >= 197 ? -10000LL * 4096
+            : (row % 2 == 0 ? 0 : -int64_t(key % 17) * 4096);
+        const int index = row * 256 + key;
+        const uint64_t share = uint64_t(index + 1) * 0x9e3779b97f4a7c15ULL & ring_mask();
+        input.data[index] = party == sci::ALICE ? share
+            : (uint64_t(value) - share) & ring_mask();
+      }
+    }
+    const auto rows = adapter.softmax_fix_he(party, input, adapter.nonlinear.fpmath, 1);
+    FixArray flattened(party, input.size, true, kBits, kScale);
+    for (int row = 0; row < 256; ++row)
+      copy_n(rows[row].data, 256, flattened.data + row * 256);
+    auto opened = adapter.nonlinear.fpmath[0]->fix->output(sci::PUBLIC, flattened);
+    int errors = 0;
+    double max_error = 0.0;
+    for (int row = 0; row < 256; ++row) {
+      double denom = 0;
+      for (int key = 0; key < 197; ++key)
+        denom += row % 2 == 0 ? 1.0 : pow(1.0 - double(key % 17) / 128.0, 128);
+      for (int key = 0; key < 256; ++key) {
+        const double value = ldexp(double(signed_ring(opened.data[row * 256 + key])), -kScale);
+        const double expected = (key >= 197 || row >= 197) ? 0.0 :
+            (row % 2 == 0 ? 1.0 : pow(1.0 - double(key % 17) / 128.0, 128)) / denom;
+        max_error = max(max_error, abs(value - expected));
+        if (((key >= 197 || row >= 197) && value != 0.0) || abs(value - expected) > 0.002) ++errors;
+      }
+    }
+    cout << "A0_PUBLIC_COMPACT_SOFTMAX status=" << (errors ? "FAIL" : "PASS")
+         << " errors=" << errors << " max_abs_error=" << max_error
+         << " queries=197 keys=197 slot_tail_padding=1" << endl;
+    adapter.linear.he_softmax = nullptr;
+    return errors ? 1 : 0;
+  }
+  if (linear_scale_cycle == 7) {
+    Bert_ckks adapter(party, &io, address, port + 1);
+    const uint64_t q = he.context->last_context_data()->parms().coeff_modulus()[0].value();
+    const uint64_t center = (q - 1) / 2;
+    const int count = 131079;
+    vector<uint64_t> input(count), low(count), high(count), peer_low(count), peer_high(count);
+    vector<__uint128_t> expected(count);
+    const uint64_t cases[] = {0, 1, 2, center - 1, center, center + 1, q - 2, q - 1};
+    for (int i = 0; i < count; ++i) {
+      const uint64_t a = i % 3 == 0 ? cases[(i / 3) % 8]
+          : uint64_t(__uint128_t(0x9e3779b97f4a7c15ULL) * (i + 1) % q);
+      const uint64_t b = i % 3 == 0 ? cases[(i / 24) % 8]
+          : uint64_t(__uint128_t(0xd1b54a32d192ed03ULL) * (i + 1) % q);
+      input[i] = party == sci::ALICE ? a : b;
+      const uint64_t residue = (a + b) % q;
+      expected[i] = residue > center ? __uint128_t(residue) - q : residue;
+    }
+    bool passed = true;
+    for (int width : {100, 120}) {
+      const auto start = chrono::steady_clock::now();
+      adapter.nonlinear.centered_field_to_ring_wide(
+          adapter.nonlinear.active_workers(), input.data(), q, low.data(),
+          high.data(), count, width);
+      const double seconds = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+      if (party == sci::ALICE) {
+        io.send_data(low.data(), count * sizeof(uint64_t));
+        io.send_data(high.data(), count * sizeof(uint64_t));
+        io.recv_data(peer_low.data(), count * sizeof(uint64_t));
+        io.recv_data(peer_high.data(), count * sizeof(uint64_t));
+      } else {
+        io.recv_data(peer_low.data(), count * sizeof(uint64_t));
+        io.recv_data(peer_high.data(), count * sizeof(uint64_t));
+        io.send_data(low.data(), count * sizeof(uint64_t));
+        io.send_data(high.data(), count * sizeof(uint64_t));
+      }
+      const __uint128_t mask = (__uint128_t{1} << width) - 1;
+      int errors = 0;
+      for (int i = 0; i < count; ++i) {
+        const __uint128_t value = (__uint128_t(high[i]) << 64) | low[i];
+        const __uint128_t peer = (__uint128_t(peer_high[i]) << 64) | peer_low[i];
+        if (((value + peer) & mask) != (expected[i] & mask)) ++errors;
+      }
+      passed &= errors == 0;
+      cout << "A0_PUBLIC_CENTERED_WIDE width=" << width << " samples=" << count
+           << " errors=" << errors << " seconds=" << seconds << endl;
+    }
+    cout << "A0_PUBLIC_CENTERED_WIDE status=" << (passed ? "PASS" : "FAIL") << endl;
+    return passed ? 0 : 1;
+  }
+  if (linear_scale_cycle == 6) {
+    Bert_ckks adapter(party, &io, address, port + 1);
+    const auto source_context = context_at_chain(he, 4);
+    vector<double> values(he.num_slots);
+    for (size_t i = 0; i < values.size(); ++i)
+      values[i] = i % 4 == 0 ? -48.0 :
+                  (i % 4 == 1 ? 44.0 : double(int(i % 25) - 12) / 4.0);
+    vector<Ciphertext> source(1);
+    if (party == sci::BOB) {
+      Plaintext plain;
+      he.encoder->encode(values, source_context->parms_id(),
+                         ldexp(1.0, 64), plain);
+      he.encryptor->encrypt(plain, source[0]);
+      send_encrypted_vector(&io, source);
+    } else {
+      recv_encrypted_vector(he.context, &io, source);
+    }
+    bool passed = true;
+    // 49 is a regression witness, not a selectable production path.
+    for (int scale : {49, Bert_ckks::kGeluConversionScaleBits}) {
+      vector<Ciphertext> result(1);
+      if (party == sci::ALICE) {
+        vector<UnifiedCiphertext> input;
+        input.emplace_back(source[0]);
+        if (device_backend) input[0].to_device(*he.context, *he.dcontext);
+        vector<UnifiedCiphertext> output;
+        adapter.eval_gelu_poly(output, input, &he, scale);
+        if (device_backend) output[0].to_host(*he.context, *he.dcontext);
+        result[0] = output[0].hcipher();
+        send_encrypted_vector(&io, result);
+      } else {
+        recv_encrypted_vector(he.context, &io, result);
+        Plaintext plain;
+        he.decryptor->decrypt(result[0], plain);
+        vector<complex<double>> decoded;
+        he.encoder->decode(plain, decoded);
+        double max_error = 0.0, interior_error = 0.0;
+        for (size_t i = 0; i < values.size(); ++i) {
+          const double x2 = values[i] * values[i];
+          const double expected = -0.018154344446004743 * x2 * x2 +
+              0.30869355275897581 * x2 + 0.027529737185454588;
+          const double error = abs(decoded[i].real() - expected);
+          if (!isfinite(error)) { passed = false; break; }
+          max_error = max(max_error, error);
+          if (abs(values[i]) <= 3.0) interior_error = max(interior_error, error);
+        }
+        const bool accurate = max_error <= 0.5 && interior_error <= 0.01;
+        passed = passed && (scale == 49 ? !accurate : accurate);
+        cout << "A0_PUBLIC_GELU_RANGE scale=" << scale
+             << " max_abs_error=" << max_error
+             << " interior_max_abs_error=" << interior_error
+             << " expected=" << (scale == 49 ? "OVERFLOW" : "ACCURATE")
+             << " accurate=" << accurate << endl;
+      }
+    }
+    uint8_t success = passed ? 1 : 0;
+    if (party == sci::BOB) io.send_data(&success, 1);
+    else io.recv_data(&success, 1);
+    cout << "A0_PUBLIC_GELU_RANGE_SELFTEST status="
+         << (success ? "PASS" : "FAIL") << endl;
+    return success ? 0 : 1;
+  }
   if (linear_scale_cycle == 5) {
     setenv("OURS_VIT_A0_PUBLIC_FIXTURE", "1", 1);
     FCMetadata data{};

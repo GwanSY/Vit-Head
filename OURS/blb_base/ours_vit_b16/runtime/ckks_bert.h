@@ -73,6 +73,9 @@ struct BlbViTProfileMetric {
 class Bert_ckks
 {
 public:
+    // Leave 22 coefficient magnitude bits for the unselected GELU tails.
+    // MPC still receives the original ell=37, scale=12 representation.
+    static constexpr int kGeluConversionScaleBits = 37;
     int party;
     string address;
     int port;
@@ -140,6 +143,10 @@ public:
     // Setting it false only splits otherwise identical public-plan groups and
     // disables diagonal reuse; it never changes the Head assignment.
     bool heterogeneous_group_packing_enabled = true;
+    // The original BLB diagonal-reuse schedule is independent of the later
+    // heterogeneous Head grouping switch.  Keep this explicit so the
+    // allocator can remain per-Head while using the established fast GPU
+    // end-to-end schedule.
     // Validation-only observers used by the paired Packed/Unpacked trace.
     FixArray heterogeneous_av_share;
     FixArray heterogeneous_wo_share;
@@ -374,6 +381,10 @@ public:
     }
 
     vector<vector<HE_CKKS::scalar_t>> ckks_to_mpc(const vector<Plaintext> &pts, int degree, uint64_t Q, int bit_out, int s_out, HE_CKKS* he, bool half=false);
+    void pack_real_ckks_pairs(vector<Ciphertext>& ciphertexts, HE_CKKS* he);
+    vector<vector<HE_CKKS::scalar_t>> ckks_pairs_to_mpc(
+        const vector<Plaintext>& pts, size_t real_ciphertexts,
+        int bit_out, int s_out, HE_CKKS* he);
 
     // BLB Algorithm 1: sample a fresh uniform element directly in the current
     // RNS polynomial ring, add it to c0, and return the additive -r share.
@@ -424,7 +435,7 @@ public:
 
     FixArray div_batch_he(const FixArray& nm, const FixArray& dn, int batch_dn_size, int l_out, int s_out, bool normalized_dn = false);
 
-    FixArray div_batch_he_V2(const FixArray& nm, const FixArray& dn, int batch_dn_size, int l_out, int s_out, bool normalized_dn = false);
+    FixArray div_batch_he_V2(const FixArray& nm, const FixArray& dn, int batch_dn_size, int l_out, int s_out, bool normalized_dn = false, bool softmax_denominator = false);
 
     FixArray element_wise_mul(FixArray x, FixArray y);
 
@@ -480,7 +491,7 @@ public:
     std::map<char*,FixArray> heterogeneous_attention_output_a3_a4(
         FixArray normalized_qk, int layer_id);
 
-    FixArray exp_he(const FixArray &x);
+    FixArray exp_he(const FixArray &x, bool apply_attention_mask = true);
 
     vector<Plaintext> eval_gelu_poly_old(FixArray x);
 

@@ -34,7 +34,7 @@ contains the stricter collector. Neither changes the measured secure graph.
   A4 native QK/AV/WO, real output conversions, and counters.
 - `runtime/linear_ckks.cpp`: split W_O preprocessing, signed 37-bit checkpoint
   handling, `alpha_h` fusion, and A4 he1 modulus schedule.
-- `scripts/make_a4_sparse_review_plan.py`: calibration-based review plans with
+- `scripts/legacy/make_a4_sparse_review_plan.py`: calibration-based review plans with
   complete two-Head packing pairs. This is not the final A2 selector.
 - `scripts/run_ours_a3_a4_container.sh`: head-reorder oracle, dynamic GPU
   selection, formal netem, and immutable Docker image-ID execution.

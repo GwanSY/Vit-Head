@@ -24,7 +24,8 @@ network_mode=${OURS_VIT_NETWORK_MODE:-netem}
 ablation=${OURS_VIT_ABLATION:-a0}
 head_plan=${OURS_VIT_HEAD_PLAN:-}
 prevalidated_reorder_binding=${OURS_VIT_PREVALIDATED_REORDER_BINDING:-}
-conversion_mode=${OURS_VIT_CONVERSION_MODE:-fast}
+cuda_gdb_command_file=${BLB_VIT_CUDA_GDB_COMMAND_FILE:-}
+debugger_binary=${BLB_VIT_DEBUGGER_BIN:-/usr/local/cuda-12.3/bin/cuda-gdb}
 
 if [[ "$output_dir" != /* ]]; then output_dir="$root/$output_dir"; fi
 if [[ "$backend" != cpu && "$backend" != gpu ]]; then
@@ -88,8 +89,12 @@ if [[ "$network_mode" != netem && "$network_mode" != none ]]; then
   echo "OURS_VIT_NETWORK_MODE must be netem or none" >&2
   exit 2
 fi
-if [[ "$conversion_mode" != fast && "$conversion_mode" != exact ]]; then
-  echo "OURS_VIT_CONVERSION_MODE must be fast or exact" >&2
+if [[ -n "$cuda_gdb_command_file" && ! -f "$cuda_gdb_command_file" ]]; then
+  echo "missing CUDA debugger command file: $cuda_gdb_command_file" >&2
+  exit 2
+fi
+if [[ -n "$cuda_gdb_command_file" && ! -x "$debugger_binary" ]]; then
+  echo "missing debugger binary: $debugger_binary" >&2
   exit 2
 fi
 if [[ ! "$ablation" =~ ^[aA][0-4]$ ]]; then
@@ -227,7 +232,7 @@ fi
   echo "transformer_blocks=$stop_after_block"
   echo "ablation=${ablation^^}"
   echo "head_plan=${head_plan:-built_in_all_softmax_original_order}"
-  echo "conversion_mode=$conversion_mode"
+  echo "conversion_path=see_edge_cloud_contract_and_run_metadata"
   if [[ -n "${OURS_VIT_STOP_AFTER_NORMALIZATION:-}" ]]; then
     echo "cost_scope=a2_normalization_only"
     echo "conversion_cost_included=0"
@@ -260,10 +265,8 @@ fi
   lscpu | grep -E 'Model name|Socket\(s\)|Core\(s\) per socket|Thread\(s\) per core'
 } > "$output_dir/environment.txt"
 
-alice_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE
-  OURS_VIT_CONVERSION_MODE="$conversion_mode")
-bob_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE
-  OURS_VIT_CONVERSION_MODE="$conversion_mode")
+alice_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE)
+bob_env=(env OMP_NUM_THREADS="$omp_threads" OMP_DYNAMIC=FALSE)
 if [[ "$backend" == gpu ]]; then
   alice_env+=(CUDA_VISIBLE_DEVICES="$alice_gpu_id"
     BLB_VIT_GPU_DIRECT_PLAINTEXT="$gpu_direct_plaintext"
@@ -276,25 +279,45 @@ fi
 ours_args=(--ablation "$ablation")
 if [[ -n "$head_plan" ]]; then ours_args+=(--head-plan "$head_plan"); fi
 
+binary_command=(
+  "$binary" --party 1 --port "$port" --address 127.0.0.1
+  --model "$model" --input "$input" --output "$output_dir"
+  --backend "$backend" --stop-after-block "$stop_after_block"
+  "${ours_args[@]}"
+)
+if [[ -n "$cuda_gdb_command_file" ]]; then
+  binary_command=(
+    "$debugger_binary" -q -batch
+    -x "$cuda_gdb_command_file" --args "${binary_command[@]}"
+  )
+  echo "BLB_VIT_CUDA_GDB status=ENABLED command_file=$cuda_gdb_command_file"
+fi
+
 date --iso-8601=ns > "$output_dir/start.txt"
 setsid /usr/bin/time -v -o "$output_dir/alice.resource.txt" \
   timeout --foreground --signal=TERM --kill-after=30s "${timeout_s}s" \
   taskset -c 0-47,96-111 "${alice_env[@]}" \
-  "$binary" --party 1 --port "$port" --address 127.0.0.1 \
-  --model "$model" --input "$input" --output "$output_dir" \
-  --backend "$backend" --stop-after-block "$stop_after_block" \
-  "${ours_args[@]}" \
+  "${binary_command[@]}" \
   > "$output_dir/alice.log" 2>&1 &
 alice_pid=$!
 
 sleep 1
+binary_command=(
+  "$binary" --party 2 --port "$port" --address 127.0.0.1
+  --model "$model" --input "$input" --output "$output_dir"
+  --backend "$backend" --stop-after-block "$stop_after_block"
+  "${ours_args[@]}"
+)
+if [[ -n "$cuda_gdb_command_file" ]]; then
+  binary_command=(
+    "$debugger_binary" -q -batch
+    -x "$cuda_gdb_command_file" --args "${binary_command[@]}"
+  )
+fi
 setsid /usr/bin/time -v -o "$output_dir/bob.resource.txt" \
   timeout --foreground --signal=TERM --kill-after=30s "${timeout_s}s" \
   taskset -c 48-95,144-159 "${bob_env[@]}" \
-  "$binary" --party 2 --port "$port" --address 127.0.0.1 \
-  --model "$model" --input "$input" --output "$output_dir" \
-  --backend "$backend" --stop-after-block "$stop_after_block" \
-  "${ours_args[@]}" \
+  "${binary_command[@]}" \
   > "$output_dir/bob.log" 2>&1 &
 bob_pid=$!
 

@@ -2,11 +2,36 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-jobs=${JOBS:-64}
+jobs=${JOBS:-4}
 cuda_root=${CUDA_ROOT:-${CUDAToolkit_ROOT:-/usr/local/cuda-12.3}}
 cmake_bin=${CMAKE_BIN:-cmake}
-build_dir=${OURS_VIT_BUILD_DIR:-$root/build/gpu}
+build_dir=${OURS_VIT_BUILD_DIR:-$root/build/container-gpu}
 eigen_build=${OURS_VIT_EIGEN_BUILD_DIR:-$root/build/eigen-config}
+
+# Reuse the canonical configured tree and its original toolchain.
+if [[ -f "$build_dir/CMakeCache.txt" ]]; then
+  cached_cmake=$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' "$build_dir/CMakeCache.txt")
+  cached_source=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$build_dir/CMakeCache.txt")
+  if [[ "$cached_source" == /workspace/OURS/gpu/SCI && "$root" != /workspace/OURS ]]; then
+    exec docker run --rm --runtime=runc --network=none \
+      -e NVIDIA_VISIBLE_DEVICES=void -e JOBS="$jobs" \
+      --mount "type=bind,src=$root,dst=/workspace/OURS,readonly" \
+      --mount "type=bind,src=$root/gpu/SCI,dst=/workspace/OURS/gpu/SCI" \
+      --mount "type=bind,src=$build_dir,dst=/workspace/OURS/build/container-gpu" \
+      --mount "type=bind,src=$cuda_root,dst=/usr/local/cuda-12.3,readonly" \
+      --workdir /workspace/OURS --entrypoint bash \
+      "${OURS_DOCKER_IMAGE:-ours:restored-fast-20260903d}" scripts/build_vit_b16.sh
+  fi
+  if [[ -x "$cached_cmake" ]]; then
+    "$cached_cmake" -S "$root/gpu/SCI" -B "$build_dir"
+    "$cached_cmake" --build "$build_dir" \
+      --target ours_vit_b16_main ours_vit_hetero_plan_test ours_vit_edge_cloud_test \
+               ours_vit_a0_conversion_selftest ours_vit_conversion_test ours_vit_row_max_test \
+      --parallel "$jobs"
+    echo "OURS_VIT_BUILD status=PASS build_dir=$build_dir"
+    exit 0
+  fi
+fi
 
 # SCI's Phantom backend uses FindCUDAToolkit, which requires CMake >= 3.17.
 # The host image still exposes CMake 3.16 as /usr/bin/cmake, while the
@@ -65,13 +90,13 @@ if [[ -d "$build_dir/thirdparty/phantom-build" ]]; then
 fi
 
 "$cmake_bin" --build "$build_dir" \
-  --target ckks_vit_b16_main ours_vit_b16_main ours_vit_hetero_plan_test \
-           ours_vit_a0_conversion_selftest ours_vit_conversion_test \
+  --target ours_vit_b16_main ours_vit_hetero_plan_test \
+           ours_vit_edge_cloud_test ours_vit_a0_conversion_selftest ours_vit_conversion_test ours_vit_row_max_test \
   --parallel "$jobs"
 
-test -x "$build_dir/bin/ckks_vit_b16_main"
 test -x "$build_dir/bin/ours_vit_b16_main"
 test -x "$build_dir/bin/ours_vit_hetero_plan_test"
+test -x "$build_dir/bin/ours_vit_edge_cloud_test"
 test -x "$build_dir/bin/ours_vit_a0_conversion_selftest"
 test -x "$build_dir/bin/ours_vit_conversion_test"
 echo "OURS_VIT_BUILD status=PASS targets=A0+OURS+PLAN_TEST+CONVERSION_TEST backend=SEAL_HOST+Phantom_DEVICE ot=VOLE threads=$jobs cmake=$cmake_bin build_dir=$build_dir"

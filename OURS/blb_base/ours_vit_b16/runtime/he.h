@@ -317,7 +317,7 @@ public:
             // io->send_data(&sk_size, sizeof(uint64_t));
             // io->send_data(keys_ser_sk.c_str(), sk_size);
 
-            encryptor = new Encryptor(*context, pub_key);
+            encryptor = new Encryptor(*context, pub_key, sec_key);
             decryptor = new Decryptor(*context, sec_key);
             // vector<double> pod_matrix(poly_modulus_degree/2, 0ULL);
             // Plaintext tmp;
@@ -395,6 +395,38 @@ public:
 
     LOCATION backend() const { return backend_; }
     bool is_gpu_enable() const { return backend_ == LOCATION::DEVICE; }
+
+    // Only the key-owning client can seed-compress fresh encryptions.
+    // The ordinary ciphertext receiver expands SEAL's seed automatically;
+    // evaluated/masked server ciphertexts must still use their full payload.
+    template <class Plain, class Cipher>
+    void encrypt_send(const vector<Plain> &plains, vector<Cipher> &ciphertexts) {
+        if (party != sci::BOB || plains.empty() || plains.size() != ciphertexts.size())
+            throw invalid_argument("seeded input encryption requires Bob and matching nonempty batches");
+        vector<string> payloads(plains.size());
+        const int workers = min<size_t>(16, plains.size());
+#pragma omp parallel for num_threads(workers)
+        for (int i = 0; i < static_cast<int>(plains.size()); ++i) {
+            const auto &plain = static_cast<const Plaintext &>(plains[i]);
+            auto seeded = encryptor->encrypt_symmetric(plain);
+            stringstream stream;
+            seeded.save(stream);
+            payloads[i] = stream.str();
+            // Preserve the caller's ciphertext buffer for existing metadata
+            // checks and diagnostic consumers without changing their layout.
+            stream.seekg(0);
+            static_cast<Ciphertext &>(ciphertexts[i]).load(*context, stream);
+        }
+        uint64_t bytes = 0;
+        for (const auto &payload : payloads) {
+            const uint64_t size = payload.size();
+            io->send_data(&size, sizeof(size));
+            io->send_data(payload.data(), size);
+            bytes += sizeof(size) + size;
+        }
+        cout << "CKKS_SEEDED_INPUT cts=" << plains.size()
+             << " send_bytes=" << bytes << " secret_key_transferred=0" << endl;
+    }
 
     vector<scalar_t> ckks_decode(vector<complex_t> x, int degree, bool half=false);
 

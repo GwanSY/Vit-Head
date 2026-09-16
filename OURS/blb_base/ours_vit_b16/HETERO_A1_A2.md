@@ -12,8 +12,8 @@ end-to-end speedups while A0 is FAIL.
 - Runtime call site: the attention-normalization branch in
   `runtime/ckks_vit_b16_main.cpp`.
 - Public reference semantics: `scripts/vit_reference.py`.
-- Independent manual-mixed oracle: `scripts/verify_manual_mixed_paths.py`.
-- Review-plan generator: `scripts/make_review_head_plan.py`.
+- Independent manual-mixed oracle: `scripts/diagnostics/verify_manual_mixed_paths.py`.
+- Review-plan generator: `scripts/legacy/make_review_head_plan.py`.
 
 A1 accepts `HeadProtocol` values directly; there are no integer path codes.
 It processes each physical head independently and deliberately retains the
@@ -24,11 +24,11 @@ not the A4 CKKS implementation.
 ## A2: offline selection and grouping
 
 - Per-head disturbance calibration and complete-assignment selection:
-  `scripts/calibrate_heterogeneous_heads.py`.
+  `scripts/legacy/calibrate_heterogeneous_heads.py`.
 - Formal A3/A4 cost collection:
   `scripts/collect_attention_assignment_costs.py`.
 - A2 normalization-only diagnostic collection (not selection-eligible):
-  `scripts/collect_secure_path_costs.py`.
+  `scripts/legacy/collect_secure_path_costs.py`.
 - Reorder oracle: `scripts/verify_head_reorder.py`.
 - Runtime grouping: the same secure function as A1 with
   `group_contiguous_protocols=true`; the plan validator requires at most one

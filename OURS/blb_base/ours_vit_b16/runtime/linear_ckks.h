@@ -257,8 +257,7 @@ public:
 		PreprocessParams_1 &pp,
 		const FCMetadata &data,
 		vector<UnifiedCiphertext> &output,
-		vector<UnifiedCiphertext> *a0_qkv_observer = nullptr,
-		bool use_blb_fast_attention_packing = false
+		vector<UnifiedCiphertext> *a0_qkv_observer = nullptr
 		);
 	
 	void linear_2(
@@ -406,8 +405,7 @@ public:
 		HE_CKKS* he,
 		const FCMetadata &data,
 		vector<UnifiedCiphertext> Cipher_plain_result,
-		vector<UnifiedCiphertext> &results,
-		bool use_blb_fast_attention_packing = false);
+		vector<UnifiedCiphertext> &results);
 
 	// Softmax * V
 
@@ -460,8 +458,7 @@ public:
 		HE_CKKS* he, const vector<UnifiedCiphertext> &matrix,
 		const FCMetadata &data,
 		vector<vector<vector<UnifiedCiphertext>>> &s2_pack,
-		const vector<bool> *active_heads = nullptr,
-		bool use_blb_fast_attention_packing = false);
+		const vector<bool> *active_heads = nullptr);
 
 	// for different applications, we need to set different HE parameters
 	void set_HE(LOCATION backend, bool enable_a4_native_linear = false);

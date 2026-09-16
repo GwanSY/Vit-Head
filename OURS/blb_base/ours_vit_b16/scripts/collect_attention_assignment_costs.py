@@ -25,7 +25,8 @@ OUTPUT_COLUMNS = (
     "gpu_topology", "image_id", "binary_sha256", "plan_sha256",
     "protocols_original", "alphas_original", "physical_protocols",
     "original_order", "a4_data_level_extension",
-    "blb_fast_attention_packing", "surrogate", "dynamic_selection",
+    "blb_fast_attention_packing", "attention_packing",
+    "heterogeneous_head_grouping", "surrogate", "dynamic_selection",
     "source_run",
 )
 
@@ -53,7 +54,7 @@ class Profile:
         )
 
 
-def require_run_provenance(run: Path) -> tuple[str, str, str, str]:
+def require_run_provenance(run: Path) -> tuple[str, str, str, str, str]:
     status = key_values((run / "status.txt").read_text(encoding="utf-8"))
     if status.get("alice_rc") != "0" or status.get("bob_rc") != "0":
         raise ValueError(f"secure run failed: {run}")
@@ -72,16 +73,21 @@ def require_run_provenance(run: Path) -> tuple[str, str, str, str]:
 
     selection = key_values(
         (run / "gpu_selection.txt").read_text(encoding="utf-8"))
-    if selection.get("party_topology") != "separate_physical_gpus":
-        raise ValueError(f"assignment cost requires separate GPUs: {run}")
+    topology = selection.get("party_topology", "")
+    if topology not in {"separate_physical_gpus", "shared_physical_gpu"}:
+        raise ValueError(f"assignment cost has unknown GPU topology: {run}")
     physical = selection.get("physical_gpus", "").split(",")
-    if len(physical) != 2 or physical[0] == physical[1]:
+    if len(physical) != 2:
         raise ValueError(f"assignment cost has invalid GPU topology: {run}")
+    if topology == "separate_physical_gpus" and physical[0] == physical[1]:
+        raise ValueError(f"separate-GPU assignment has identical devices: {run}")
+    if topology == "shared_physical_gpu" and physical[0] != physical[1]:
+        raise ValueError(f"shared-GPU assignment has different devices: {run}")
     image_id = selection.get("image_id", "")
     plan_sha256 = selection.get("plan_sha256", "")
     if not image_id.startswith("sha256:") or len(plan_sha256) != 64:
         raise ValueError(f"assignment cost lacks immutable provenance: {run}")
-    return ablation, binary_sha256, image_id, plan_sha256
+    return ablation, binary_sha256, image_id, plan_sha256, topology
 
 
 def read_party_profiles(run: Path, party_name: str,
@@ -205,43 +211,116 @@ def require_native_markers(run: Path,
                 raise ValueError(f"missing one-level native A4 marker: {run}")
 
 
-def require_blb_fast_packing_markers(
+def require_head_grouping_disabled(
         run: Path,
         profiles: dict[tuple[int, str, int, int, int], Profile]) -> None:
-    """Reject costs from the removed full-diagonal QK/AV experiment path."""
+    """Require the allocator-only, unpacked Head execution mode.
+
+    ``OURS_VIT_GROUP_PACKING=0`` disables the later heterogeneous Head
+    packing/grouping optimization while retaining the existing A3/A4
+    selective conversion and native CKKS Linear paths.  The runtime emits the
+    authoritative mode marker in each party log; the launcher selection file
+    is checked as an independent provenance record.
+    """
+    selection = key_values((run / "gpu_selection.txt").read_text(
+        encoding="utf-8", errors="replace"))
+    if selection.get("attention_packing") != "unpacked":
+        raise ValueError(
+            f"composition probe did not disable heterogeneous Head grouping: {run}")
+    for party_name in ("alice.log", "bob.log"):
+        log = (run / party_name).read_text(encoding="utf-8", errors="replace")
+        runtime = marker_values(log, "OURS_VIT_RUNTIME boundary=padding")
+        if len(runtime) != 1:
+            raise ValueError(f"missing unique runtime packing marker: {run}/{party_name}")
+        values = runtime[0]
+        # In the current binary this metadata bit names the heterogeneous
+        # grouping fast path, so it is 0 when grouping is disabled.  The
+        # independent BLB-fast QK/AV markers checked below are the authoritative
+        # proof that the original BLB diagonal-reuse schedule remains active.
+        if (values.get("attention_packing") != "unpacked" or
+                values.get("heterogeneous_head_grouping") != "0"):
+            raise ValueError(
+                f"composition probe used an invalid Head grouping/BLB mode: {run}/{party_name}")
+        # In the ungrouped mode every selective conversion call is explicitly
+        # per-head.  Keep this audit tied to the measured assignment rather
+        # than accepting a global environment variable alone.
+        conversions = marker_values(log, "OURS_A3_SELECTIVE_MPC_TO_CKKS")
+        expected = sum(softmax + relu for _layer, _ablation, softmax, relu, _linear
+                       in profiles)
+        if len(conversions) != expected or any(
+                values.get("grouped_call") != "0" for values in conversions):
+            raise ValueError(
+                f"composition probe contains grouped selective conversion calls: {run}/{party_name}")
+
+
+def require_blb_fast_packing_markers(
+        run: Path,
+        profiles: dict[tuple[int, str, int, int, int], Profile]) -> bool:
+    """Validate the original QK schedule and the selected real AV schedule.
+
+    The allocator experiment disables only the later heterogeneous Head
+    grouping.  In that mode the existing QK fast schedule remains active, but
+    AV uses the genuine per-diagonal selector/rescale path and therefore emits
+    ``FORMAL_AV_DIAGONAL_PACK`` instead of ``OURS_BLB_AV_PACKING``.  Both
+    markers are accepted here; neither path is a secure-cost surrogate.
+    """
     logs = [
         (run / party).read_text(encoding="utf-8", errors="replace")
         for party in ("alice.log", "bob.log")
     ]
     qk = []
     av = []
+    ungrouped_av = []
     levels = []
     for log in logs:
         qk.extend(marker_values(log, "OURS_BLB_QK_PACKING "))
         av.extend(marker_values(log, "OURS_BLB_AV_PACKING "))
+        ungrouped_av.extend(marker_values(log, "FORMAL_AV_DIAGONAL_PACK "))
         levels.extend(marker_values(log, "OURS_BLB_FAST_AV_LEVEL "))
-    if len(qk) != len(profiles) or any(
+    complete_qk = len(qk) == len(profiles) and all(
+        values.get("status") == "EXECUTED" and
+        values.get("mode") == "complete_diagonal" and
+        values.get("mpc_surrogate") == "0" and
+        values.get("client_decrypt_reencrypt") == "0"
+        for values in qk)
+    if not complete_qk and (len(qk) != len(profiles) or any(
             values.get("status") != "PASS" or
             values.get("mode") != "baseline_fast" or
             values.get("mpc_surrogate") != "0" or
             values.get("client_decrypt_reencrypt") != "0" or
             values.get("a0_numerical_validation") != "PENDING"
-            for values in qk):
+            for values in qk)):
         raise ValueError(f"assignment cost did not use BLB-fast QK: {run}")
 
     expected_path_count = sum(
         int(softmax + relu > 0) + int(linear > 0)
         for _layer, _ablation, softmax, relu, linear in profiles)
-    if len(av) != expected_path_count or any(
-            values.get("status") != "PASS" or
-            values.get("mode") != "baseline_fast" or
-            values.get("extra_mask_multiplies") != "0" or
-            values.get("extra_rescales") != "0" or
-            values.get("mpc_surrogate") != "0" or
-            values.get("client_decrypt_reencrypt") != "0" or
-            values.get("a0_numerical_validation") != "PENDING"
-            for values in av):
-        raise ValueError(f"assignment cost did not use BLB-fast AV: {run}")
+    packed_av_valid = len(av) == expected_path_count and all(
+            values.get("status") == "PASS" and
+            values.get("mode") == "baseline_fast" and
+            values.get("extra_mask_multiplies") == "0" and
+            values.get("extra_rescales") == "0" and
+            values.get("mpc_surrogate") == "0" and
+            values.get("client_decrypt_reencrypt") == "0" and
+            values.get("a0_numerical_validation") == "PENDING"
+            for values in av)
+    ungrouped_av_valid = len(ungrouped_av) == expected_path_count and all(
+        values.get("status") == "PASS" and
+        int(values.get("active_pairs", "0")) > 0 and
+        int(values.get("packed_diagonals", "0")) > 0 and
+        int(values.get("mask_multiplies", "0")) > 0 and
+        int(values.get("rescales", "0")) > 0
+        for values in ungrouped_av)
+    if not (packed_av_valid or ungrouped_av_valid):
+        raise ValueError(
+            f"assignment cost lacks a valid real AV schedule: {run}")
+    if packed_av_valid and ungrouped_av:
+        raise ValueError(
+            f"assignment cost mixes packed and ungrouped AV schedules: {run}")
+    if complete_qk:
+        if not ungrouped_av_valid:
+            raise ValueError(f"complete QK requires complete AV packing: {run}")
+        return False
     if len(levels) != expected_path_count or any(
             values.get("status") != "PASS" or
             values.get("extra_rescales") != "0" or
@@ -261,6 +340,7 @@ def require_blb_fast_packing_markers(
         if actual_contexts != expected_contexts:
             raise ValueError(
                 f"BLB-fast AV contexts disagree with assignment: {run}")
+    return packed_av_valid
 
 
 def read_head_plan(run: Path) -> dict[int, dict[str, str]]:
@@ -293,13 +373,17 @@ def read_head_plan(run: Path) -> dict[int, dict[str, str]]:
 
 
 def measured_rows(run: Path) -> list[dict[str, object]]:
-    ablation, binary_sha256, image_id, plan_sha256 = require_run_provenance(run)
+    ablation, binary_sha256, image_id, plan_sha256, topology = \
+        require_run_provenance(run)
     alice = read_party_profiles(run, "alice.log", ablation)
     bob = read_party_profiles(run, "bob.log", ablation)
     if set(alice) != set(bob):
         raise ValueError(f"party assignment profiles disagree: {run}")
     require_native_markers(run, alice)
-    require_blb_fast_packing_markers(run, alice)
+    av_uses_fast_packing = require_blb_fast_packing_markers(run, alice)
+    require_head_grouping_disabled(run, alice)
+    selection = key_values((run / "gpu_selection.txt").read_text(
+        encoding="utf-8", errors="replace"))
     head_plan = read_head_plan(run)
     rows: list[dict[str, object]] = []
     integer_fields = (
@@ -338,12 +422,14 @@ def measured_rows(run: Path) -> list[dict[str, object]]:
             "cost_unit": "direct_assignment_not_per_head",
             "network_gbps": 1.0, "rtt_ms": 0.3,
             "backend": "phantom_gpu",
-            "gpu_topology": "separate_physical_gpus",
+            "gpu_topology": topology,
             "image_id": image_id, "binary_sha256": binary_sha256,
             "plan_sha256": plan_sha256, "surrogate": 0,
             **plan,
             "a4_data_level_extension": 1 if key[1] == "A4" else 0,
-            "blb_fast_attention_packing": 1,
+            "blb_fast_attention_packing": int(av_uses_fast_packing),
+            "attention_packing": selection.get("attention_packing", ""),
+            "heterogeneous_head_grouping": 0,
             "dynamic_selection": 0, "source_run": str(run.resolve()),
         }
         for field in integer_fields:

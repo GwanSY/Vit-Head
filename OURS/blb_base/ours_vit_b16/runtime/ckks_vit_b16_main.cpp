@@ -12,6 +12,7 @@
 
 #include "ckks_bert.h"
 #include "hetero_plan.h"
+#include "edge_cloud_runtime.h"
 #include "vit_model.h"
 
 #include <algorithm>
@@ -82,6 +83,7 @@ struct Args {
   ours_vit::Ablation ablation = ours_vit::Ablation::A0;
   string head_plan;
   bool validate_plan_only = false;
+  string role;
 };
 
 struct BlockProfile {
@@ -204,18 +206,23 @@ static void usage(const char *name) {
        << " --party 1|2 --port P --address HOST --model FILE"
           " --input FILE --output DIR --backend gpu|cpu"
           " --stop-after-block N --ablation a0|a1|a2|a3|a4"
-          " [--head-plan FILE] [--validate-plan-only]\n";
+          " [--role cloud|edge] [--head-plan FILE] [--validate-plan-only]\n";
 }
 
 static Args parse_args(int argc, char **argv) {
   Args args;
+  bool party_explicit = false;
   auto next = [&](int &i, const string &key) -> string {
     if (i + 1 >= argc) throw invalid_argument("missing value for " + key);
     return argv[++i];
   };
   for (int i = 1; i < argc; ++i) {
     const string key = argv[i];
-    if (key == "--party") args.party = stoi(next(i, key));
+    if (key == "--party") {
+      args.party = stoi(next(i, key));
+      party_explicit = true;
+    }
+    else if (key == "--role") args.role = next(i, key);
     else if (key == "--port") args.port = stoi(next(i, key));
     else if (key == "--address") args.address = next(i, key);
     else if (key == "--model") args.model = next(i, key);
@@ -236,6 +243,14 @@ static Args parse_args(int argc, char **argv) {
     } else {
       throw invalid_argument("unknown option " + key);
     }
+  }
+  if (!args.role.empty()) {
+    if (args.role != "cloud" && args.role != "edge")
+      throw invalid_argument("--role must be cloud or edge");
+    const int role_party = args.role == "cloud" ? sci::ALICE : sci::BOB;
+    if (party_explicit && args.party != role_party)
+      throw invalid_argument("--role conflicts with --party");
+    args.party = role_party;
   }
   if (args.party != sci::ALICE && args.party != sci::BOB)
     throw invalid_argument("--party must be 1 (Alice) or 2 (Bob)");
@@ -885,6 +900,17 @@ int main(int argc, char **argv) {
             ? ours_vit::HeteroPlan::all_softmax_a0()
             : ours_vit::HeteroPlan::load_file(args.head_plan);
     head_plan.validate(args.ablation);
+    ours_vit::EdgeCloudRuntime edge_cloud(
+        args.party,
+        {"ours_vit_b16_pre_norm_v1", kLogicalTokens, kPhysicalTokens, kDim,
+         kHeadDim, kClasses, args.stop_after_block},
+        head_plan, args.ablation);
+    {
+      ofstream contract(args.output + "/edge_cloud_contract_party" +
+                        to_string(args.party) + ".txt");
+      if (!contract) throw runtime_error("cannot write edge/cloud public contract");
+      contract << edge_cloud.public_contract();
+    }
     head_plan.write_audit_csv(
         args.output + "/head_plan_party" + to_string(args.party) + ".csv",
         args.ablation);
@@ -900,7 +926,7 @@ int main(int argc, char **argv) {
 
     VitModel vit;
     BertModel blb_model;
-    if (args.party == sci::ALICE) {
+    if (edge_cloud.is_cloud()) {
       vit = load_vit_model(args.model);
       if (args.ablation >= ours_vit::Ablation::A2)
         reorder_vit_attention_heads(vit, head_plan);
@@ -909,10 +935,14 @@ int main(int argc, char **argv) {
 
     const auto setup_start = chrono::steady_clock::now();
     Bert_ckks bert(args.party, args.port, args.address, backend,
-                   args.party == sci::ALICE ? &blb_model : nullptr,
+                   edge_cloud.is_cloud() ? &blb_model : nullptr,
                    args.physical_tokens, false,
                    max(1, args.stop_after_block),
                    args.ablation == ours_vit::Ablation::A4);
+    edge_cloud.agree(*bert.io);
+    cout << "OURS_EDGE_CLOUD role=" << edge_cloud.role_name()
+         << " contract=" << edge_cloud.contract_digest()
+         << " status=AGREED native_static_execution=1" << endl;
     double setup_seconds =
         chrono::duration<double>(chrono::steady_clock::now() - setup_start)
             .count();
@@ -981,11 +1011,11 @@ int main(int argc, char **argv) {
         heterogeneous_group_packing;
     if (a0_trace) {
       if (args.ablation != ours_vit::Ablation::A0 ||
-          args.stop_after_block != 1 ||
+          (args.stop_after_block != 1 && args.stop_after_block != 2) ||
           getenv("OURS_VIT_A0_TRACE_DIR") == nullptr ||
           string(getenv("OURS_VIT_A0_TRACE_DIR")).empty()) {
         throw runtime_error(
-            "A0 trace requires ablation=A0, stop-after-block=1 and "
+            "A0 trace requires ablation=A0, stop-after-block=1 or 2 and "
             "OURS_VIT_A0_TRACE_DIR");
       }
     }
@@ -1166,7 +1196,7 @@ int main(int argc, char **argv) {
 
     vector<uint64_t> image_patch_values(
         static_cast<size_t>(args.physical_tokens) * kDim, 0);
-    if (args.party == sci::BOB) {
+    if (edge_cloud.is_edge()) {
       image_patch_values = image_to_patch_input(load_vit_input(args.input),
                                                 args.physical_tokens);
     }
@@ -1251,7 +1281,9 @@ int main(int argc, char **argv) {
          << (args.ablation == ours_vit::Ablation::A0 ? 0 : 1)
          << " selective_conversion="
          << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0)
-         << " blb_fast_attention_packing="
+         << " attention_diagonal_kernel=complete_v1"
+         << " blb_fast_attention_packing=0"
+         << " heterogeneous_head_grouping="
          << (args.ablation >= ours_vit::Ablation::A3 &&
                      heterogeneous_group_packing
                  ? 1
@@ -1267,6 +1299,19 @@ int main(int argc, char **argv) {
     auto write_run_metadata = [&](int prediction, bool prediction_ready) {
       ofstream meta(args.output + "/run_metadata_party" +
                     to_string(args.party) + ".txt");
+      meta << "execution_framework=ours_native_edge_cloud_v1\n"
+           << "edge_cloud_role=" << edge_cloud.role_name() << '\n'
+           << "edge_cloud_contract_sha256=" << edge_cloud.contract_digest() << '\n'
+           << "edge_cloud_plan_agreed=1\n"
+           << "edge_cloud_setup_sent_bytes=33\n"
+           << "edge_cloud_online_dispatch=inline_native\n"
+           << "edge_cloud_output_policy=public_to_both\n";
+      meta << "field_to_ring_protocol=fused_prime_wrap\n"
+           << "mpc_to_ckks_protocol=integer_lift_single_extension\n"
+           << "input_ciphertext_transport=seal_seeded_symmetric\n"
+           << "real_output_packing=adjacent_real_imag\n"
+           << "softmax_public_padding_compaction=1\n"
+           << "vit_residual_addition=local_mpc\n";
       meta << "protocol="
            << (args.ablation == ours_vit::Ablation::A0
                    ? "original_blb_ckks_mpc"
@@ -1299,46 +1344,13 @@ int main(int argc, char **argv) {
         const char *value = getenv(name);
         return value != nullptr && *value != '\0' && string(value) != "0";
       };
-      const bool unsafe_legacy_conversion =
-          enabled_env("OURS_VIT_UNSAFE_LEGACY_CONVERSION");
-      const bool unsafe_legacy_ckks_to_mpc =
-          unsafe_legacy_conversion ||
-          enabled_env("OURS_VIT_UNSAFE_LEGACY_CKKS_TO_MPC");
-      const bool unsafe_legacy_mpc_to_ckks =
-          unsafe_legacy_conversion ||
-          enabled_env("OURS_VIT_UNSAFE_LEGACY_MPC_TO_CKKS");
-      const char *conversion_mode_value =
-          getenv("OURS_VIT_CONVERSION_MODE");
-      const string conversion_mode =
-          (conversion_mode_value == nullptr || *conversion_mode_value == '\0')
-              ? "fast"
-              : string(conversion_mode_value);
-      if (conversion_mode != "fast" && conversion_mode != "exact") {
-        throw invalid_argument(
-            "OURS_VIT_CONVERSION_MODE must be fast or exact");
-      }
-      const bool exact_conversion =
-          conversion_mode == "exact" &&
-          !unsafe_legacy_ckks_to_mpc && !unsafe_legacy_mpc_to_ckks;
-      meta << "conversion_mode_requested=" << conversion_mode << '\n'
-           << "conversion_mode_effective="
-           << (exact_conversion ? "exact" : "fast") << '\n'
-           << "conversion_path="
-           << (exact_conversion ? "exact_wide_shared_rns_extension"
-                                : "legacy_local_fft")
-           << '\n'
-           << "ckks_to_mpc_conversion="
-           << (exact_conversion ? "exact_wide" : "legacy_local_fft")
-           << '\n'
-           << "mpc_to_ckks_conversion="
-           << (exact_conversion ? "exact_wide_shared_rns_extension"
-                                : "legacy_local_fft")
-           << '\n'
-           << "softmax_product="
-           << (enabled_env("OURS_VIT_SOFTMAX_EXACT_PRODUCT")
-                   ? "mpc_exact_reference"
-                   : "blb_fast_he")
-           << '\n'
+      meta << "conversion_path=wide_shared_rns_v1\n"
+           << "ckks_to_mpc_conversion=wide_centered\n"
+           << "mpc_to_ckks_conversion=wide_shared_rns_extension\n"
+           << "softmax_product=mpc_batched\n"
+           << "gelu_polynomial=even_quartic\n"
+           << "gelu_conversion_scale_bits="
+           << Bert_ckks::kGeluConversionScaleBits << '\n'
            << "secure_exp_clamp="
            << (enabled_env("OURS_VIT_SECURE_EXP_CLAMP") ? 1 : 0) << '\n'
            << "softmax_exp_polynomial="
@@ -1377,7 +1389,9 @@ int main(int argc, char **argv) {
            << (args.ablation >= ours_vit::Ablation::A2 ? 1 : 0) << '\n'
            << "selective_conversion="
            << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0) << '\n'
-           << "blb_fast_attention_packing="
+           << "attention_diagonal_kernel=complete_v1\n"
+           << "blb_fast_attention_packing=0\n"
+           << "heterogeneous_head_grouping="
            << (args.ablation >= ours_vit::Ablation::A3 &&
                        heterogeneous_group_packing
                    ? 1
@@ -1417,20 +1431,8 @@ int main(int argc, char **argv) {
       if (prediction_ready) meta << "prediction=" << prediction << '\n';
     };
     for (int layer = 0; layer < args.stop_after_block; ++layer) {
-      vector<ours_vit::HeadProtocol> protocols(
-          kHeads, ours_vit::HeadProtocol::SoftmaxMpc);
-      vector<double> alphas(kHeads, 1.0);
-      if (args.ablation != ours_vit::Ablation::A0) {
-        const auto &layer_plan = head_plan.layers().at(layer);
-        for (int head = 0; head < kHeads; ++head) {
-          protocols[head] = layer_plan.heads.at(head).protocol;
-          alphas[head] = layer_plan.heads.at(head).alpha;
-        }
-      }
-      if (args.ablation >= ours_vit::Ablation::A3) {
-        bert.configure_heterogeneous_attention_layer(
-            layer, protocols, alphas, args.ablation);
-      }
+      const auto &protocols = edge_cloud.layer_plan(layer).protocols;
+      const auto &alphas = edge_cloud.layer_plan(layer).alphas;
       // Materialize exactly the original BLB plaintext packing for the layer
       // that is about to run, then release it after use.  Keeping all twelve
       // ViT/256 caches resident exceeds host memory; this scheduling changes
@@ -1438,8 +1440,7 @@ int main(int argc, char **argv) {
       const auto layer_setup_start = chrono::steady_clock::now();
       const uint64_t layer_setup_comm0 = bert.current_comm();
       const uint64_t layer_setup_round0 = bert.current_round();
-      if (args.party == sci::ALICE)
-        bert.linear.weights_preprocess_layer(blb_model, layer);
+      edge_cloud.prepare_layer(bert, blb_model, layer);
       bert.io->sync();
       setup_seconds += chrono::duration<double>(chrono::steady_clock::now() -
                                                  layer_setup_start).count();
@@ -1487,14 +1488,15 @@ int main(int argc, char **argv) {
           bert, bert.linear.w_ln_1, layer, args.physical_tokens, kDim);
       FixArray ln1_b = input_layernorm_share(
           bert, bert.linear.b_ln_1, layer, args.physical_tokens, kDim);
-      map<char *, FixArray> ln1 =
-          bert.layer_norm_part1_real(hidden, ln1_w, ln1_b);
+      auto ln1 = edge_cloud.execute_node(layer, "ln1", [&]() {
+        return bert.layer_norm_part1_real(hidden, ln1_w, ln1_b);
+      });
       mask_layernorm_padding(ln1, "block_" + to_string(layer) + "_ln1");
-      if (a0_trace && layer == 0) {
+      if (a0_trace) {
         write_a0_stage(bert, ln1.at("x_flat_avg"),
-                       "block_0_ln1_centered", {kPhysicalTokens, kDim});
+                       "block_" + to_string(layer) + "_ln1_centered", {kPhysicalTokens, kDim});
         write_a0_stage(bert, ln1.at("sigma_flat"),
-                       "block_0_ln1_sigma", {kPhysicalTokens, kDim});
+                       "block_" + to_string(layer) + "_ln1_sigma", {kPhysicalTokens, kDim});
       }
       profile.nonlinear_layernorm_bucket_ms += chrono::duration<double, milli>(
           chrono::steady_clock::now() - ln1_start).count();
@@ -1536,7 +1538,9 @@ int main(int argc, char **argv) {
       const uint64_t assignment_mpc_to_ckks_start =
           bert.mpc_to_ckks_conversions;
       const double he_before_qkv = bert.he_compute_la;
-      const auto qkv_packed = bert.layer_norm_part2_attention(ln1, layer);
+      const auto qkv_packed = edge_cloud.execute_node(layer, "qkv", [&]() {
+        return bert.layer_norm_part2_attention(ln1, layer);
+      });
       profile.linear1_he_ms = (bert.he_compute_la - he_before_qkv) * 1000.0;
       comm.mark("block_" + to_string(layer) + "_qkv_projection_qkt");
 
@@ -1552,7 +1556,7 @@ int main(int argc, char **argv) {
             bert, qk_row, "block_0_qk",
             {kHeads, kPhysicalTokens, kPhysicalTokens});
       }
-      if (a0_trace && layer == 0) {
+      if (a0_trace) {
         if (!bert.a0_qkv_ready)
           throw runtime_error("A0 Q/K/V observer was not populated");
         const FixArray q = a0_projected_tensor_to_token_major(
@@ -1561,14 +1565,14 @@ int main(int argc, char **argv) {
             bert.a0_k_share, bert.party, args.physical_tokens);
         const FixArray observed_v = a0_projected_tensor_to_token_major(
             bert.a0_v_share, bert.party, args.physical_tokens);
-        write_a0_stage(bert, q, "block_0_q", {kPhysicalTokens, kDim});
-        write_a0_stage(bert, k, "block_0_k", {kPhysicalTokens, kDim});
-        write_a0_stage(bert, observed_v, "block_0_v",
+        write_a0_stage(bert, q, "block_" + to_string(layer) + "_q", {kPhysicalTokens, kDim});
+        write_a0_stage(bert, k, "block_" + to_string(layer) + "_k", {kPhysicalTokens, kDim});
+        write_a0_stage(bert, observed_v, "block_" + to_string(layer) + "_v",
                        {kPhysicalTokens, kDim});
         FixArray qk_row(bert.party, qk.size, qk.signed_, qk.ell, qk.s);
         bert.linear.plain_cross_packing_postprocess(
             qk.data, qk_row.data, false, bert.linear.data_lin1_0);
-        write_a0_stage(bert, qk_row, "block_0_qk",
+        write_a0_stage(bert, qk_row, "block_" + to_string(layer) + "_qk",
                        {kHeads, kPhysicalTokens, kPhysicalTokens});
       }
       bert.attention_v_share = std::move(v);
@@ -1576,18 +1580,9 @@ int main(int argc, char **argv) {
       bert.profile_switch(BlbViTProfileStage::SOFTMAX);
 
       const auto softmax_start = chrono::steady_clock::now();
-      if (args.ablation == ours_vit::Ablation::A0) {
-        qk = bert.softmax_he(qk);
-      } else {
-        qk = bert.heterogeneous_attention_norm_a1(
-            qk, protocols, alphas, kLogicalTokens, layer,
-            args.ablation >= ours_vit::Ablation::A2 &&
-                (args.ablation < ours_vit::Ablation::A3 ||
-                 heterogeneous_group_packing),
-            args.ablation >= ours_vit::Ablation::A3);
-      }
-      if (a0_trace && layer == 0)
-        write_a0_stage(bert, qk, "block_0_softmax",
+      qk = edge_cloud.attention_norm(bert, qk, layer, heterogeneous_group_packing);
+      if (a0_trace)
+        write_a0_stage(bert, qk, "block_" + to_string(layer) + "_softmax",
                        {kHeads, kPhysicalTokens, kPhysicalTokens});
       if (hetero_attention_trace && layer == 0)
         write_hetero_attention_stage(
@@ -1644,22 +1639,19 @@ int main(int argc, char **argv) {
       // branch exits at the same CKKS residual boundary that ViT requires;
       // it does not replace any internal operator.
       const double he_before_linear2 = bert.he_compute_la;
-      auto attention_result =
-          args.ablation >= ours_vit::Ablation::A3
-              ? bert.heterogeneous_attention_output_a3_a4(qk, layer)
-              : bert.Softmax_v_linear_layer_norm_part1(qk, layer);
+      auto attention_result = edge_cloud.attention_output(bert, qk, layer);
       profile.linear2_softmax_v_he_ms =
           (bert.he_compute_la - he_before_linear2) * 1000.0;
       bert.pre_norm_attention_output_only = false;
       hidden = attention_result.at("residual");
-      if (a0_trace && layer == 0) {
+      if (a0_trace) {
         if (!bert.a0_av_wo_ready)
           throw runtime_error("A0 AV/W_O observers were not populated");
         const FixArray av = a0_projected_tensor_to_token_major(
             bert.a0_av_share, bert.party, args.physical_tokens);
-        write_a0_stage(bert, av, "block_0_av",
+        write_a0_stage(bert, av, "block_" + to_string(layer) + "_av",
                        {kPhysicalTokens, kDim});
-        write_a0_stage(bert, bert.a0_wo_share, "block_0_wo",
+        write_a0_stage(bert, bert.a0_wo_share, "block_" + to_string(layer) + "_wo",
                        {kPhysicalTokens, kDim});
       }
       if (hetero_attention_trace && layer == 0) {
@@ -1747,8 +1739,8 @@ int main(int argc, char **argv) {
       }
       write_diagnostic_aggregate_max(hidden,
                                      "block_0_attention_residual");
-      if (a0_trace && layer == 0)
-        write_a0_stage(bert, hidden, "block_0_attention_residual",
+      if (a0_trace)
+        write_a0_stage(bert, hidden, "block_" + to_string(layer) + "_attention_residual",
                        {kPhysicalTokens, kDim});
       if (hetero_attention_trace && layer == 0)
         write_hetero_attention_stage(
@@ -1764,8 +1756,9 @@ int main(int argc, char **argv) {
           bert, bert.linear.w_ln_2, layer, args.physical_tokens, kDim);
       FixArray ln2_b = input_layernorm_share(
           bert, bert.linear.b_ln_2, layer, args.physical_tokens, kDim);
-      map<char *, FixArray> ln2 =
-          bert.layer_norm_part1_real(hidden, ln2_w, ln2_b);
+      auto ln2 = edge_cloud.execute_node(layer, "ln2", [&]() {
+        return bert.layer_norm_part1_real(hidden, ln2_w, ln2_b);
+      });
       mask_layernorm_padding(ln2, "block_" + to_string(layer) + "_ln2");
       profile.nonlinear_layernorm_bucket_ms += chrono::duration<double, milli>(
           chrono::steady_clock::now() - ln2_start).count();
@@ -1781,9 +1774,11 @@ int main(int argc, char **argv) {
       // MPC map (centered share + inverse-sigma share + parameters).  The
       // CKKS affine result above is the ViT FFN input, but passing that flat
       // tensor would drop the original BLB LayerNorm hand-off.
-      auto ffn1 = bert.ln_part2_linear3_gelu_part1(ln2, layer);
-      if (a0_trace && layer == 0)
-        write_a0_stage(bert, ffn1.at("x_array"), "block_0_fc1",
+      auto ffn1 = edge_cloud.execute_node(layer, "ffn1", [&]() {
+        return bert.ln_part2_linear3_gelu_part1(ln2, layer);
+      });
+      if (a0_trace)
+        write_a0_stage(bert, ffn1.at("x_array"), "block_" + to_string(layer) + "_fc1",
                        {kPhysicalTokens, kFfDim});
       profile.linear3_he_ms = (bert.he_compute_la - he_before_linear3) * 1000.0;
       bert.pre_norm_ffn_residual_from_external = false;
@@ -1791,9 +1786,11 @@ int main(int argc, char **argv) {
       bert.profile_switch(BlbViTProfileStage::GELU);
 
       const auto gelu_start = chrono::steady_clock::now();
-      FixArray gelu = bert.gelu_nonlinear(ffn1);
-      if (a0_trace && layer == 0)
-        write_a0_stage(bert, gelu, "block_0_gelu",
+      FixArray gelu = edge_cloud.execute_node(layer, "gelu", [&]() {
+        return bert.gelu_nonlinear(ffn1);
+      });
+      if (a0_trace)
+        write_a0_stage(bert, gelu, "block_" + to_string(layer) + "_gelu",
                        {kPhysicalTokens, kFfDim});
       profile.nonlinear_gelu_core_ms = chrono::duration<double, milli>(
           chrono::steady_clock::now() - gelu_start).count();
@@ -1805,12 +1802,14 @@ int main(int argc, char **argv) {
       bert.ffn_residual_ready = true;
       bert.pre_norm_ffn_output_only = true;
       const double he_before_linear4 = bert.he_compute_la;
-      auto ffn2_result = bert.linear4_add_layernorm_part1(gelu, layer);
+      auto ffn2_result = edge_cloud.execute_node(layer, "ffn2", [&]() {
+        return bert.linear4_add_layernorm_part1(gelu, layer);
+      });
       profile.linear4_he_ms = (bert.he_compute_la - he_before_linear4) * 1000.0;
       bert.pre_norm_ffn_output_only = false;
       hidden = ffn2_result.at("residual");
-      if (a0_trace && layer == 0)
-        write_a0_stage(bert, hidden, "block_0_ffn_residual",
+      if (a0_trace)
+        write_a0_stage(bert, hidden, "block_" + to_string(layer) + "_ffn_residual",
                        {kPhysicalTokens, kDim});
       } else {
         cout << "OURS_ATTENTION_PREFIX status=PASS ablation="
@@ -1929,8 +1928,7 @@ int main(int argc, char **argv) {
       const auto release_start = chrono::steady_clock::now();
       const uint64_t release_comm0 = bert.current_comm();
       const uint64_t release_round0 = bert.current_round();
-      if (args.party == sci::ALICE)
-        bert.linear.release_preprocessed_layer(layer);
+      edge_cloud.release_layer(bert, layer, diagnostic_stop_after_attention);
       bert.io->sync();
       setup_seconds += chrono::duration<double>(chrono::steady_clock::now() -
                                                  release_start).count();
@@ -2145,7 +2143,9 @@ int main(int argc, char **argv) {
          << "Prediction: " << prediction << '\n'
          << "OURS_VIT_RUNTIME status=PASS ablation="
          << ours_vit::to_string(args.ablation)
-         << " full_structure=1 protocol_substitution="
+         << " full_structure=" << (args.stop_after_block == kLayers ? 1 : 0)
+         << " executed_blocks=" << args.stop_after_block
+         << " protocol_substitution="
          << (args.ablation == ours_vit::Ablation::A0 ? 0 : 1)
          << " selective_conversion="
          << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0)

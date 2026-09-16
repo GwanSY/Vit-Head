@@ -1267,7 +1267,7 @@ int main(int argc, char **argv) {
     adapter.linear.he_onetime = &division_he;
     const FixArray division_output = adapter.div_batch_he_V2(
         division_nm_local, division_dn_local, kDivisionBatch, kBits, kScale,
-        false);
+        false, true);
     vector<uint64_t> division_remote;
     exchange_vector(io, party,
                     vector<uint64_t>(

@@ -5,6 +5,13 @@
 baseline 直接建立的 clean fork，不复用旧 OURS 的 65-token CKKS 原型、
 BFV/BOLT adapter、head assignment 或异构内核。
 
+端云执行架构现在直接接入 `ours_vit_b16` 原生模型：端云角色、公开静态计划、
+逐层准备与协同执行都由 C++ `EdgeCloudRuntime` 管理，现有头级异构密码算子不变。
+后续模型修改沿用该执行接口。实现、构建与验证边界见
+[原生端云架构说明](blb_base/ours_vit_b16/EDGE_CLOUD.md)。运行程序统一为
+`build/container-gpu/bin/ours_vit_b16_main`，不再选择 `fast/exact` 转换模式。
+旧程序及清理前源码已归档；性能和数值是否通过以完整回归结果为准。
+
 ## 当前布局
 
 - `blb_base/gpu/SCI`：BLB 使用的 SCI、Phantom GPU 和 CKKS/MPC 后端。
@@ -31,10 +38,21 @@ bash scripts/build_vit_b16.sh
 构建目标：
 
 ```text
-blb_base/build/gpu/bin/ckks_vit_b16_main       # 不可变 A0
-blb_base/build/gpu/bin/ours_vit_b16_main      # 新异构开发线
-blb_base/build/gpu/bin/ours_vit_hetero_plan_test
+blb_base/build/container-gpu/bin/ours_vit_b16_main
+blb_base/build/container-gpu/bin/ours_vit_hetero_plan_test
+blb_base/build/container-gpu/bin/ours_vit_edge_cloud_test
 ```
+
+统一入口及配置为 `scripts/run_vit.py` 和 `ours_vit_b16/experiments/HAP-ViT.json`。
+在上述工作目录中，指定两张物理显卡运行完整 A0 回归：
+
+```bash
+python3 -B scripts/run_vit.py --gpus 4 6 \
+  --output-dir outputs/runtime_cleanup_20260916/a0_gpu4_gpu6
+```
+
+当前配置关闭头异构，执行全部 12 层 Softmax。运行结束自动核对明文、定点和
+安全推理结果，写入 `native/validation.json`，单独报告与 498.103927 秒的差异。
 
 ## A0–A4
 
