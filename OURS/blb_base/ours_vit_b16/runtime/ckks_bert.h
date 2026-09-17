@@ -394,7 +394,7 @@ public:
                                   HE_CKKS *he);
 
     // size是slot_num
-    vector<Plaintext> mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>> &input, int slot, uint64_t Q, int bit_out, int s_in, int s_out, HE_CKKS* he, bool half=false);
+    vector<Plaintext> mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>> &input, int slot, uint64_t Q, int bit_out, int s_in, int s_out, HE_CKKS* he, bool half=false, bool known_nonnegative=false);
 
     // Before Algorithm 1, align to the CKKS conversion scale and
     // modulus-switch to the final single-prime level. ckks_to_mpc performs
@@ -407,8 +407,11 @@ public:
     inline void mpc_to_ckks(vector<UnifiedPlaintext> &out,
                             const vector<vector<HE_CKKS::scalar_t>> &in, int slot,
                             uint64_t Q, int bit_out, int s_in, int s_out,
-                            HE_CKKS *he, bool half = false) {
-        vector<Plaintext> tmp = std::move(mpc_to_ckks(in, slot, Q, bit_out, s_in, s_out, he, half));
+                            HE_CKKS *he, bool half = false,
+                            bool known_nonnegative = false) {
+        vector<Plaintext> tmp = std::move(mpc_to_ckks(
+            in, slot, Q, bit_out, s_in, s_out, he, half,
+            known_nonnegative));
         out.resize(tmp.size());
         for (size_t i = 0;i < out.size();i ++) {
             out[i] = std::move(tmp[i]);
@@ -435,7 +438,7 @@ public:
 
     FixArray div_batch_he(const FixArray& nm, const FixArray& dn, int batch_dn_size, int l_out, int s_out, bool normalized_dn = false);
 
-    FixArray div_batch_he_V2(const FixArray& nm, const FixArray& dn, int batch_dn_size, int l_out, int s_out, bool normalized_dn = false, bool softmax_denominator = false);
+    FixArray div_batch_he_V2(const FixArray& nm, const FixArray& dn, int batch_dn_size, int l_out, int s_out, bool normalized_dn = false, bool softmax_denominator = false, bool compact_softmax_denominator = false);
 
     FixArray element_wise_mul(FixArray x, FixArray y);
 

@@ -163,7 +163,7 @@ void import_target_scale(Bert_ckks &owner,
     }
     vector<Plaintext> host_plaintexts = owner.mpc_to_ckks(
         shares, slot, he->get_conversion_prime(), ell, input_scale,
-        target_scale, he, false);
+        target_scale, he, false, string(stage) == "softmax");
     owner.profile_set_conversion_bucket(previous_conversion_bucket);
     const auto first_data = he->context->first_context_data();
     if (host_plaintexts.empty() || !first_data) {

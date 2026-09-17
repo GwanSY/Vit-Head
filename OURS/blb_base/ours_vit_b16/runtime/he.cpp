@@ -2,6 +2,7 @@
 #include "wide_fft_math.h"
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace {
 
@@ -708,6 +709,25 @@ vector<HE_CKKS::wide_complex_t> HE_CKKS::ckks_encode_wide(
                             inverse_degree_scale);
 }
 
+vector<HE_CKKS::wide_complex_t> HE_CKKS::ckks_encode_wide(
+    vector<wide_complex_t> &&x, int degree, int working_ell) const {
+    if (degree <= 0 || x.size() != static_cast<size_t>(degree) ||
+        (degree & (degree - 1)) != 0 || fft_scale <= 0) {
+        throw invalid_argument("invalid wide CKKS encode metadata");
+    }
+    const int width = working_ell > 0 ? working_ell : 43 + 40;
+    if (width <= 1 || width >= 127 || width + fft_scale >= 255) {
+        throw invalid_argument("wide CKKS encode exceeds integer width");
+    }
+    const scalar_t inverse_degree_scale =
+        EncodeToFxp<scalar_t>(1.0 / static_cast<double>(degree), fft_scale);
+    if (inverse_degree_scale == 0) {
+        throw invalid_argument("wide CKKS encode inverse scale rounded to zero");
+    }
+    return wide_fft_inverse(std::move(x), width, fft_scale,
+                            inv_root_powers_2n_scaled,
+                            inverse_degree_scale);
+}
 #if 0 // Removed experimental public-field FFT; paper Algorithm 2 uses local Encode then ring-to-field.
 namespace {
 

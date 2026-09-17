@@ -357,10 +357,12 @@ int main(int argc, char **argv) {
     bool passed = true;
     for (int width : {100, 120}) {
       const auto start = chrono::steady_clock::now();
+      const uint64_t comm_before = adapter.current_comm();
       adapter.nonlinear.centered_field_to_ring_wide(
           adapter.nonlinear.active_workers(), input.data(), q, low.data(),
           high.data(), count, width);
       const double seconds = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+      const uint64_t conversion_bytes = adapter.current_comm() - comm_before;
       if (party == sci::ALICE) {
         io.send_data(low.data(), count * sizeof(uint64_t));
         io.send_data(high.data(), count * sizeof(uint64_t));
@@ -381,7 +383,8 @@ int main(int argc, char **argv) {
       }
       passed &= errors == 0;
       cout << "A0_PUBLIC_CENTERED_WIDE width=" << width << " samples=" << count
-           << " errors=" << errors << " seconds=" << seconds << endl;
+           << " errors=" << errors << " seconds=" << seconds
+           << " comm_bytes=" << conversion_bytes << endl;
     }
     cout << "A0_PUBLIC_CENTERED_WIDE status=" << (passed ? "PASS" : "FAIL") << endl;
     return passed ? 0 : 1;

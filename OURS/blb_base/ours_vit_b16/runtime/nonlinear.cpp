@@ -960,41 +960,63 @@ static void centered_field_to_ring_wide_thread(
     fix->aux->wrap_computation_prime(
         shifted.data(), wrap.data(), size, field_bits, p);
 
-    // If w = wa XOR wb is the prime wrap, convert q*w directly into
-    // the wide ring using full-width random OT pads. This avoids a second
-    // comparison to extend an intermediate narrow-ring sharing.
-    unique_ptr<emp::block[]> pad0(new emp::block[size]);
-    vector<__uint128_t> correction(size);
+    // If w = wa XOR wb is the prime wrap, the conversion needs an arithmetic
+    // sharing of w in the target ring.  The old implementation used
+    // send_ot_rm_cc plus an explicit 128-bit correction for every coefficient.
+    // That correction dominated CKKS-to-MPC traffic.  Generate the same
+    // arithmetic sharing with two fixed-width COTs instead:
+    //   r1 = r0 - 2*wa (mod 2^target_bitwidth).
+    // The low 64-bit COT is followed by a high-limb COT whose correlation
+    // includes the low-limb borrow.  Thus the concatenated random values obey
+    // the relation exactly, with no per-element __uint128_t correction.
+    const int high_bits = target_bitwidth - 64;
+    if (high_bits <= 0 || high_bits >= 64) {
+        throw invalid_argument("wide field conversion requires 65..127 bits");
+    }
+    const uint64_t high_mask = (uint64_t{1} << high_bits) - uint64_t{1};
+    vector<uint64_t> random_low(size), random_high(size);
+    vector<uint64_t> correlation_low(size), correlation_high(size);
     if (sender) {
-        unique_ptr<emp::block[]> pad1(new emp::block[size]);
-        fix->otpack->iknp_straight->send_ot_rm_cc(
-            pad0.get(), pad1.get(), size);
         for (int i = 0; i < size; ++i) {
-            __uint128_t r0, r1;
-            memcpy(&r0, &pad0[i], sizeof(r0));
-            memcpy(&r1, &pad1[i], sizeof(r1));
-            correction[i] = (r0 - r1 + (wrap[i] ? -__uint128_t(p)
-                                                               : p)) & mask;
-            const __uint128_t value =
-                (shifted[i] - __uint128_t(p) * wrap[i] + r0 - center) & mask;
-            output_low[i] = uint64_t(value);
-            output_high[i] = uint64_t(value >> 64);
+            correlation_low[i] = wrap[i] ? (uint64_t{0} - 2) : 0;
         }
-        fix->iopack->io->send_data(correction.data(), size * sizeof(__uint128_t));
+        fix->otpack->iknp_straight->send_cot(
+            random_low.data(), correlation_low.data(), size, 64);
+
+        // Subtracting two from the low limb borrows exactly when the sender's
+        // random low limb is 0 or 1.  The high correlation is therefore -1
+        // only for wa=1 and that sender-local borrow event.
+        for (int i = 0; i < size; ++i) {
+            correlation_high[i] =
+                (wrap[i] && random_low[i] < 2) ? high_mask : 0;
+        }
+        fix->otpack->iknp_straight->send_cot(
+            random_high.data(), correlation_high.data(), size, high_bits);
     } else {
-        unique_ptr<bool[]> choice(new bool[size]);
-        for (int i = 0; i < size; ++i) choice[i] = wrap[i] != 0;
-        fix->otpack->iknp_straight->recv_ot_rm_cc(
-            pad0.get(), choice.get(), size);
-        fix->iopack->io->recv_data(correction.data(), size * sizeof(__uint128_t));
-        for (int i = 0; i < size; ++i) {
-            __uint128_t r;
-            memcpy(&r, &pad0[i], sizeof(r));
-            const __uint128_t value =
-                (shifted[i] - r - (choice[i] ? correction[i] : 0)) & mask;
-            output_low[i] = uint64_t(value);
-            output_high[i] = uint64_t(value >> 64);
-        }
+        const bool *choice = reinterpret_cast<const bool *>(wrap.data());
+        fix->otpack->iknp_straight->recv_cot(
+            random_low.data(), choice, size, 64);
+        fix->otpack->iknp_straight->recv_cot(
+            random_high.data(), choice, size, high_bits);
+    }
+
+    for (int i = 0; i < size; ++i) {
+        const __uint128_t random =
+            (static_cast<__uint128_t>(random_high[i]) << 64) |
+            random_low[i];
+        const __uint128_t arithmetic_wrap = sender
+            ? (static_cast<__uint128_t>(wrap[i]) - random) & mask
+            : (static_cast<__uint128_t>(wrap[i]) + random) & mask;
+        // Multiplication by the public 60-bit prime is reduced modulo the
+        // target ring.  Unsigned __uint128_t overflow only discards bits above
+        // 127, which are already outside the target's <=127-bit mask.
+        const __uint128_t product =
+            (static_cast<__uint128_t>(p) * arithmetic_wrap) & mask;
+        __uint128_t value =
+            (static_cast<__uint128_t>(shifted[i]) - product) & mask;
+        if (sender) value = (value - center) & mask;
+        output_low[i] = static_cast<uint64_t>(value);
+        output_high[i] = static_cast<uint64_t>(value >> 64);
     }
 }
 
@@ -1040,6 +1062,21 @@ static void ring_extend_wide_zero_thread(
       num_ops, input, output_low, output_high, bitwidth, target_bitwidth);
 }
 
+static void ring_extend_wide_nonnegative_thread(
+    int tid, int party, uint64_t *input, uint64_t *output_low,
+    uint64_t *output_high, int num_ops, int bitwidth, int target_bitwidth,
+    FPMath *fpmath) {
+  (void)tid;
+  (void)party;
+  // This is the BLB fast-path contract: the reconstructed l-bit value has
+  // public MSB zero.  MSB_to_Wrap then computes the share carry with its
+  // two-bit LUT instead of the generic exact wrap comparison.
+  std::vector<uint8_t> all_zero_msb(static_cast<size_t>(num_ops), 0);
+  fpmath->fix->xt->z_extend_wide(
+      num_ops, input, output_low, output_high, bitwidth, target_bitwidth,
+      all_zero_msb.data());
+}
+
 void NonLinear::ring_extend_wide(int nthreads, uint64_t* input,
                                  uint64_t* output_low,
                                  uint64_t* output_high, int size,
@@ -1058,6 +1095,30 @@ void NonLinear::ring_extend_wide(int nthreads, uint64_t* input,
         if (count == 0) continue;
     threads.emplace_back(
         ring_extend_wide_thread, i, party, input + offset,
+            output_low + offset, output_high + offset, count, bitwidth,
+            target_bitwidth, this->fpmath[i]);
+    }
+    for (auto &thread : threads) thread.join();
+}
+
+void NonLinear::ring_extend_wide_nonnegative(
+    int nthreads, uint64_t* input, uint64_t* output_low,
+    uint64_t* output_high, int size, int bitwidth, int target_bitwidth) {
+    if (nthreads <= 0 || nthreads > MAX_THREADS || size <= 0 ||
+        bitwidth <= 1 || bitwidth >= 64 || target_bitwidth <= bitwidth ||
+        target_bitwidth > 127) {
+        throw std::invalid_argument(
+            "invalid wide nonnegative extension dimensions");
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(nthreads));
+    const int chunk_size = size / nthreads;
+    for (int i = 0; i < nthreads; ++i) {
+        const int offset = i * chunk_size;
+        const int count = (i == nthreads - 1) ? size - offset : chunk_size;
+        if (count == 0) continue;
+        threads.emplace_back(
+            ring_extend_wide_nonnegative_thread, i, party, input + offset,
             output_low + offset, output_high + offset, count, bitwidth,
             target_bitwidth, this->fpmath[i]);
     }

@@ -52,6 +52,17 @@ int blb_conversion_threads() {
     }
     return static_cast<int>(parsed);
 }
+int blb_c2m_headroom_bits() {
+    const char *value = std::getenv("OURS_VIT_C2M_HEADROOM_BITS");
+    if (value == nullptr || *value == '\0') return 24;
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 16 || parsed > 40) {
+        throw std::invalid_argument(
+            "OURS_VIT_C2M_HEADROOM_BITS must be an integer in [16,40]");
+    }
+    return static_cast<int>(parsed);
+}
 
 bool blb_secure_exp_clamp_enabled() {
     const char *value = std::getenv("OURS_VIT_SECURE_EXP_CLAMP");
@@ -408,11 +419,18 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext>
         // cout << "i:" << i << endl;
         x_intt[i] = he->ckks_intt(pts[i]);
     }
-    vector<HE_CKKS::scalar_t> x_intt_flatten_field;
-    x_intt_flatten_field.reserve(x_intt.size() * x_intt[0].size());
-    // #pragma omp parallel for
-    for(int i=0;i<x_intt.size();i++){
-        for(int j=0;j<x_intt[i].size();j++){
+    const size_t coefficients_per_plain = x_intt[0].size();
+    if (coefficients_per_plain != static_cast<size_t>(degree)) {
+        throw runtime_error("CKKS-to-MPC inverse FFT degree mismatch");
+    }
+    // Pre-size the batch so coefficient canonicalization does not serialize
+    // on vector::push_back.  Every output cell has one owner, so this remains
+    // bit-for-bit identical to the old flattening loop.
+    vector<HE_CKKS::scalar_t> x_intt_flatten_field(
+        x_intt.size() * coefficients_per_plain);
+#pragma omp parallel for num_threads(num_threads)
+    for(int i=0;i<static_cast<int>(x_intt.size());i++){
+        for(size_t j=0;j<coefficients_per_plain;j++){
             // ckks_intt returns centered coefficients through a uint64_t
             // container.  Negative coefficients therefore arrive in
             // two's-complement form; Algorithm 1's field share must instead
@@ -431,7 +449,8 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext>
             } else {
                 canonical = raw % conversion_prime;
             }
-            x_intt_flatten_field.push_back(canonical);
+            x_intt_flatten_field[static_cast<size_t>(i) *
+                                 coefficients_per_plain + j] = canonical;
         }
     }
     cout << "CKKS_INTT_FIELD_CANONICAL status=PASS range=[0,q) q="
@@ -461,13 +480,19 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext>
     // before the FFT discards the high bits that must be removed exactly once
     // when changing the CKKS scale from s_in to s_out.
     const int source_ring_bits = field_ring_bits;
-    const int working_bits = source_ring_bits + 40;
+    const int c2m_headroom_bits = blb_c2m_headroom_bits();
+    const int working_bits = source_ring_bits + c2m_headroom_bits;
     if (output_ring_bits <= 1 || output_ring_bits >= 63 ||
         source_ring_bits <= output_ring_bits || source_ring_bits >= 64 ||
         working_bits <= source_ring_bits || working_bits >= 127) {
         throw runtime_error("invalid BLB CKKS-to-MPC working ring");
     }
     const uint64_t center_offset = (conversion_prime - 1) / 2;
+    // Keep the prime-field coefficient at its natural width before the FFT.
+    // The conversion uses a 64-bit low COT limb plus a configured high limb
+    // in NonLinear; reducing that limb preserves the exact prime-wrap result
+    // while shrinking only the wide working representation.
+    // This avoids the generic 60->100 extension's larger per-worker workspace.
     vector<uint64_t> wide_low(x_intt_flatten_field.size());
     vector<uint64_t> wide_high(x_intt_flatten_field.size());
     nonlinear.centered_field_to_ring_wide(
@@ -483,27 +508,29 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext>
          << " source_scale=" << s_in << " target_scale=" << s_out
          << " secure_truncate_bits=" << (s_in - s_out)
          << " working_ell=" << working_bits
-         << " protocol=fused_prime_wrap"
+         << " protocol=prime_wrap_then_split_wide_b2a"
+         << "headroom_bits=" << c2m_headroom_bits
          << " workers=" << blb_conversion_threads() << endl;
 
-    vector<vector<HE_CKKS::wide_complex_t>> x_decode(pts.size());
-    for (size_t i = 0; i < pts.size(); ++i) {
-        x_decode[i].resize(static_cast<size_t>(degree));
-        for (int j = 0; j < degree; ++j) {
-            const size_t index =
-                i * static_cast<size_t>(degree) + static_cast<size_t>(j);
-            x_decode[i][j].real =
-                (static_cast<__uint128_t>(wide_high[index]) << 64) |
-                wide_low[index];
-            x_decode[i][j].imag = 0;
-        }
-    }
-    cout << "pts.size():" << pts.size() << endl;
     vector<vector<HE_CKKS::scalar_t>> y(pts.size());
 #pragma omp parallel for num_threads(num_threads)
     for(int i=0;i<static_cast<int>(pts.size());i++){
+        // Build each wide FFT input on the worker that consumes it.  This
+        // removes a second batch-sized temporary and parallelizes the former
+        // serial wide-word assembly without changing any arithmetic.
+        vector<HE_CKKS::wide_complex_t> x_decode(
+            static_cast<size_t>(degree));
+        for (int j = 0; j < degree; ++j) {
+            const size_t index =
+                static_cast<size_t>(i) * static_cast<size_t>(degree) +
+                static_cast<size_t>(j);
+            x_decode[j].real =
+                (static_cast<__uint128_t>(wide_high[index]) << 64) |
+                wide_low[index];
+            x_decode[j].imag = 0;
+        }
         y[i] = he->ckks_decode_wide(
-            x_decode[i], degree, output_ring_bits, s_in, s_out, half,
+            x_decode, degree, output_ring_bits, s_in, s_out, half,
             working_bits);
         // ckks_decode_wide returns ring words, not signed host integers.  Keep
         // the ABI invariant explicit at this boundary: every local additive
@@ -650,7 +677,10 @@ void Bert_ckks::mask_ckks_to_mpc_inplace(
            这里s_out > s_in (41 vs 30)
 		3. 本地做ntt
 */
-vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>> & x, int slot, uint64_t Q, int bitwidth, int s_in, int s_out, HE_CKKS* he, bool half){
+vector<Plaintext> Bert_ckks::mpc_to_ckks(
+    const vector<vector<HE_CKKS::scalar_t>> & x, int slot, uint64_t Q,
+    int bitwidth, int s_in, int s_out, HE_CKKS* he, bool half,
+    bool known_nonnegative){
     const bool profile_conversion = profile_enabled_;
     const auto conversion_bucket = profile_conversion_bucket_;
     const uint64_t conversion_comm_before =
@@ -684,10 +714,12 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
         }
     }
 
-    // Extend once before Encode. Except for the usual 2^-40 boundary event,
-    // unsigned shares sum to 2^sharing_bits + signed(input). Subtract that
-    // public origin on Alice, then retain the resulting signed integers
-    // throughout the local FFT. No second coefficient carry is introduced.
+    // Extend once before Encode. The conversion API receives additive shares
+    // in the unsigned sharing ring, while the CKKS encoder consumes the
+    // signed representative of their reconstruction. This public origin
+    // correction is required for both extension protocols: the non-negative
+    // shortcut changes only how the wide MSB/wrap is obtained, not the
+    // encoder's signed share convention.
     const size_t slot_elements = x.size() * static_cast<size_t>(slot);
     vector<uint64_t> slot_ring(slot_elements);
     for (size_t ct = 0; ct < x.size(); ++ct) {
@@ -695,9 +727,17 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
              slot_ring.begin() + ct * static_cast<size_t>(slot));
     }
     vector<uint64_t> slot_low(slot_elements), slot_high(slot_elements);
-    nonlinear.ring_extend_wide(
-        blb_conversion_threads(), slot_ring.data(), slot_low.data(), slot_high.data(),
-        static_cast<int>(slot_elements), bitwidth, sharing_bits);
+    if (known_nonnegative) {
+        nonlinear.ring_extend_wide_nonnegative(
+            blb_conversion_threads(), slot_ring.data(), slot_low.data(),
+            slot_high.data(), static_cast<int>(slot_elements), bitwidth,
+            sharing_bits);
+    } else {
+        nonlinear.ring_extend_wide(
+            blb_conversion_threads(), slot_ring.data(), slot_low.data(),
+            slot_high.data(), static_cast<int>(slot_elements), bitwidth,
+            sharing_bits);
+    }
 
     // The input shares arrive at scale s_in.  A fixed-point FFT rounds every
     // public-twiddle product, so running it directly at s_in accumulates the
@@ -718,32 +758,10 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
         slot_high[index] = static_cast<uint64_t>(lifted >> 64);
     }
 
-    vector<vector<HE_CKKS::wide_complex_t>> encoded_wide(x.size());
-    #pragma omp parallel for num_threads(thread_num)
-    for (int i = 0; i < static_cast<int>(x.size()); ++i) {
-        vector<HE_CKKS::wide_complex_t> encoded_input(
-            static_cast<size_t>(poly_degree));
-        for (int j = 0; j < slot; ++j) {
-            const size_t flat = static_cast<size_t>(i) * slot + j;
-            const __uint128_t value =
-                (static_cast<__uint128_t>(slot_high[flat]) << 64) |
-                slot_low[flat];
-            const size_t real_index = he->matrix_reps_index_map_[j];
-            const size_t conjugate_index =
-                he->matrix_reps_index_map_[j + slot];
-            encoded_input[real_index].real = value;
-            encoded_input[conjugate_index].real = value;
-        }
-        encoded_wide[i] =
-            he->ckks_encode_wide(encoded_input, poly_degree, working_bits);
-    }
-
     // Real CKKS slots imply a[N-j] = -a[j] and a[N/2] = 0.
     // Convert only the independent coefficients, then restore symmetry in
     // each RNS prime. Complex (half) inputs retain the complete polynomial.
     const int independent_coefficients = half ? poly_degree : slot;
-    const size_t coefficient_elements =
-        x.size() * static_cast<size_t>(independent_coefficients);
     // CKKS plaintexts at the first context are RNS polynomials.  The old
     // adapter converted the share once modulo the final-prime Q and then
     // passed that same uint64 residue to every RNS limb.  That is not a
@@ -768,50 +786,69 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
         throw runtime_error(
             "MPC-to-CKKS optimized RNS conversion cannot lower scale");
     }
-    vector<vector<HE_CKKS::scalar_t>> encode_field_by_limb(
-        rns_moduli.size(),
-        vector<HE_CKKS::scalar_t>(coefficient_elements));
+    // The old implementation materialized both [ciphertext][coefficient]
+    // wide FFT output and [RNS limb][coefficient] field shares before doing
+    // the NTT.  Those buffers are large and force three full-batch passes.
+    // Keep the exact same per-coefficient reduction, but fuse encode,
+    // per-prime reduction, symmetry restoration, and NTT per ciphertext.
+    // This is local work only; the single ring-to-field protocol above is
+    // unchanged.
+    vector<__uint128_t> scale_factors(rns_moduli.size());
+    vector<__uint128_t> wrap_corrections(rns_moduli.size());
+    const auto pow_two_mod = [](const __uint128_t modulus, int exponent) {
+        __uint128_t base = 2 % modulus;
+        __uint128_t result = 1 % modulus;
+        while (exponent > 0) {
+            if (exponent & 1) result = (result * base) % modulus;
+            exponent >>= 1;
+            if (exponent > 0) base = (base * base) % modulus;
+        }
+        return result;
+    };
     for (size_t limb = 0; limb < rns_moduli.size(); ++limb) {
         const __uint128_t modulus = rns_moduli[limb].value();
-        const auto pow_two_mod = [modulus](int exponent) {
-            __uint128_t base = 2 % modulus;
-            __uint128_t result = 1 % modulus;
-            while (exponent > 0) {
-                if (exponent & 1) result = (result * base) % modulus;
-                exponent >>= 1;
-                if (exponent > 0) base = (base * base) % modulus;
-            }
-            return result;
-        };
-        const __uint128_t scale_factor = pow_two_mod(scale_shift);
-        const __uint128_t wrap_correction =
-            pow_two_mod(working_bits + scale_shift);
-        auto &field_shares = encode_field_by_limb[limb];
-#pragma omp parallel for num_threads(thread_num)
-        for (int index = 0; index < static_cast<int>(coefficient_elements);
-             ++index) {
-            const __uint128_t wide = encoded_wide[
-                index / independent_coefficients][
-                index % independent_coefficients].real & working_mask;
-            __uint128_t local =
-                ((wide % modulus) * scale_factor) % modulus;
-            if ((wide >> (working_bits - 1)) != 0) {
-                local = (local + modulus - wrap_correction) % modulus;
-            }
-            field_shares[index] = static_cast<uint64_t>(local);
-        }
+        scale_factors[limb] = pow_two_mod(modulus, scale_shift);
+        wrap_corrections[limb] =
+            pow_two_mod(modulus, working_bits + scale_shift);
     }
     vector<Plaintext> y(x.size());
-    #pragma omp parallel for num_threads(thread_num)
-    for(int i=0;i<x.size();i++){
+    const double ckks_scale = ldexp(1.0, s_out);
+#pragma omp parallel for num_threads(thread_num)
+    for (int i = 0; i < static_cast<int>(x.size()); ++i) {
+        vector<HE_CKKS::wide_complex_t> encoded_input(
+            static_cast<size_t>(poly_degree));
+        for (int j = 0; j < slot; ++j) {
+            const size_t flat = static_cast<size_t>(i) * slot + j;
+            const __uint128_t value =
+                (static_cast<__uint128_t>(slot_high[flat]) << 64) |
+                slot_low[flat];
+            const size_t real_index = he->matrix_reps_index_map_[j];
+            const size_t conjugate_index =
+                he->matrix_reps_index_map_[j + slot];
+            encoded_input[real_index].real = value;
+            encoded_input[conjugate_index].real = value;
+        }
+        auto encoded =
+            he->ckks_encode_wide(std::move(encoded_input), poly_degree,
+                                 working_bits);
         vector<vector<HE_CKKS::scalar_t>> x_encode_rns(
             rns_moduli.size(), vector<HE_CKKS::scalar_t>(poly_degree));
         for (size_t limb = 0; limb < rns_moduli.size(); ++limb) {
-            copy(encode_field_by_limb[limb].begin() +
-                     static_cast<size_t>(i) * independent_coefficients,
-                 encode_field_by_limb[limb].begin() +
-                     static_cast<size_t>(i + 1) * independent_coefficients,
-                 x_encode_rns[limb].begin());
+            const __uint128_t modulus = rns_moduli[limb].value();
+            const __uint128_t scale_factor = scale_factors[limb];
+            const __uint128_t wrap_correction = wrap_corrections[limb];
+            for (int coefficient = 0;
+                 coefficient < independent_coefficients; ++coefficient) {
+                const __uint128_t wide =
+                    encoded[coefficient].real & working_mask;
+                __uint128_t local =
+                    ((wide % modulus) * scale_factor) % modulus;
+                if ((wide >> (working_bits - 1)) != 0) {
+                    local = (local + modulus - wrap_correction) % modulus;
+                }
+                x_encode_rns[limb][coefficient] =
+                    static_cast<uint64_t>(local);
+            }
             if (!half) {
                 const uint64_t prime = rns_moduli[limb].value();
                 for (int j = 1; j < slot; ++j) {
@@ -821,7 +858,7 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
                 }
             }
         }
-        he->ckks_ntt_rns(x_encode_rns, pow(2, s_out), y[i]);
+        he->ckks_ntt_rns(x_encode_rns, ckks_scale, y[i]);
     }
     cout << "BLB_RING_TO_FIELD_WIDE status=PASS input_bits=" << bitwidth
          << " extension_bits=" << sharing_bits
@@ -832,9 +869,10 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(const vector<vector<HE_CKKS::scalar_t>>
          << " lifted_input_scale=" << encode_scale
          << " rns_limbs=" << rns_moduli.size()
          << " secure_slot_extensions=1 interactive_rns_extensions=0"
+         << " known_nonnegative=" << (known_nonnegative ? 1 : 0)
          << " independent_coefficients_per_ciphertext=" << independent_coefficients
          << " real_coefficient_symmetry=" << (!half ? 1 : 0)
-         << " encode=integer_fft_then_local_reduce_per_prime" << endl;
+         << " encode=integer_fft_then_local_reduce_per_prime_fused" << endl;
     mpc_to_ckks_conversions += x.size();
     cout << "mpc_to_ckks done" << endl;
 	if (profile_conversion) {
@@ -855,6 +893,14 @@ void Bert_ckks::prepare_ckks_to_mpc_inplace(
     size_t source_limbs = 0;
     double source_scale_bits = 0.0;
     size_t rescaled_ciphertexts = 0;
+    struct PublicUnitCacheEntry {
+        parms_id_type parms_id;
+        double scale;
+        Plaintext plaintext;
+    };
+    vector<PublicUnitCacheEntry> public_unit_cache;
+    size_t public_unit_cache_hits = 0;
+    size_t public_unit_encodes = 0;
 
     for (size_t index = 0; index < ciphertexts.size(); ++index) {
         Ciphertext &ciphertext = ciphertexts[index];
@@ -884,10 +930,26 @@ void Bert_ckks::prepare_ckks_to_mpc_inplace(
                 throw runtime_error(
                     "CKKS-to-MPC public-unit scale is not encodable");
             }
-            Plaintext public_unit;
-            he->encoder->encode(public_one, ciphertext.parms_id(),
-                                unit_plain_scale, public_unit);
-            he->evaluator->multiply_plain_inplace(ciphertext, public_unit);
+            const Plaintext *public_unit = nullptr;
+            for (auto &entry : public_unit_cache) {
+                if (entry.parms_id == ciphertext.parms_id() &&
+                    entry.scale == unit_plain_scale) {
+                    public_unit = &entry.plaintext;
+                    ++public_unit_cache_hits;
+                    break;
+                }
+            }
+            if (public_unit == nullptr) {
+                PublicUnitCacheEntry entry;
+                entry.parms_id = ciphertext.parms_id();
+                entry.scale = unit_plain_scale;
+                he->encoder->encode(public_one, ciphertext.parms_id(),
+                                    unit_plain_scale, entry.plaintext);
+                public_unit_cache.push_back(std::move(entry));
+                public_unit = &public_unit_cache.back().plaintext;
+                ++public_unit_encodes;
+            }
+            he->evaluator->multiply_plain_inplace(ciphertext, *public_unit);
             ++this->he_rescale_count;
             he->evaluator->rescale_to_next_inplace(ciphertext);
             ++rescaled_ciphertexts;
@@ -916,6 +978,8 @@ void Bert_ckks::prepare_ckks_to_mpc_inplace(
          << " source_scale_bits=" << source_scale_bits
          << " target_limbs=1 target_scale_bits=" << target_scale_bits
          << " unit_plaintext=real_1 rescaled_cts=" << rescaled_ciphertexts
+         << " unit_plaintext_encodes=" << public_unit_encodes
+         << " unit_plaintext_cache_hits=" << public_unit_cache_hits
          << endl;
 }
 
@@ -2268,8 +2332,12 @@ FixArray Bert_ckks::div_batch_he(const FixArray& nm, const FixArray& dn, int bat
 }
 
 // bumblebee's version
-FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int batch_dn_size, int l_out, int s_out, bool normalized_dn, bool softmax_denominator){
-    assert(nm.size == dn.size * batch_dn_size);
+FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int batch_dn_size, int l_out, int s_out, bool normalized_dn, bool softmax_denominator, bool compact_softmax_denominator){
+    if (batch_dn_size <= 0 ||
+        static_cast<size_t>(dn.size) * static_cast<size_t>(batch_dn_size) !=
+            static_cast<size_t>(nm.size)) {
+        throw invalid_argument("division batch shape mismatch");
+    }
     const auto previous_conversion_bucket = profile_conversion_bucket();
     const uint64_t rec_comm_before = profile_is_enabled() ? current_comm() : 0;
     profile_set_conversion_bucket(BlbViTCommAuditBucket::SOFTMAX_REC_CONVERSION);
@@ -2281,6 +2349,38 @@ FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int 
     if (softmax_denominator && (dn.s < 1 || reciprocal_ell >= dn.ell ||
                                l_out + nm.s + dn.s - s_out > nm.ell + reciprocal_ell))
         throw invalid_argument("invalid bounded Softmax reciprocal metadata");
+
+    // A shifted Softmax exponential is at most one on the production BLB
+    // domain.  The reciprocal path already relies on that bound (with a
+    // factor-three approximation guard); carry the row-size bound into the
+    // local ring metadata before sqrt.  `reduce` is purely local, so this
+    // removes high zero/sign-extension bits from MSNZB/B2A and the following
+    // fixed-point products without changing a protocol message or a value in
+    // the valid domain.  If an unusually large row cannot be represented by a
+    // safe public bound, retain the old wide path.
+    int reciprocal_input_ell = dn.ell;
+    FixArray bounded_dn;
+    bool denominator_reduced = false;
+    if (softmax_denominator && compact_softmax_denominator &&
+        static_cast<size_t>(batch_dn_size) <=
+            numeric_limits<size_t>::max() / 4) {
+        const size_t guarded_bound =
+            static_cast<size_t>(batch_dn_size) * size_t{4};
+        size_t bound_power = 1;
+        int bound_bits = 0;
+        while (bound_power < guarded_bound && bound_bits < 63) {
+            bound_power <<= 1;
+            ++bound_bits;
+        }
+        const int candidate_ell = dn.s + bound_bits;
+        if (bound_bits < 63 && candidate_ell > 0 &&
+            candidate_ell < dn.ell && candidate_ell <= 64) {
+            bounded_dn = nonlinear.fpmath[0]->fix->reduce(dn, candidate_ell);
+            reciprocal_input_ell = candidate_ell;
+            denominator_reduced = true;
+        }
+    }
+    const FixArray &reciprocal_input = denominator_reduced ? bounded_dn : dn;
     FixArray dn_rec(party, dn.size, false, reciprocal_ell, dn.s);
     const int reciprocal_workers = min(nonlinear.active_workers(),
                                        max(1, (dn.size + 63) / 64));
@@ -2290,8 +2390,11 @@ FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int 
         const int end = dn.size * (worker + 1) / reciprocal_workers;
         reciprocal_threads.emplace_back([&, worker, begin, end]() {
             auto *math = nonlinear.fpmath[worker];
-            FixArray denominator(party, end - begin, dn.signed_, dn.ell, dn.s);
-            copy_n(dn.data + begin, end - begin, denominator.data);
+            FixArray denominator(party, end - begin,
+                                reciprocal_input.signed_, reciprocal_input_ell,
+                                reciprocal_input.s);
+            copy_n(reciprocal_input.data + begin, end - begin,
+                   denominator.data);
             if (softmax_denominator) {
                 const uint64_t floor = uint64_t{1} << (dn.s - 1);
                 // This SCI build's LE predicate selects lhs >= rhs, as
@@ -2316,6 +2419,11 @@ FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int 
     }
     for (auto& worker : reciprocal_threads) worker.join();
     cout << "FORMAL_SOFTMAX_RECIPROCAL status=PASS mode=1_over_dn" << endl;
+    cout << "FORMAL_SOFTMAX_DENOMINATOR_RING input_ell="
+         << dn.ell << " reciprocal_input_ell=" << reciprocal_input_ell
+         << " row_bound=" << (compact_softmax_denominator ? batch_dn_size : 0)
+         << " guard_factor=" << (compact_softmax_denominator ? 4 : 0)
+         << " local_reduce=" << (denominator_reduced ? 1 : 0) << endl;
     this->other_nonlinear_la += ((high_resolution_clock::now() - start)).count()/1e+9;
     this->other_nonlinear_comm += this->get_comm();
     this->other_nonlinear_round += this->get_round();
@@ -2564,8 +2672,13 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
             clamp_workers.emplace_back([&, worker, begin, end]() {
                 auto local = e_x_flat.subset(begin, end);
                 auto *fix = fpmath[worker]->fix;
-                auto nonnegative = fix->LE(local, uint64_t(0));
-                auto clipped = fix->if_else(nonnegative, local, uint64_t(0));
+                // MSB(local) is the negative predicate for this signed ring.
+                // The previous LE(local, 0) formulation computed the same
+                // selector through an extra Boolean NOT; keep the mux and
+                // comparison semantics while removing that local Boolean
+                // operation from every Softmax element.
+                auto negative = fix->MSB(local);
+                auto clipped = fix->if_else(negative, uint64_t(0), local);
                 copy_n(clipped.data, end - begin, e_x_flat.data + begin);
             });
         }
@@ -2631,7 +2744,7 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
     cout << "exp_he data time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
     start = high_resolution_clock::now();
     FixArray ret_flat = div_batch_he_V2(
-        e_x_flat, sum_e_x, array_size, exp_ell, s, false, true);
+        e_x_flat, sum_e_x, array_size, exp_ell, s, false, true, true);
     diagnostic_open_sum(ret_flat, "probability");
     cout << "FORMAL_SOFTMAX_DIVISION status=PASS"
          << " engine=BLB_HE_ASSISTED_RECIPROCAL"

@@ -446,6 +446,9 @@ public:
     vector<wide_complex_t> ckks_encode_wide(
         const vector<wide_complex_t> &x, int degree, int working_ell=-1) const;
 
+    vector<wide_complex_t> ckks_encode_wide(
+        vector<wide_complex_t> &&x, int degree, int working_ell=-1) const;
+
     vector<scalar_t> ckks_encode(vector<scalar_t> x, int slot, bool half=false);
 
     void ckks_ntt(vector<scalar_t> x, int degree,double scale, Plaintext &destination);

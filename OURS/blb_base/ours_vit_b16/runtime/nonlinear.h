@@ -69,6 +69,14 @@ public:
     void ring_extend_wide(int nthreads, uint64_t* input,
                           uint64_t* output_low, uint64_t* output_high,
                           int size, int bitwidth, int target_bitwidth);
+    // Fast BLB-style zero extension for a value whose public semantic range
+    // is non-negative and below 2^(bitwidth-1).  The caller supplies this
+    // range proof; the protocol then uses MSB_to_Wrap instead of the exact
+    // generic wrap computation.
+    void ring_extend_wide_nonnegative(int nthreads, uint64_t* input,
+                                      uint64_t* output_low,
+                                      uint64_t* output_high, int size,
+                                      int bitwidth, int target_bitwidth);
     void ring_extend_wide_zero(int nthreads, uint64_t* input,
                                uint64_t* output_low, uint64_t* output_high,
                                int size, int bitwidth, int target_bitwidth);

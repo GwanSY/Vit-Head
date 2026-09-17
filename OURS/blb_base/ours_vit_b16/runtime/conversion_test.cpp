@@ -476,6 +476,68 @@ int main(int argc, char **argv) {
        << " max_native_abs=" << c3_max_native_error
        << " mismatches=" << c3_mismatches << endl;
 
+  // Optional C4N: BLB's non-negative extension contract.  This gate checks
+  // the protocol independently of CKKS so a production Softmax regression
+  // cannot be confused with an encoder/NTT regression.  The largest probe is
+  // 2^(l-1)-1, which is still valid because the reconstructed l-bit MSB is
+  // zero; the local additive shares themselves remain fully random.
+  if (getenv("OURS_VIT_CONVERSION_NONNEGATIVE_TEST") != nullptr) {
+    const int extension_bits = kBits + 40;
+    const __uint128_t extension_mask =
+        (__uint128_t{1} << extension_bits) - 1;
+    const uint64_t nonnegative_mask = (uint64_t{1} << (kBits - 1)) - 1;
+    vector<uint64_t> nonnegative_expected(he.num_slots);
+    for (size_t index = 0; index < nonnegative_expected.size(); ++index) {
+      if (index == 0)
+        nonnegative_expected[index] = 0;
+      else if (index == 1)
+        nonnegative_expected[index] = 1;
+      else if (index == 2)
+        nonnegative_expected[index] = nonnegative_mask;
+      else
+        nonnegative_expected[index] =
+            (static_cast<uint64_t>(index) * 104729ULL) & nonnegative_mask;
+    }
+    vector<uint64_t> nonnegative_share0, nonnegative_share1;
+    make_shares(nonnegative_expected, uint64_t{1} << kBits,
+                nonnegative_share0, nonnegative_share1);
+    vector<uint64_t> nonnegative_local =
+        party == sci::ALICE ? nonnegative_share0 : nonnegative_share1;
+    vector<uint64_t> nonnegative_low(nonnegative_local.size());
+    vector<uint64_t> nonnegative_high(nonnegative_local.size());
+    adapter.nonlinear.ring_extend_wide_nonnegative(
+        active_workers(adapter), nonnegative_local.data(),
+        nonnegative_low.data(), nonnegative_high.data(),
+        static_cast<int>(nonnegative_local.size()), kBits, extension_bits);
+    vector<uint64_t> nonnegative_remote_low;
+    vector<uint64_t> nonnegative_remote_high;
+    exchange_vector(io, party, nonnegative_low, nonnegative_remote_low);
+    exchange_vector(io, party, nonnegative_high, nonnegative_remote_high);
+    bool nonnegative_ok = true;
+    uint64_t nonnegative_mismatches = 0;
+    for (size_t index = 0; index < nonnegative_expected.size(); ++index) {
+      const __uint128_t local =
+          (static_cast<__uint128_t>(nonnegative_high[index]) << 64) |
+          nonnegative_low[index];
+      const __uint128_t remote =
+          (static_cast<__uint128_t>(nonnegative_remote_high[index]) << 64) |
+          nonnegative_remote_low[index];
+      const __uint128_t reconstructed = (local + remote) & extension_mask;
+      if (reconstructed != nonnegative_expected[index]) {
+        nonnegative_ok = false;
+        ++nonnegative_mismatches;
+      }
+    }
+    if (!gate(io, party, "C4N", nonnegative_ok)) {
+      stop_after("C4N");
+      return 1;
+    }
+    cout << "CONVERSION_TEST C4N detail=known_nonnegative_wide_extension"
+         << " extension_bits=" << extension_bits
+         << " max_valid_value=" << nonnegative_mask
+         << " mismatches=" << nonnegative_mismatches << endl;
+  }
+
   // C4: the complete MPC -> CKKS -> encrypted addition -> CKKS -> MPC
   // identity.  This is the production boundary, including per-RNS local
   // NTT construction and the uniform mask cancellation.
