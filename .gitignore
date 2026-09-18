@@ -89,3 +89,6 @@ fixtures/
 .venv-vit-b16
 
 Vit-Head/datasets/
+
+# Generated archives are too large for regular Git.
+OURS/blb_base/archives/**/*.tar.gz
