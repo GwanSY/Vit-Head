@@ -1,0 +1,64 @@
+{
+  "schema": "OURS_B_BASELINE_FREEZE_V1",
+  "version": "B",
+  "name": "Strict BLB-ViT baseline",
+  "status": "FROZEN",
+  "criterion": "strict_blb_vit",
+  "date": "2026-09-22",
+  "research_matrix_changed": false,
+  "active_C_count": 0,
+  "run": "outputs/strict_blb_20260922/strict_full_r02",
+  "config": "outputs/strict_blb_20260922/strict_baseline_config.json",
+  "binary_sha256": "18842f7b1708e95a15cf3c21bd750008c10fcff69425004fd0fa3095c287f348",
+  "binary": "outputs/strict_blb_20260922/strict_full_r02/executed_artifacts/ours_vit_b16_main",
+  "phantom": "outputs/strict_blb_20260922/strict_full_r02/executed_artifacts/libPhantom.so",
+  "numeric_summary": {
+    "clear_top1": 248,
+    "fixed_top1": 248,
+    "secure_top1": 248,
+    "same_public_logits": true,
+    "fixed_relative_l2": 0.01733657865013157,
+    "fixed_max_abs": 0.137451171825,
+    "online_s": 1505.218348
+  },
+  "network": "netem 1 Gbps / 0.3 ms RTT",
+  "gpu_pair": [
+    2,
+    5
+  ],
+  "execution_framework": "ours_native_edge_cloud_v1",
+  "model": "google/vit-base-patch16-224",
+  "shape": {
+    "layers": 12,
+    "hidden": 768,
+    "heads": 12,
+    "head_dim": 64,
+    "logical_tokens": 197,
+    "physical_tokens": 256
+  },
+  "precision": {
+    "activation_ring_bits": 37,
+    "activation_scale": 12,
+    "he_security": "tc128"
+  },
+  "online_communication_aggregate_bytes": 34037567058,
+  "legacy_802_777_seconds": "Historical implementation only; not the Strict baseline latency.",
+  "runtime_status_note": "candidate_not_frozen and verification=0 in runtime metadata are build-time labels; the completed, hash-bound strict_protocol_review and strict_validation are the post-run freeze decision.",
+  "dataset_accuracy_claimed": false,
+  "artifact_sha256": {
+    "outputs/strict_blb_20260922/strict_full_r02/executed_artifacts/ours_vit_b16_main": "18842f7b1708e95a15cf3c21bd750008c10fcff69425004fd0fa3095c287f348",
+    "outputs/strict_blb_20260922/strict_full_r02/executed_artifacts/libPhantom.so": "9225a0a5fe9df041b4920c64e114fd9b320270cefa7a3392b0a4e715be84b9d7",
+    "outputs/strict_blb_20260922/strict_full_r02/executed_artifacts/reviewed_source.tar.gz": "a448b98510f950de7022f0d68d2406faa63d369362171d07137f62e7cf10257a",
+    "outputs/strict_blb_20260922/strict_full_r02/build_manifest.json": "4894e75e0243c0bec4e1f4b7aae4b8096d5cbaa4849b489576568de25b294dbb",
+    "outputs/strict_blb_20260922/strict_full_r02/process_binary_sha256.txt": "4f408d174a5d67a62da442e7060caee72361223e9e1c0d0618260ee674aada77",
+    "outputs/strict_blb_20260922/strict_full_r02/native/validation.json": "1f54edb0e141b95a3dd5f96d4e764e362833691c30e449f1cff01860008c3a63",
+    "outputs/strict_blb_20260922/strict_full_r02/native/strict_protocol_review.json": "a99f89d187a5b299d13dcef0598e2ac5c05055e50c0efeaf491ab1310472de01",
+    "outputs/strict_blb_20260922/strict_full_r02/strict_review/strict_validation.json": "c8e8bdd22b3cdaead4105a7c5f2aa461b5e5d4d334bc2e2304a5ecfcad357c23",
+    "outputs/strict_blb_20260922/algorithm2_restoration.json": "a47cb4b088cb884763ccaeec7b47497269378f0824d5e34c36c3bee4e5b0f1f5",
+    "outputs/strict_blb_20260922/adaptations.csv": "ddba42d8a14ee95067d39703558071569ba62d641faa443da8b164a7f3ce285e",
+    "outputs/strict_blb_20260922/source_lineage.json": "b122d99b2c12330cd3832625edebce69921299dc3ea2af1e532a4e9d096cd70d",
+    "outputs/strict_blb_20260922/strict_baseline_config.json": "b984bd24a225a703c7c4c8b3461382f8e3f8184106459d54288ab5422883cded",
+    "scripts/audit_strict_blb.py": "b3d7fd690f6080818ed65a2ca7b9260833e020c7006cf3ee3c0ee34c1a361c88",
+    "scripts/validate_b_migration.py": "fddd2077b31caae1748e14a1abb9847eeb327776074fed5db0abb577386abd4a"
+  }
+}

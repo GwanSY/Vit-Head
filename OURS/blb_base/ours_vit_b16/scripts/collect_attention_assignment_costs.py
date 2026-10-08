@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect directly measured complete A3/A4 attention assignments.
+"""Collect directly measured complete heterogeneous attention assignments.
 
 One output row is one whole layer assignment from QKV/QK through the genuine
 Algorithm-1 attention-output conversion.  Rows are never divided by Head
@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROFILE_PREFIX = "OURS_A3_A4_ASSIGNMENT_PROFILE "
+PROFILE_PREFIX = "OURS_HETERO_ASSIGNMENT_PROFILE "
 OUTPUT_COLUMNS = (
-    "layer", "ablation", "softmax_heads", "relu_heads", "linear_heads",
+    "layer", "version", "softmax_heads", "relu_heads", "linear_heads",
     "latency_ms", "he_instrumented_ms", "conversion_instrumented_ms",
     "communication_bytes", "rounds", "protocol_groups", "mpc_group_calls",
     "native_linear_groups", "ckks_to_mpc", "mpc_to_ckks",
@@ -24,10 +24,12 @@ OUTPUT_COLUMNS = (
     "measurement_scope", "cost_unit", "network_gbps", "rtt_ms", "backend",
     "gpu_topology", "image_id", "binary_sha256", "plan_sha256",
     "protocols_original", "alphas_original", "physical_protocols",
-    "original_order", "a4_data_level_extension",
+    "original_order", "native_data_level_extension",
     "blb_fast_attention_packing", "attention_packing",
     "heterogeneous_head_grouping", "surrogate", "dynamic_selection",
-    "source_run",
+    "source_run", "cloud_latency_ms", "edge_latency_ms",
+    "conversion_ciphertexts", "normalization_hybrid_ms", "run_head_reorder_ms",
+    "synchronization_measurement",
 )
 
 
@@ -47,7 +49,7 @@ class Profile:
     @property
     def key(self) -> tuple[int, str, int, int, int]:
         return (
-            int(self.values["layer"]), self.values["ablation"].upper(),
+            int(self.values["layer"]), self.values["version"].upper(),
             int(self.values["softmax_heads"]),
             int(self.values["relu_heads"]),
             int(self.values["linear_heads"]),
@@ -64,9 +66,9 @@ def require_run_provenance(run: Path) -> tuple[str, str, str, str, str]:
         raise ValueError(f"assignment cost is not a GPU run: {run}")
     if "network=1Gbps/0.3ms_RTT" not in environment_text:
         raise ValueError(f"assignment cost lacks formal network shaping: {run}")
-    ablation = environment.get("ablation", "").upper()
-    if ablation not in {"A3", "A4"}:
-        raise ValueError(f"assignment cost must be A3 or A4: {run}")
+    version = environment.get("version", "").upper()
+    if version not in {"H", "HA", "HP", "HAP", "J", "BP"}:
+        raise ValueError(f"assignment cost must use a heterogeneous matrix version: {run}")
     binary_sha256 = environment.get("binary_sha256", "")
     if len(binary_sha256) != 64:
         raise ValueError(f"assignment cost lacks binary SHA-256: {run}")
@@ -87,22 +89,22 @@ def require_run_provenance(run: Path) -> tuple[str, str, str, str, str]:
     plan_sha256 = selection.get("plan_sha256", "")
     if not image_id.startswith("sha256:") or len(plan_sha256) != 64:
         raise ValueError(f"assignment cost lacks immutable provenance: {run}")
-    return ablation, binary_sha256, image_id, plan_sha256, topology
+    return version, binary_sha256, image_id, plan_sha256, topology
 
 
 def read_party_profiles(run: Path, party_name: str,
-                        ablation: str) -> dict[tuple[int, str, int, int, int], Profile]:
+                        version: str) -> dict[tuple[int, str, int, int, int], Profile]:
     log = (run / party_name).read_text(encoding="utf-8", errors="replace")
     if "surrogate=1" in log or "mpc_reference=1" in log or \
             "client_decrypt_reencrypt=1" in log:
-        raise ValueError(f"forbidden A4 shortcut appears in {run}/{party_name}")
+        raise ValueError(f"forbidden native shortcut appears in {run}/{party_name}")
     profiles: dict[tuple[int, str, int, int, int], Profile] = {}
     for line in log.splitlines():
         if not line.startswith(PROFILE_PREFIX):
             continue
         values = key_values(line)
         required = {
-            "status", "ablation", "layer", "latency_ms",
+            "status", "version", "layer", "latency_ms",
             "communication_bytes", "rounds", "he_instrumented_ms",
             "conversion_instrumented_ms", "softmax_heads", "relu_heads",
             "linear_heads", "protocol_groups", "mpc_group_calls",
@@ -114,7 +116,7 @@ def read_party_profiles(run: Path, party_name: str,
         if required - values.keys():
             raise ValueError(f"incomplete assignment profile in {run}/{party_name}")
         if (values["status"] != "PASS" or
-                values["ablation"].upper() != ablation or
+                values["version"].upper() != version or
                 values["measurement_scope"] != "complete_attention_assignment" or
                 values["cost_unit"] != "direct_assignment_not_per_head" or
                 values["network"] != "1Gbps_0.3ms_RTT" or
@@ -145,9 +147,9 @@ def require_native_markers(run: Path,
         for party_name in ("alice.log", "bob.log")
     }
     for party_name, log in logs.items():
-        chain = marker_values(log, "OURS_A4_HE1_CHAIN ")
+        chain = marker_values(log, "OURS_NATIVE_HE1_CHAIN ")
         if len(chain) != 1:
-            raise ValueError(f"missing unique A4 chain marker: {run}/{party_name}")
+            raise ValueError(f"missing unique native chain marker: {run}/{party_name}")
         values = chain[0]
         expected_extension = "1" if any(key[4] for key in profiles) else "0"
         if (values.get("status") != "PASS" or
@@ -155,33 +157,33 @@ def require_native_markers(run: Path,
                 values.get("data_level_extension") != expected_extension or
                 int(values.get("modulus_entries", "-1")) !=
                 int(values.get("baseline_entries", "-1")) + int(expected_extension)):
-            raise ValueError(f"invalid one-level A4 chain marker: {run}/{party_name}")
+            raise ValueError(f"invalid one-level native chain marker: {run}/{party_name}")
 
-    for (layer, ablation, softmax, relu, linear), _profile in profiles.items():
+    for (layer, version, softmax, relu, linear), _profile in profiles.items():
         mpc_heads = softmax + relu
         for party_name, log in logs.items():
             outputs = [
                 values for values in marker_values(
-                    log, "OURS_A3_A4_ATTENTION_OUTPUT ")
+                    log, "OURS_HETERO_ATTENTION_OUTPUT ")
                 if values.get("layer") == str(layer) and
-                values.get("ablation", "").upper() == ablation
+                values.get("version", "").upper() == version
             ]
             if (len(outputs) != 1 or outputs[0].get("status") != "PASS" or
                     outputs[0].get("dynamic_selection") != "0" or
                     outputs[0].get("surrogate") != "0" or
                     int(outputs[0].get("mpc_heads", "-1")) != mpc_heads or
                     int(outputs[0].get("linear_heads", "-1")) != linear):
-                raise ValueError(f"missing real A3/A4 output marker: {run}/{party_name}")
+                raise ValueError(f"missing real heterogeneous output marker: {run}/{party_name}")
 
             conversions = [
                 values for values in marker_values(
                     log, "OURS_SELECTIVE_OUTPUT_CONVERSION ")
                 if values.get("layer") == str(layer)
             ]
-            expected_stages = ({"a4_mpc_heads_wo", "a4_linear_heads_wo"}
+            expected_stages = ({"mpc_heads_wo", "linear_heads_wo"}
                                if linear and mpc_heads else
-                               {"a4_linear_heads_wo"} if linear else
-                               {"a3_mpc_heads_wo"})
+                               {"linear_heads_wo"} if linear else
+                               {"mpc_heads_wo"})
             real_stages = {
                 values.get("stage") for values in conversions
                 if values.get("status") == "PASS" and
@@ -200,7 +202,7 @@ def require_native_markers(run: Path,
             for log in logs.values():
                 native.extend(
                     values for values in marker_values(
-                        log, "OURS_A4_NATIVE_CKKS ")
+                        log, "OURS_NATIVE_NATIVE_CKKS ")
                     if values.get("layer") == str(layer)
                 )
             if (len(native) != 1 or native[0].get("status") != "PASS" or
@@ -208,7 +210,7 @@ def require_native_markers(run: Path,
                     native[0].get("client_decrypt_reencrypt") != "0" or
                     native[0].get("mpc_reference") != "0" or
                     native[0].get("v_alignment_rescales") != "1"):
-                raise ValueError(f"missing one-level native A4 marker: {run}")
+                raise ValueError(f"missing one-level native native marker: {run}")
 
 
 def require_head_grouping_disabled(
@@ -216,8 +218,8 @@ def require_head_grouping_disabled(
         profiles: dict[tuple[int, str, int, int, int], Profile]) -> None:
     """Require the allocator-only, unpacked Head execution mode.
 
-    ``OURS_VIT_GROUP_PACKING=0`` disables the later heterogeneous Head
-    packing/grouping optimization while retaining the existing A3/A4
+    Versions H/HA disables the later heterogeneous Head
+    packing/grouping optimization while retaining the existing heterogeneous
     selective conversion and native CKKS Linear paths.  The runtime emits the
     authoritative mode marker in each party log; the launcher selection file
     is checked as an independent provenance record.
@@ -244,8 +246,8 @@ def require_head_grouping_disabled(
         # In the ungrouped mode every selective conversion call is explicitly
         # per-head.  Keep this audit tied to the measured assignment rather
         # than accepting a global environment variable alone.
-        conversions = marker_values(log, "OURS_A3_SELECTIVE_MPC_TO_CKKS")
-        expected = sum(softmax + relu for _layer, _ablation, softmax, relu, _linear
+        conversions = marker_values(log, "OURS_SELECTIVE_SELECTIVE_MPC_TO_CKKS")
+        expected = sum(softmax + relu for _layer, _version, softmax, relu, _linear
                        in profiles)
         if len(conversions) != expected or any(
                 values.get("grouped_call") != "0" for values in conversions):
@@ -288,13 +290,13 @@ def require_blb_fast_packing_markers(
             values.get("mode") != "baseline_fast" or
             values.get("mpc_surrogate") != "0" or
             values.get("client_decrypt_reencrypt") != "0" or
-            values.get("a0_numerical_validation") != "PENDING"
+            values.get("b_numerical_validation") != "PENDING"
             for values in qk)):
         raise ValueError(f"assignment cost did not use BLB-fast QK: {run}")
 
     expected_path_count = sum(
         int(softmax + relu > 0) + int(linear > 0)
-        for _layer, _ablation, softmax, relu, linear in profiles)
+        for _layer, _version, softmax, relu, linear in profiles)
     packed_av_valid = len(av) == expected_path_count and all(
             values.get("status") == "PASS" and
             values.get("mode") == "baseline_fast" and
@@ -302,7 +304,7 @@ def require_blb_fast_packing_markers(
             values.get("extra_rescales") == "0" and
             values.get("mpc_surrogate") == "0" and
             values.get("client_decrypt_reencrypt") == "0" and
-            values.get("a0_numerical_validation") == "PENDING"
+            values.get("b_numerical_validation") == "PENDING"
             for values in av)
     ungrouped_av_valid = len(ungrouped_av) == expected_path_count and all(
         values.get("status") == "PASS" and
@@ -327,7 +329,7 @@ def require_blb_fast_packing_markers(
             values.get("extra_multiplies") != "0"
             for values in levels):
         raise ValueError(f"assignment cost lacks BLB-fast AV level proof: {run}")
-    for layer, _ablation, softmax, relu, linear in profiles:
+    for layer, _version, softmax, relu, linear in profiles:
         expected_contexts = set()
         if softmax + relu:
             expected_contexts.add("he2")
@@ -373,10 +375,10 @@ def read_head_plan(run: Path) -> dict[int, dict[str, str]]:
 
 
 def measured_rows(run: Path) -> list[dict[str, object]]:
-    ablation, binary_sha256, image_id, plan_sha256, topology = \
+    version, binary_sha256, image_id, plan_sha256, topology = \
         require_run_provenance(run)
-    alice = read_party_profiles(run, "alice.log", ablation)
-    bob = read_party_profiles(run, "bob.log", ablation)
+    alice = read_party_profiles(run, "alice.log", version)
+    bob = read_party_profiles(run, "bob.log", version)
     if set(alice) != set(bob):
         raise ValueError(f"party assignment profiles disagree: {run}")
     require_native_markers(run, alice)
@@ -385,6 +387,8 @@ def measured_rows(run: Path) -> list[dict[str, object]]:
     selection = key_values((run / "gpu_selection.txt").read_text(
         encoding="utf-8", errors="replace"))
     head_plan = read_head_plan(run)
+    reorder = marker_values((run / "alice.log").read_text(), "OURS_OFFLINE_HEAD_REORDER")
+    reorder_ms = float(reorder[0]["milliseconds"]) if len(reorder) == 1 else ""
     rows: list[dict[str, object]] = []
     integer_fields = (
         "rounds", "protocol_groups", "mpc_group_calls",
@@ -407,7 +411,15 @@ def measured_rows(run: Path) -> list[dict[str, object]]:
              protocol_counts["he_linear"]) != key[2:]):
             raise ValueError(f"profile and audited Head assignment disagree: {run}")
         row: dict[str, object] = {
-            "layer": key[0], "ablation": key[1],
+            "layer": key[0], "version": key[1],
+            "cloud_latency_ms": float(a["latency_ms"]),
+            "edge_latency_ms": float(b["latency_ms"]),
+            "conversion_ciphertexts": max(int(a["conversion_ciphertexts"]), int(b["conversion_ciphertexts"]))
+                if "conversion_ciphertexts" in a and "conversion_ciphertexts" in b else "",
+            "normalization_hybrid_ms": max(float(a["normalization_hybrid_ms"]), float(b["normalization_hybrid_ms"]))
+                if "normalization_hybrid_ms" in a and "normalization_hybrid_ms" in b else "",
+            "run_head_reorder_ms": reorder_ms,
+            "synchronization_measurement": "included_in_assignment_wall_not_separately_instrumented",
             "softmax_heads": key[2], "relu_heads": key[3],
             "linear_heads": key[4],
             "latency_ms": max(float(a["latency_ms"]), float(b["latency_ms"])),
@@ -426,7 +438,7 @@ def measured_rows(run: Path) -> list[dict[str, object]]:
             "image_id": image_id, "binary_sha256": binary_sha256,
             "plan_sha256": plan_sha256, "surrogate": 0,
             **plan,
-            "a4_data_level_extension": 1 if key[1] == "A4" else 0,
+            "native_data_level_extension": 1 if key[4] else 0,
             "blb_fast_attention_packing": int(av_uses_fast_packing),
             "attention_packing": selection.get("attention_packing", ""),
             "heterogeneous_head_grouping": 0,
@@ -449,7 +461,7 @@ def main() -> None:
     for run in args.run:
         rows.extend(measured_rows(run))
     identities = [
-        (row["layer"], row["plan_sha256"], row["ablation"])
+        (row["layer"], row["plan_sha256"], row["version"])
         for row in rows
     ]
     if len(identities) != len(set(identities)):
@@ -459,10 +471,10 @@ def main() -> None:
         writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
-    print("OURS_A3_A4_COST_COLLECTION status=PASS")
-    print("OURS_A3_A4_COST_UNIT complete_attention_assignment")
-    print("OURS_A3_A4_COST_EXTRAPOLATION per_head=0 layer_copy=0 surrogate=0")
-    print(f"OURS_A3_A4_COST_CSV={args.output}")
+    print("OURS_HETERO_COST_COLLECTION status=PASS")
+    print("OURS_HETERO_COST_UNIT complete_attention_assignment")
+    print("OURS_HETERO_COST_EXTRAPOLATION per_head=0 layer_copy=0 surrogate=0")
+    print(f"OURS_HETERO_COST_CSV={args.output}")
 
 
 if __name__ == "__main__":

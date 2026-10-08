@@ -65,8 +65,7 @@ int blb_c2m_headroom_bits() {
 }
 
 bool blb_secure_exp_clamp_enabled() {
-    const char *value = std::getenv("OURS_VIT_SECURE_EXP_CLAMP");
-    return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+    return true; // BLB Algorithm 5 is mandatory, never an environment toggle.
 }
 }
 // #define SCI_HE
@@ -151,26 +150,26 @@ inline void MulImageUnitInplace(seal::Ciphertext& ct, const seal::SEALContext& c
     }
 }
 
-// A0 \in (1/4, 1)
+// B \in (1/4, 1)
 inline uint64_t recp_lookup_c0(uint64_t index, int m) {
   uint64_t k = 1ULL << m;
   double p = 1 + (double(index) / double(k));
-  double A1 = 1.0 / (p * (p + 1.0 / double(k)));
+  double HETERO = 1.0 / (p * (p + 1.0 / double(k)));
   int32_t scale = m + 3;
   uint64_t mask = (1ULL << scale) - 1;
-  uint64_t val = uint64_t(A1 * (1ULL << scale)) & mask;
+  uint64_t val = uint64_t(HETERO * (1ULL << scale)) & mask;
   return val;
 }
 
-// A1 \in (1/2, 1)
+// HETERO \in (1/2, 1)
 inline uint64_t recp_lookup_c1(uint64_t index, int m) {
   uint64_t k = 1ULL << m;
   double p = 1 + (double(index) / double(k));
   double z = (p * (p + (1.0 / double(k))));
-  double A1 = ((1.0 / double(k * 2)) + sqrt(z)) / z;
+  double HETERO = ((1.0 / double(k * 2)) + sqrt(z)) / z;
   int32_t scale = 2 * m + 2;
   uint64_t mask = (1ULL << scale) - 1;
-  uint64_t val = uint64_t(A1 * (1ULL << scale)) & mask;
+  uint64_t val = uint64_t(HETERO * (1ULL << scale)) & mask;
     return val;
 }
 
@@ -270,7 +269,7 @@ Bert_ckks::Bert_ckks(int party, int port, string address, LOCATION backend,
 Bert_ckks::Bert_ckks(int party, int port, string address, LOCATION backend,
                      const BertModel *external_model, int sequence_length,
                      bool preprocess_weights, int layers_to_preprocess,
-                     bool enable_a4_native_linear) {
+                     bool enable_native_linear) {
     if (sequence_length <= 0) {
         throw invalid_argument("Bert_ckks: sequence length must be positive");
     }
@@ -287,7 +286,7 @@ Bert_ckks::Bert_ckks(int party, int port, string address, LOCATION backend,
     this->io = new sci::NetIO(party == 1 ? nullptr : address.c_str(), port);
     this->location_ = backend;
     this->linear = Linear_ckks(
-        party, io, backend, enable_a4_native_linear);
+        party, io, backend, enable_native_linear);
     this->linear.profile_context = this;
     this->linear.profile_switch_callback = vit_profile_switch_callback;
     this->linear.profile_he_callback = vit_profile_he_callback;
@@ -338,27 +337,22 @@ Bert_ckks::~Bert_ckks() {
 
 void Bert_ckks::configure_heterogeneous_attention_layer(
     int layer_id, const vector<ours_vit::HeadProtocol> &protocols,
-    const vector<double> &alphas, ours_vit::Ablation ablation) {
+    const vector<double> &alphas, ours_vit::Version version) {
     if (layer_id < 0 || layer_id >= ATTENTION_LAYERS ||
         protocols.size() != PACKING_NUM || alphas.size() != PACKING_NUM ||
-        ablation < ours_vit::Ablation::A2) {
+        version == ours_vit::Version::B) {
         throw invalid_argument("heterogeneous attention layer configuration mismatch");
     }
-    if (ablation == ours_vit::Ablation::A3 &&
-        find(protocols.begin(), protocols.end(),
-             ours_vit::HeadProtocol::HeLinear) != protocols.end()) {
-        throw invalid_argument(
-            "A3 selective conversion does not execute he_linear; use A4");
-    }
+
     heterogeneous_protocols = protocols;
     heterogeneous_alphas = alphas;
-    heterogeneous_ablation = ablation;
+    heterogeneous_version = version;
     vector<int> protocol_codes(PACKING_NUM);
     for (int head = 0; head < PACKING_NUM; ++head)
         protocol_codes[head] = static_cast<int>(protocols[head]);
     linear.configure_heterogeneous_layer(layer_id, protocol_codes, alphas);
     cout << "OURS_PUBLIC_LAYER_PLAN status=PASS layer=" << layer_id
-         << " ablation=" << ours_vit::to_string(ablation)
+         << " version=" << ours_vit::to_string(version)
          << " softmax_heads="
          << count(protocols.begin(), protocols.end(),
                   ours_vit::HeadProtocol::SoftmaxMpc)
@@ -776,9 +770,35 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(
     if (rns_moduli.empty() || Q == 0) {
         throw runtime_error("MPC-to-CKKS RNS modulus set is empty");
     }
-    // FFT coefficients are signed integer shares with no workspace wrap.
-    // Reduce each local integer independently into every RNS prime. Reducing
-    // to encode_bitwidth first would lose carries and require another OT.
+    // Algorithm 2 step 1: local Encode in the enlarged FFT workspace.
+    // Keep the numerical guard bits, then form additive coefficient shares
+    // in Z_(2^encode_bitwidth). Do not locally reinterpret wide shares as
+    // field shares: Algorithm 2's coefficient-domain conversion follows.
+    const size_t coefficient_count = x.size() * independent_coefficients;
+    const uint64_t coefficient_mask = (uint64_t{1} << encode_bitwidth) - 1;
+    vector<uint64_t> coefficient_ring(coefficient_count);
+#pragma omp parallel for num_threads(thread_num)
+    for (int i=0; i<static_cast<int>(x.size()); ++i) {
+        vector<HE_CKKS::wide_complex_t> encoded_input(poly_degree);
+        for (int j=0; j<slot; ++j) {
+            const size_t flat = static_cast<size_t>(i)*slot+j;
+            const __uint128_t value = (__uint128_t(slot_high[flat]) << 64) | slot_low[flat];
+            encoded_input[he->matrix_reps_index_map_[j]].real = value;
+            encoded_input[he->matrix_reps_index_map_[j+slot]].real = value;
+        }
+        auto encoded = he->ckks_encode_wide(std::move(encoded_input), poly_degree, working_bits);
+        for (int j=0; j<independent_coefficients; ++j)
+            coefficient_ring[static_cast<size_t>(i)*independent_coefficients+j] =
+                static_cast<uint64_t>(encoded[j].real) & coefficient_mask;
+    }
+    // Algorithm 2 step 2 / Appendix C.3: securely extend coefficient shares
+    // before local field reduction. The same extended integer is reduced
+    // separately into each RNS prime, never reused as a residue of another.
+    const int coefficient_sharing_bits = encode_bitwidth + 40;
+    vector<uint64_t> coefficient_low(coefficient_count), coefficient_high(coefficient_count);
+    nonlinear.ring_extend_wide(blb_conversion_threads(), coefficient_ring.data(),
+        coefficient_low.data(), coefficient_high.data(), static_cast<int>(coefficient_count),
+        encode_bitwidth, coefficient_sharing_bits);
     ++ring_to_field_calls;
 
     const int scale_shift = s_out - encode_scale;
@@ -786,13 +806,8 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(
         throw runtime_error(
             "MPC-to-CKKS optimized RNS conversion cannot lower scale");
     }
-    // The old implementation materialized both [ciphertext][coefficient]
-    // wide FFT output and [RNS limb][coefficient] field shares before doing
-    // the NTT.  Those buffers are large and force three full-batch passes.
-    // Keep the exact same per-coefficient reduction, but fuse encode,
-    // per-prime reduction, symmetry restoration, and NTT per ciphertext.
-    // This is local work only; the single ring-to-field protocol above is
-    // unchanged.
+    // After the secure coefficient extension, perform local per-prime
+    // reduction, real-slot symmetry restoration and NTT per ciphertext.
     vector<__uint128_t> scale_factors(rns_moduli.size());
     vector<__uint128_t> wrap_corrections(rns_moduli.size());
     const auto pow_two_mod = [](const __uint128_t modulus, int exponent) {
@@ -809,28 +824,12 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(
         const __uint128_t modulus = rns_moduli[limb].value();
         scale_factors[limb] = pow_two_mod(modulus, scale_shift);
         wrap_corrections[limb] =
-            pow_two_mod(modulus, working_bits + scale_shift);
+            pow_two_mod(modulus, coefficient_sharing_bits + scale_shift);
     }
     vector<Plaintext> y(x.size());
     const double ckks_scale = ldexp(1.0, s_out);
 #pragma omp parallel for num_threads(thread_num)
     for (int i = 0; i < static_cast<int>(x.size()); ++i) {
-        vector<HE_CKKS::wide_complex_t> encoded_input(
-            static_cast<size_t>(poly_degree));
-        for (int j = 0; j < slot; ++j) {
-            const size_t flat = static_cast<size_t>(i) * slot + j;
-            const __uint128_t value =
-                (static_cast<__uint128_t>(slot_high[flat]) << 64) |
-                slot_low[flat];
-            const size_t real_index = he->matrix_reps_index_map_[j];
-            const size_t conjugate_index =
-                he->matrix_reps_index_map_[j + slot];
-            encoded_input[real_index].real = value;
-            encoded_input[conjugate_index].real = value;
-        }
-        auto encoded =
-            he->ckks_encode_wide(std::move(encoded_input), poly_degree,
-                                 working_bits);
         vector<vector<HE_CKKS::scalar_t>> x_encode_rns(
             rns_moduli.size(), vector<HE_CKKS::scalar_t>(poly_degree));
         for (size_t limb = 0; limb < rns_moduli.size(); ++limb) {
@@ -839,13 +838,12 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(
             const __uint128_t wrap_correction = wrap_corrections[limb];
             for (int coefficient = 0;
                  coefficient < independent_coefficients; ++coefficient) {
-                const __uint128_t wide =
-                    encoded[coefficient].real & working_mask;
-                __uint128_t local =
-                    ((wide % modulus) * scale_factor) % modulus;
-                if ((wide >> (working_bits - 1)) != 0) {
+                const size_t flat = static_cast<size_t>(i)*independent_coefficients+coefficient;
+                const __uint128_t wide = (__uint128_t(coefficient_high[flat]) << 64) |
+                                           coefficient_low[flat];
+                __uint128_t local = ((wide % modulus) * scale_factor) % modulus;
+                if (party == sci::ALICE)
                     local = (local + modulus - wrap_correction) % modulus;
-                }
                 x_encode_rns[limb][coefficient] =
                     static_cast<uint64_t>(local);
             }
@@ -868,11 +866,11 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(
          << " encode_guard_bits=" << encode_guard_bits
          << " lifted_input_scale=" << encode_scale
          << " rns_limbs=" << rns_moduli.size()
-         << " secure_slot_extensions=1 interactive_rns_extensions=0"
+         << " secure_slot_extensions=1 secure_coefficient_extensions=1"
          << " known_nonnegative=" << (known_nonnegative ? 1 : 0)
          << " independent_coefficients_per_ciphertext=" << independent_coefficients
          << " real_coefficient_symmetry=" << (!half ? 1 : 0)
-         << " encode=integer_fft_then_local_reduce_per_prime_fused" << endl;
+         << " encode=integer_fft_then_secure_coefficient_ring_to_field" << endl;
     mpc_to_ckks_conversions += x.size();
     cout << "mpc_to_ckks done" << endl;
 	if (profile_conversion) {
@@ -1103,33 +1101,6 @@ FixArray Bert_ckks::element_wise_square(int32_t dim, FixArray input) {
     if (offset != static_cast<size_t>(dim)) {
         throw runtime_error("formal CKKS square output is incomplete");
     }
-    return result;
-}
-
-std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
-    const FixArray &input, const FixArray &w, const FixArray &b) {
-    if (input.size <= 0 || input.size % COMMON_DIM != 0 ||
-        w.size != input.size || b.size != input.size) {
-        throw runtime_error("formal LayerNorm input/parameter shape mismatch");
-    }
-    const int rows = input.size / COMMON_DIM;
-    FixArray centered(party, input.size, input.signed_, input.ell, input.s);
-    FixArray sigma_flat(party, input.size, input.signed_, input.ell, input.s);
-
-    // LayerNorm part 1 is the original BLB MPC primitive.  The previous ViT
-    // adapter evaluated centered^2 by converting every share through CKKS,
-    // encrypting it, and converting it back.  That is not the BERT BLB
-    // protocol and added two large CKKS conversion/transfer paths per block.
-    nonlinear.layer_norm_part1(
-        NL_NTHREADS, input.data, centered.data, sigma_flat.data,
-        w.data, b.data,
-        rows, COMMON_DIM, input.ell, input.s);
-
-    std::map<char*,FixArray> result;
-    result["x_flat_avg"] = std::move(centered);
-    result["sigma_flat"] = sigma_flat;
-    result["w"] = w;
-    result["b"] = b;
     return result;
 }
 
@@ -1380,97 +1351,103 @@ void Bert_ckks::eval_gelu_poly(
     if (input.empty() || output_scale_bits < 0 || output_scale_bits > 62)
         throw invalid_argument("invalid GeLU ciphertexts or output scale");
     const auto loc = input.front().location();
+    const size_t n = input.size();
     const double target_scale = ldexp(1.0, output_scale_bits);
-    vector<UnifiedCiphertext> square(input.size(), UnifiedCiphertext(loc));
-    vector<UnifiedCiphertext> quartic(input.size(), UnifiedCiphertext(loc));
-    output_cts.resize(input.size(), UnifiedCiphertext(loc));
-
-    // Only the even terms are nonzero. The x/2 term and tail selection
-    // remain in MPC; computing encrypted x^3 added no value to this polynomial.
-    auto powers = [&](auto *evaluator, auto &keys) {
-        for (size_t i = 0; i < input.size(); ++i) {
-            evaluator->square(input[i], square[i]);
-            evaluator->relinearize_inplace(square[i], keys);
-            evaluator->rescale_to_next_inplace(square[i]);
-            evaluator->square(square[i], quartic[i]);
-            evaluator->relinearize_inplace(quartic[i], keys);
-            evaluator->rescale_to_next_inplace(quartic[i]);
-            evaluator->mod_switch_to_next_inplace(square[i]);
-            he_rescale_count += 2;
+    vector<UnifiedCiphertext> square(n, UnifiedCiphertext(loc));
+    vector<UnifiedCiphertext> cube(n, UnifiedCiphertext(loc));
+    vector<UnifiedCiphertext> quartic(n, UnifiedCiphertext(loc));
+    output_cts.resize(2 * n, UnifiedCiphertext(loc));
+    // BLB Algorithm 4: x^2, x^3=x^2*x, x^4=x^2*x^2.
+    auto powers = [&](auto *ev, auto &keys) {
+        for (size_t i = 0; i < n; ++i) {
+            ev->square(input[i], square[i]);
+            ev->relinearize_inplace(square[i], keys);
+            ev->rescale_to_next_inplace(square[i]);
+            ev->mod_switch_to_next_inplace(input[i]);
+            ev->multiply(square[i], input[i], cube[i]);
+            ev->relinearize_inplace(cube[i], keys);
+            ev->rescale_to_next_inplace(cube[i]);
+            ev->square(square[i], quartic[i]);
+            ev->relinearize_inplace(quartic[i], keys);
+            ev->rescale_to_next_inplace(quartic[i]);
+            ev->mod_switch_to_next_inplace(input[i]);
+            ev->mod_switch_to_next_inplace(square[i]);
+            he_rescale_count += 3;
         }
     };
-    if (loc == LOCATION::HOST)
-        powers(he->evaluator, *he->relin_keys);
-    else if (loc == LOCATION::DEVICE)
-        powers(he->devaluator, *he->drelin_keys);
-    else
-        throw runtime_error("GeLU backend is invalid");
-
-    uint64_t drop1 = 0, drop2 = 0;
+    if (loc == LOCATION::HOST) powers(he->evaluator, *he->relin_keys);
+    else if (loc == LOCATION::DEVICE) powers(he->devaluator, *he->drelin_keys);
+    else throw runtime_error("invalid GeLU backend");
+    uint64_t drop1, drop2;
     if (loc == LOCATION::HOST) {
-        auto context = he->context->get_context_data(quartic[0].hcipher().parms_id());
-        if (!context || !context->next_context_data() ||
-            !context->next_context_data()->next_context_data())
+        auto ctx = he->context->get_context_data(quartic[0].hcipher().parms_id());
+        if (!ctx || !ctx->next_context_data() || !ctx->next_context_data()->next_context_data())
             throw runtime_error("GeLU coefficient levels unavailable");
-        drop1 = context->parms().coeff_modulus().back().value();
-        drop2 = context->next_context_data()->parms().coeff_modulus().back().value();
+        drop1 = ctx->parms().coeff_modulus().back().value();
+        drop2 = ctx->next_context_data()->parms().coeff_modulus().back().value();
     } else {
-        const auto chain = quartic[0].dcipher().chain_index();
+        auto chain = quartic[0].dcipher().chain_index();
         drop1 = he->dcontext->get_context_data(chain).parms().coeff_modulus().back().value();
         drop2 = he->dcontext->get_context_data(chain + 1).parms().coeff_modulus().back().value();
     }
-    auto coefficient_scale = [&](const UnifiedCiphertext &ct) {
-        const double scale = target_scale * double(drop1) * double(drop2) / ct.scale();
-        if (!isfinite(scale) || scale < 1.0)
-            throw runtime_error("GeLU coefficient scale is not encodable");
-        return scale;
+    // Original BLB/BOLT coefficients; F0 and F1 are both evaluated in HE.
+    constexpr double a = 0.020848611754127593, b = -0.18352506127082727;
+    constexpr double c = 0.5410550166368381, d = -0.03798164612714154;
+    constexpr double e = 0.001620808531841547;
+    auto encode = [&](double value, double scale, int levels, UnifiedPlaintext &pt) {
+        if (!isfinite(scale) || scale < 1) throw runtime_error("invalid GeLU plaintext scale");
+        vector<double> values(he->num_slots, value);
+        if (loc == LOCATION::HOST) {
+            auto ctx = he->context->get_context_data(quartic[0].hcipher().parms_id());
+            for (int k = 0; k < levels; ++k) ctx = ctx->next_context_data();
+            he->encoder->encode(values, ctx->parms_id(), scale, pt);
+        } else {
+            he->dencoder->encode(*he->dcontext, values, scale, pt,
+                                quartic[0].dcipher().chain_index() + levels);
+        }
     };
-    vector<double> c4(he->num_slots, -0.018154344446004743);
-    vector<double> c2(he->num_slots, 0.30869355275897581);
-    vector<double> c0(he->num_slots, 0.027529737185454588);
-    UnifiedPlaintext p4(loc), p2(loc), p0(loc);
-    if (loc == LOCATION::HOST) {
-        const auto pid = quartic[0].hcipher().parms_id();
-        const auto last = he->context->get_context_data(pid)
-                              ->next_context_data()->next_context_data()->parms_id();
-        he->encoder->encode(c4, pid, coefficient_scale(quartic[0]), p4);
-        he->encoder->encode(c2, pid, coefficient_scale(square[0]), p2);
-        he->encoder->encode(c0, last, target_scale, p0);
-    } else {
-        const auto chain = quartic[0].dcipher().chain_index();
-        he->dencoder->encode(*he->dcontext, c4, coefficient_scale(quartic[0]), p4, chain);
-        he->dencoder->encode(*he->dcontext, c2, coefficient_scale(square[0]), p2, chain);
-        he->dencoder->encode(*he->dcontext, c0, target_scale, p0, chain + 2);
-    }
-    auto evaluate = [&](auto *evaluator) {
-        for (size_t i = 0; i < input.size(); ++i) {
-            evaluator->multiply_plain_inplace(quartic[i], p4);
-            evaluator->multiply_plain_inplace(square[i], p2);
-            for (int step = 0; step < 2; ++step) {
-                evaluator->rescale_to_next_inplace(quartic[i]);
-                evaluator->rescale_to_next_inplace(square[i]);
+    vector<UnifiedPlaintext> coefficients(5, UnifiedPlaintext(loc));
+    const double product_scale = target_scale * double(drop1) * double(drop2);
+    encode(a, product_scale / quartic[0].scale(), 0, coefficients[0]);
+    encode(b, product_scale / cube[0].scale(), 0, coefficients[1]);
+    encode(c, product_scale / square[0].scale(), 0, coefficients[2]);
+    encode(0.5 - d, product_scale / input[0].scale(), 0, coefficients[3]);
+    encode(0.5 + d, product_scale / input[0].scale(), 0, coefficients[4]);
+    UnifiedPlaintext constant(loc);
+    encode(e, target_scale, 2, constant);
+    auto evaluate = [&](auto *ev) {
+        for (size_t i = 0; i < n; ++i) {
+            UnifiedCiphertext negative_linear(loc), positive_linear(loc);
+            ev->multiply_plain(input[i], coefficients[3], negative_linear);
+            ev->multiply_plain(input[i], coefficients[4], positive_linear);
+            ev->multiply_plain_inplace(quartic[i], coefficients[0]);
+            ev->multiply_plain_inplace(cube[i], coefficients[1]);
+            ev->multiply_plain_inplace(square[i], coefficients[2]);
+            for (auto *term : {&quartic[i], &cube[i], &square[i], &negative_linear, &positive_linear}) {
+                ev->rescale_to_next_inplace(*term);
+                ev->rescale_to_next_inplace(*term);
                 he_rescale_count += 2;
-            }
-            for (auto *term : {&quartic[i], &square[i]}) {
-                const double error = abs(term->scale() / target_scale - 1.0);
-                if (!isfinite(error) || error > 1e-6)
-                    throw runtime_error("GeLU term did not reach target scale");
+                if (!isfinite(term->scale()) || abs(term->scale() / target_scale - 1) > 1e-6)
+                    throw runtime_error("GeLU scale mismatch");
                 term->scale() = target_scale;
             }
-            evaluator->add(quartic[i], square[i], output_cts[i]);
-            evaluator->add_plain_inplace(output_cts[i], p0);
+            ev->add(quartic[i], square[i], output_cts[i]);
+            output_cts[n+i] = output_cts[i];
+            ev->sub_inplace(output_cts[i], cube[i]);
+            ev->add_inplace(output_cts[i], negative_linear);
+            ev->add_plain_inplace(output_cts[i], constant);
+            ev->add_inplace(output_cts[n+i], cube[i]);
+            ev->add_inplace(output_cts[n+i], positive_linear);
+            ev->add_plain_inplace(output_cts[n+i], constant);
         }
     };
     if (loc == LOCATION::HOST) evaluate(he->evaluator);
     else evaluate(he->devaluator);
-    for (const auto &ct : output_cts) {
-        if (ct.coeff_modulus_size() != 1 || ct.location() != loc ||
-            !isfinite(ct.scale()) || abs(ct.scale() / target_scale - 1.0) > 1e-9)
-            throw runtime_error("invalid GeLU output metadata");
-    }
-    cout << "FORMAL_GELU_SCALE_READY status=PASS actual_scale_bits="
-         << output_scale_bits << " limbs=1 cts=" << output_cts.size()
-         << " polynomial=even_quartic ct_ct_per_ciphertext=2" << endl;
+    for (const auto &ct : output_cts)
+        if (ct.coeff_modulus_size() != 1) throw runtime_error("invalid GeLU final level");
+    cout << "FORMAL_GELU_SCALE_READY status=PASS actual_scale_bits=" << output_scale_bits
+         << " limbs=1 cts=" << output_cts.size()
+         << " polynomial=blb_F0_F1 ct_ct_per_input_ciphertext=3" << endl;
 }
 
 // void Bert_ckks::mp2ml_test(){
@@ -1542,9 +1519,16 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_nonlinear(map<char*,FixArray> inp
     int dim = x_flat_avg.size / num_ops;
     cout << "in layer_norm_nonlinear, bitwidth,s,num_ops,dim:" << bitwidth << "," << s << "," << num_ops << "," << dim << endl;
     cout << "sigma.size, should be L:" << sigma.size << endl;
+    // Padded rows are public and later discarded. Use public variance one
+    // before rsqrt so CKKS noise around an unused zero cannot create a
+    // negative fixed-point variance. No live token is clipped or opened.
+    if (!bert_post_norm && public_attention_mask_ready && sigma.size == static_cast<int>(public_attention_mask.size()))
+        for (int i=0; i<sigma.size; ++i)
+            if (public_attention_mask[i]) sigma.data[i] = party == sci::ALICE ? (uint64_t{1} << s) : 0;
     // 计算平方根倒数
+    const uint64_t sqrt_sent_before = current_comm();
     FixArray sigma_sqrt = fpmath->sqrt(sigma, true);
-    cout << "sqrt comm:" << this->get_comm() << endl;
+    cout << "sqrt comm:" << current_comm() - sqrt_sent_before << endl;
     cout << "sqrt round:" << this->get_round() << endl;
     //point8
     FixArray sigma_flat(party, x_flat_avg.size, sigma_sqrt.signed_, bitwidth, s);
@@ -1564,7 +1548,7 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_nonlinear(map<char*,FixArray> inp
     return result;
 }
 
-void gelu_nonlinear_thread(int tid, int party, uint64_t *x1, uint64_t* x2, uint64_t* output, int array_size, int ell, int s, FPMath *fpmath){
+void gelu_nonlinear_thread(int tid, int party, uint64_t *x1, uint64_t* x2, uint64_t* x3, uint64_t* output, int array_size, int ell, int s, FPMath *fpmath){
     // cout << "in gelu thread, tid:" << tid << endl;
     // x1/x2 are already additive shares produced by the HE->MPC boundary.
     // Re-inputting odd chunks as the remote party zeroed both parties' local
@@ -1575,41 +1559,18 @@ void gelu_nonlinear_thread(int tid, int party, uint64_t *x1, uint64_t* x2, uint6
     memcpy(x_array.data, x1, static_cast<size_t>(array_size) * sizeof(uint64_t));
     memcpy(gelu_poly_flat.data, x2,
            static_cast<size_t>(array_size) * sizeof(uint64_t));
-    auto start = high_resolution_clock::now();
-    // cout << "x_array.size:" << x_array.size << endl;
-    BoolArray msb_x = fpmath->fix->MSB(x_array);
-    // cout << "MSB time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
-    // no communication
-    FixArray neg_x = fpmath->fix->mul(x_array, -1);
-    // point 2
-    
-    FixArray y = fpmath->fix->if_else(msb_x, neg_x, x_array);
-
-    // FixOp::LT is the ordinary signed less-than predicate (MSB(y-c)).
-    // Selecting the polynomial with GT reverses the two regions and lets a
-    // quartic grow without bound in the tail.
-    BoolArray lt27 = fpmath->fix->LT(y, 2.7*(1 << s));
-    // point 8
-    BoolArray all_0 = fpmath->bool_op->input(sci::ALICE, array_size, uint8_t(0));
-    FixArray x_plus_y = fpmath->fix->add(x_array, y);
-    // (x + |x|) / 2 is the exact linear tail used outside the polynomial
-    // interval.  Merely changing the scale metadata leaves the raw value
-    // doubled; perform the one required arithmetic right shift first.
-    FixArray half_x_plus_y =
-        fpmath->fix->right_shift(x_plus_y, 1, all_0.data);
-    // point 9
-    // cout << "gelu_poly_flat(bitwidth,s):" << gelu_poly_flat.ell << "," << gelu_poly_flat.s << endl;
-    // cout << "x array bitwidth,s:" << x_array.ell << "," << x_array.s << endl;
-    // cout << "half_x_plus_y(bitwidth,s):" << half_x_plus_y.ell << "," << half_x_plus_y.s << endl;
-    half_x_plus_y.s = s;
-    // eval_gelu_poly deliberately returns only the even term.  Complete
-    // GELU with x/2 inside the approximation interval.
-    FixArray half_x = fpmath->fix->right_shift(x_array, 1, msb_x.data);
-    half_x.s = s;
-    FixArray gelu_inner = fpmath->fix->add(gelu_poly_flat, half_x);
-    // half_x_plus_y = (x+|x|)/2 = max(x,0).
-    FixArray ret =
-        fpmath->fix->if_else(lt27, gelu_inner, half_x_plus_y);
+    FixArray positive(party, array_size, true, ell, s);
+    memcpy(positive.data, x3, static_cast<size_t>(array_size) * sizeof(uint64_t));
+    // Use LT/MSB directly. Donor BoolOp::NOT flips both XOR shares, so
+    // derived LE/GE names do not have their conventional semantics.
+    auto negative = fpmath->fix->MSB(x_array);
+    auto below = fpmath->fix->LT(x_array, uint64_t(-int64_t(2.7 * (1ULL << s))));
+    auto above = fpmath->fix->LT(
+        fpmath->fix->input(sci::PUBLIC, array_size,
+                          uint64_t(2.7 * (1ULL << s)), true, ell, s), x_array);
+    auto inner = fpmath->fix->if_else(negative, gelu_poly_flat, positive);
+    auto left = fpmath->fix->if_else(below, uint64_t(0), inner);
+    auto ret = fpmath->fix->if_else(above, x_array, left);
     // cout << "OK1" << endl;
     for(int i = 0; i < array_size; i++){
         output[i] = ret.data[i];
@@ -1621,6 +1582,7 @@ void gelu_nonlinear_thread(int tid, int party, uint64_t *x1, uint64_t* x2, uint6
 FixArray Bert_ckks::gelu_nonlinear(std::map<char*,FixArray> input){
     FixArray x_array = input["x_array"];
     FixArray gelu_poly_flat = input["gelu_poly_flat"];
+    FixArray gelu_positive = input.at("gelu_positive");
     // Pure output buffer: every entry is written by a worker below. Do not
     // invoke an MPC input protocol or seed it with a constant share.
     FixArray ret(party, x_array.size, x_array.signed_, x_array.ell,
@@ -1646,7 +1608,8 @@ FixArray Bert_ckks::gelu_nonlinear(std::map<char*,FixArray> input){
                 i, 
                 party, 
                 &x_array.data[offset], 
-                &gelu_poly_flat.data[offset], 
+                &gelu_poly_flat.data[offset],
+                &gelu_positive.data[offset],
                 &ret.data[offset],
                 lnum_ops,
                 x_array.ell,
@@ -1712,29 +1675,38 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
     // qk gaps below -13 returned deterministic 1e7-scale signed values.
     // Compare and clamp in MPC before the HE polynomial, then mux the exact
     // fixed-point zero back for x <= -13.  No activation is opened.
-    FPMath *exp_math = this->nonlinear.fpmath[0];
     const int64_t cutoff_value = -13LL * (int64_t{1} << scale);
     const uint64_t cutoff_raw = static_cast<uint64_t>(cutoff_value);
-    // In this SCI fork the signed comparison primitive exposed as LT/MSB is
-    // oriented as ``lhs >= rhs`` (the BLB code compensates for this in its
-    // max/GELU call sites).  GE therefore represents the actual predicate
-    // lhs <= rhs that is required here, including the -13 boundary.
+    // LT/MSB is the direct signed predicate. Do not use derived GE/LE:
+    // the donor BoolOp::NOT toggles both XOR shares, leaving their XOR unchanged.
     BoolArray underflow;
     FixArray evaluation_input = x;
+    const int exp_workers = min(nonlinear.active_workers(), x.size);
     if (blb_secure_exp_clamp_enabled()) {
-        underflow = exp_math->fix->GE(x, cutoff_raw);
-        evaluation_input = exp_math->fix->if_else(
-            underflow, cutoff_raw, x);
+        const auto clip_start = high_resolution_clock::now();
+        underflow = BoolArray(x.party, x.size);
+        vector<thread> workers;
+        for (int worker = 0; worker < exp_workers; ++worker) {
+            const int begin = x.size * worker / exp_workers;
+            const int end = x.size * (worker + 1) / exp_workers;
+            workers.emplace_back([&, worker, begin, end]() {
+                FixArray local(x.party, end - begin, x.signed_, x.ell, x.s);
+                local.set_p(x.p);
+                copy_n(x.data + begin, end - begin, local.data);
+                auto *fix = nonlinear.fpmath[worker]->fix;
+                auto below = fix->LT(local, cutoff_raw);
+                auto clipped = fix->if_else(below, cutoff_raw, local);
+                copy_n(below.data, end - begin, underflow.data + begin);
+                copy_n(clipped.data, end - begin, evaluation_input.data + begin);
+            });
+        }
+        for (auto &worker : workers) worker.join();
+        cout << "EXP_SAFETY_PHASE phase=input_clip workers=" << exp_workers
+             << " ms=" << chrono::duration<double, milli>(
+                    high_resolution_clock::now() - clip_start).count() << endl;
     }
-    // Real ViT attention gaps reach roughly -168.  The legacy fast form
-    // (1+x/64)^64 is unstable once x<-128 because the base magnitude exceeds
-    // one.  The comparison-free path uses (1+x/128)^128 instead.  Its public
-    // divisor is folded into the MPC-to-CKKS input scale, which removes the
-    // old plaintext multiply/rescale and leaves seven total rescale steps.
-    // The explicit secure-clamp reference retains Algorithm 5's /64 form.
-    const int exp_divisor_bits =
-        blb_secure_exp_clamp_enabled() ? 6 : 7;
-    const int exp_squarings = exp_divisor_bits;
+    // BLB Algorithm 5: exactly six squares after a public HE division by 64.
+    const int exp_squarings = 6;
     size_t public_masked_elements = 0;
     if (apply_attention_mask && public_attention_mask_ready) {
         const size_t row_width = public_attention_mask.size();
@@ -1781,7 +1753,7 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
         BlbViTCommAuditBucket::SOFTMAX_TO_CKKS_CONVERSION);
     vector<UnifiedPlaintext> pts_x;
     mpc_to_ckks(pts_x, vec_x, slots, he->get_conversion_prime(), ell,
-                scale + exp_divisor_bits, he->he_scale, he);
+                scale, he->he_scale, he);
     profile_set_conversion_bucket(previous_conversion_bucket);
     cout << "pts.size:" << pts_x.size() << endl;
     this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
@@ -1874,18 +1846,23 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
 
         start = high_resolution_clock::now();
 
-        // The divisor was folded into mpc_to_ckks above, so only the public
-        // one is needed at the current ciphertext level and scale.
-        UnifiedPlaintext one(loc);
+        // Algorithm 5: public /64 in HE, then +1 and six squares.
+        UnifiedPlaintext divisor(loc), one(loc);
+        double drop = he->is_gpu_enable()
+            ? he->dcontext->get_context_data(cts_x[0].dcipher().chain_index()).parms().coeff_modulus().back().value()
+            : he->context->get_context_data(cts_x[0].hcipher().parms_id())->parms().coeff_modulus().back().value();
+        const double divisor_scale = ldexp(1.0, he->he_scale);
+        const double next_scale = cts_x[0].scale() * divisor_scale / drop;
         if (!he->is_gpu_enable()) {
-            he->encoder->encode(1.0, cts_x[0].hcipher().parms_id(),
-                                cts_x[0].scale(), one);
+            auto ctx = he->context->get_context_data(cts_x[0].hcipher().parms_id());
+            he->encoder->encode(1.0/64.0, ctx->parms_id(), divisor_scale, divisor);
+            he->encoder->encode(1.0, ctx->next_context_data()->parms_id(), next_scale, one);
         } else {
-            he->dencoder->encode(
-                *he->dcontext, vector<double>(slots, 1.0),
-                cts_x[0].scale(), one, cts_x[0].dcipher().chain_index());
+            auto chain = cts_x[0].dcipher().chain_index();
+            he->dencoder->encode(*he->dcontext, vector<double>(slots, 1.0/64.0), divisor_scale, divisor, chain);
+            he->dencoder->encode(*he->dcontext, vector<double>(slots, 1.0), next_scale, one, chain + 1);
         }
-        
+
         // The encoded constant and uploads belong to the producer stream;
         // workers must finish before the main thread copies their results.
         const int exp_threads = min<int>(cts_x.size(),
@@ -1903,8 +1880,10 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
                 // Add Alice's independently converted share before applying
                 // the nonlinear polynomial; evaluating exp on only one share
                 // is not a secret-shared exp and was the source of the
-                // deterministic C4E/A0 corruption.
+                // deterministic C4E/B corruption.
                 he->evaluator->add_plain_inplace(cts_x[i], pts_x[i]);
+                he->evaluator->multiply_plain_inplace(cts_x[i], divisor);
+                he->evaluator->rescale_to_next_inplace(cts_x[i]);
                 he->evaluator->add_plain_inplace(cts_x[i], one);
                 for (int j = 0; j < exp_squarings; j++) {
                     he->evaluator->square_inplace(cts_x[i]);
@@ -1916,6 +1895,8 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
                 // Keep the GPU path's share aggregation identical to SEAL:
                 // both local CKKS shares are present before any HE multiply.
                 he->devaluator->add_plain_inplace(cts_x[i], pts_x[i]);
+                he->devaluator->multiply_plain_inplace(cts_x[i], divisor);
+                he->devaluator->rescale_to_next_inplace(cts_x[i]);
                 he->devaluator->add_plain_inplace(cts_x[i], one);
                 for (int j = 0; j < exp_squarings; j++) {
                     he->devaluator->square_inplace(cts_x[i]);
@@ -1928,7 +1909,7 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
             }
         }
 
-        he_rescale_count += cts_x.size() * exp_squarings;
+        he_rescale_count += cts_x.size() * (exp_squarings + 1);
 #ifdef BLB_HAS_HE_GPU
         for (int error : exp_errors)
             if (error != int(cudaSuccess))
@@ -1988,12 +1969,28 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
     // approximation.  Apply the mux after the HE round so malformed CKKS
     // values from the unclipped branch can never enter the denominator.
     if (blb_secure_exp_clamp_enabled()) {
-        ret = exp_math->fix->if_else(underflow, uint64_t(0), ret);
-        // Keep the element-wise clamp as an explicit correctness-reference
-        // mode.  It is not the paper default because two MPC passes over the
-        // complete attention matrix cost minutes per layer.
-        BoolArray negative_output = exp_math->fix->MSB(ret);
-        ret = exp_math->fix->if_else(negative_output, uint64_t(0), ret);
+        const auto clip_start = high_resolution_clock::now();
+        vector<thread> workers;
+        for (int worker = 0; worker < exp_workers; ++worker) {
+            const int begin = ret.size * worker / exp_workers;
+            const int end = ret.size * (worker + 1) / exp_workers;
+            workers.emplace_back([&, worker, begin, end]() {
+                auto *fix = nonlinear.fpmath[worker]->fix;
+                auto local = ret.subset(begin, end);
+                BoolArray below(local.party, end - begin);
+                copy_n(underflow.data + begin, end - begin, below.data);
+                local = fix->if_else(below, uint64_t(0), local);
+                // CKKS tails may be negative by a few raw units. Preserve
+                // the mandatory signed clamp exactly once, before row sums.
+                auto negative = fix->MSB(local);
+                auto clipped = fix->if_else(negative, uint64_t(0), local);
+                copy_n(clipped.data, end - begin, ret.data + begin);
+            });
+        }
+        for (auto &worker : workers) worker.join();
+        cout << "EXP_SAFETY_PHASE phase=output_mux_and_clamp workers="
+             << exp_workers << " ms=" << chrono::duration<double, milli>(
+                    high_resolution_clock::now() - clip_start).count() << endl;
     }
     if (apply_attention_mask && public_attention_mask_ready) {
         const size_t row_width = public_attention_mask.size();
@@ -2005,14 +2002,14 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
             }
         }
     }
-    // Keep approximation noise signed until the caller clamps negative tails.
+    // Values have been clamped; preserve the signed API metadata.
     ret.signed_ = x.signed_;
     cout << "FORMAL_SOFTMAX_EXP_CLIP status=PASS cutoff=-13"
          << " comparison="
-         << (blb_secure_exp_clamp_enabled() ? "secure_GE" : "none")
-         << " divisor=2^" << exp_divisor_bits
+         << (blb_secure_exp_clamp_enabled() ? "secure_LT" : "none")
+         << " divisor=2^" << 6
          << " exponent=2^" << exp_squarings
-         << " divisor_folded_into_conversion=1 zero_after_HE="
+         << " divisor_folded_into_conversion=0 zero_after_HE="
          << (blb_secure_exp_clamp_enabled() ? 1 : 0)
          << " negative_rounding_to_zero="
          << (blb_secure_exp_clamp_enabled() ? 1 : 0)
@@ -2039,22 +2036,22 @@ FixArray Bert_ckks::element_wise_mul(FixArray x, FixArray y){
     }
     int poly_modulus_degree = he->poly_modulus_degree;
     uint64_t slot_count = poly_modulus_degree / 2;
-    uint64_t num_cts = dim / slot_count;
-    if(x.size<slot_count){
+    uint64_t num_cts = (dim + slot_count - 1) / slot_count;
+    if (dim % slot_count != 0) {
+        const int padded_size = num_cts * slot_count;
         // Preserve the real shares while padding the public unused tail with
         // additive zero.  The old branch replaced both inputs with fresh,
         // uninitialized slot buffers, so the 3072 Softmax denominators were
         // discarded before the reciprocal-square multiplication.
-        FixArray x_padded(x.party, slot_count, x.signed_, x.ell, x.s);
-        FixArray y_padded(y.party, slot_count, y.signed_, y.ell, y.s);
-        fill(x_padded.data, x_padded.data + slot_count, uint64_t{0});
-        fill(y_padded.data, y_padded.data + slot_count, uint64_t{0});
+        FixArray x_padded(x.party, padded_size, x.signed_, x.ell, x.s);
+        FixArray y_padded(y.party, padded_size, y.signed_, y.ell, y.s);
+        fill(x_padded.data, x_padded.data + padded_size, uint64_t{0});
+        fill(y_padded.data, y_padded.data + padded_size, uint64_t{0});
         copy(x.data, x.data + original_size, x_padded.data);
         copy(y.data, y.data + original_size, y_padded.data);
         x = std::move(x_padded);
         y = std::move(y_padded);
-        dim = slot_count;
-        num_cts = 1;
+        dim = padded_size;
         cout << "FORMAL_ELEMENTWISE_PADDING status=PASS original_elements="
              << original_size << " padded_elements=" << slot_count
              << " copied_inputs=2 zero_tail=1 output_trimmed=1" << endl;
@@ -2436,33 +2433,15 @@ FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int 
         // division broadcasts the corresponding row denominator correctly.
         dn_rec_flat.data[i] = dn_rec.data[i / batch_dn_size];
     }
-    // Both operands are already MPC shares. Multiply here, without two
-    // Encode imports and a Decode export of the complete attention tensor.
-    // This also prevents another CKKS round trip from changing tiny tails.
-    const int product_shift = nm.s + dn_rec_flat.s - s_out;
-    if (product_shift < 0 || l_out + product_shift > 64)
-        throw invalid_argument("Softmax product exceeds the MPC ring width");
-    FixArray result(party, nm.size, nm.signed_, l_out, s_out);
-    const int workers = min(nonlinear.active_workers(), nm.size);
-    vector<thread> product_workers;
-    for (int worker = 0; worker < workers; ++worker) {
-        const int begin = nm.size * worker / workers;
-        const int end = nm.size * (worker + 1) / workers;
-        product_workers.emplace_back([&, worker, begin, end]() {
-            auto *fix = nonlinear.fpmath[worker]->fix;
-            FixArray numerator(party, end - begin, nm.signed_, nm.ell, nm.s);
-            copy_n(nm.data + begin, end - begin, numerator.data);
-            auto reciprocal = dn_rec_flat.subset(begin, end);
-            auto product = fix->mul(numerator, reciprocal, l_out + product_shift);
-            auto reduced = fix->truncate_reduce(product, product_shift);
-            copy_n(reduced.data, end - begin, result.data + begin);
-        });
-    }
-    for (auto &worker : product_workers) worker.join();
-    cout << "FORMAL_SOFTMAX_PRODUCT status=EXECUTED engine=MPC_BATCHED"
-         << " input_ell=" << nm.ell << " reciprocal_ell=" << reciprocal_ell
-         << " output_ell=" << result.ell
-         << " workers=" << workers << " ckks_round_trips=0" << endl;
+    // BLB Algorithm 5 smulcc executes in HE. Widen the reciprocal shares
+    // before import; changing ell metadata alone is not a share extension.
+    auto reciprocal_he = nonlinear.fpmath[0]->fix->extend(dn_rec_flat, nm.ell);
+    reciprocal_he.signed_ = nm.signed_;
+    if (l_out != nm.ell || s_out != nm.s || reciprocal_he.s != nm.s)
+        throw invalid_argument("BLB HE Softmax product output metadata mismatch");
+    FixArray result = element_wise_mul(nm, reciprocal_he);
+    cout << "FORMAL_SOFTMAX_PRODUCT status=EXECUTED engine=CKKS"
+         << " output_ell=" << result.ell << " ckks_round_trips=1" << endl;
     if (profile_is_enabled()) {
         profile_record_comm(BlbViTCommAuditBucket::SOFTMAX_REC,
                             current_comm() - rec_comm_before);
@@ -2493,7 +2472,7 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
     cout << "ell,s:" << ell << "," << s << endl;
     auto diagnostic_open_sum = [&](const FixArray &tensor,
                                    const char *stage) {
-        if (getenv("OURS_VIT_A0_AGGREGATE_MAX") == nullptr) return;
+        if (getenv("OURS_VIT_B_AGGREGATE_MAX") == nullptr) return;
         const uint64_t mask = tensor.ell_mask();
         uint64_t local_sum = 0;
         for (int i = 0; i < tensor.size; ++i)
@@ -2505,7 +2484,7 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
         int64_t decoded = static_cast<int64_t>(raw);
         if (opened.signed_ && (raw & (uint64_t{1} << (opened.ell - 1))))
             decoded -= static_cast<int64_t>(uint64_t{1} << opened.ell);
-        cout << "OURS_A0_SOFTMAX_SCALAR stage=" << stage
+        cout << "OURS_B_SOFTMAX_SCALAR stage=" << stage
              << " metric=sum value=" << setprecision(17)
              << ldexp(static_cast<double>(decoded), -opened.s)
              << defaultfloat << " ell=" << opened.ell
@@ -2653,37 +2632,15 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
     this->other_nonlinear_comm += get_comm();
     this->other_nonlinear_round += get_round();
     // Keep the production Softmax on BLB's HE-assisted exponentiation path.
-    // A previous A0 diagnostic revision replaced this with SCI exp4 plus an
+    // A previous B diagnostic revision replaced this with SCI exp4 plus an
     // exact MPC division and two secure clamps.  That path took roughly 350 s
     // for one 12-head normalization and was not a valid optimization baseline.
     // exp_he performs MPC->CKKS, evaluates the BLB polynomial on Phantom, and
     // returns additive shares; it never opens the activation to the client.
     //point3
     e_x_flat = exp_he(shifted_x_flat, false);
-    // CKKS approximation can return -1 or -2 raw units for tiny positive
-    // tails. Clamp while still signed; reinterpreting those words as unsigned
-    // corrupts the row sum and reciprocal. Each worker owns its SCI channel.
-    {
-        const int workers = min(nonlinear.active_workers(), e_x_flat.size);
-        vector<thread> clamp_workers;
-        for (int worker = 0; worker < workers; ++worker) {
-            const int begin = e_x_flat.size * worker / workers;
-            const int end = e_x_flat.size * (worker + 1) / workers;
-            clamp_workers.emplace_back([&, worker, begin, end]() {
-                auto local = e_x_flat.subset(begin, end);
-                auto *fix = fpmath[worker]->fix;
-                // MSB(local) is the negative predicate for this signed ring.
-                // The previous LE(local, 0) formulation computed the same
-                // selector through an extra Boolean NOT; keep the mux and
-                // comparison semantics while removing that local Boolean
-                // operation from every Softmax element.
-                auto negative = fix->MSB(local);
-                auto clipped = fix->if_else(negative, uint64_t(0), local);
-                copy_n(clipped.data, end - begin, e_x_flat.data + begin);
-            });
-        }
-        for (auto &worker : clamp_workers) worker.join();
-    }
+    // exp_he already applies C(z)=max(z,0) after the underflow mux. There
+    // is no intervening HE operation: a second C(C(z)) was redundant.
     e_x_flat.signed_ = false;
     diagnostic_open_softmax_prefix(e_x_flat, "exp", 8);
     diagnostic_open_softmax_row_sum(e_x_flat, "exp_row_sum");
@@ -2743,8 +2700,10 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
     cout << "sum_e_x.size:" << sum_e_x.size << endl;
     cout << "exp_he data time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
     start = high_resolution_clock::now();
+    // Strict B retains the full nonlinear ring. Public-range narrowing and
+    // reciprocal clipping are optional optimizations, not BLB restoration.
     FixArray ret_flat = div_batch_he_V2(
-        e_x_flat, sum_e_x, array_size, exp_ell, s, false, true, true);
+        e_x_flat, sum_e_x, array_size, exp_ell, s, false, false, false);
     diagnostic_open_sum(ret_flat, "probability");
     cout << "FORMAL_SOFTMAX_DIVISION status=PASS"
          << " engine=BLB_HE_ASSISTED_RECIPROCAL"
@@ -2799,12 +2758,11 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
     return ret;
 }
 
-FixArray Bert_ckks::heterogeneous_attention_norm_a1(
+FixArray Bert_ckks::heterogeneous_attention_norm(
     FixArray input,
     const vector<ours_vit::HeadProtocol> &protocols,
     const vector<double> &alphas, int logical_tokens,
-    int layer_id, bool group_contiguous_protocols,
-    bool native_he_linear) {
+    int layer_id, bool group_contiguous_protocols) {
     FCMetadata data = linear.data_lin1_0;
     const int tokens = data.image_size;
     const int per_head = tokens * tokens;
@@ -2813,7 +2771,7 @@ FixArray Bert_ckks::heterogeneous_attention_norm_a1(
         protocols.size() != PACKING_NUM || alphas.size() != PACKING_NUM ||
         logical_tokens <= 0 || logical_tokens > tokens || layer_id < 0 ||
         layer_id >= ours_vit::kPlanLayers) {
-        throw runtime_error("A1 heterogeneous attention metadata mismatch");
+        throw runtime_error("HETERO heterogeneous attention metadata mismatch");
     }
 
     vector<uint64_t> row_major(static_cast<size_t>(input.size));
@@ -2840,8 +2798,7 @@ FixArray Bert_ckks::heterogeneous_attention_norm_a1(
         const int group_heads = group_end - group_start;
         const int group_values = group_heads * per_head;
         ++protocol_invocations;
-        const bool native_linear_group = native_he_linear &&
-            protocols[group_start] == ours_vit::HeadProtocol::HeLinear;
+        const bool native_linear_group = protocols[group_start] == ours_vit::HeadProtocol::HeLinear;
         if (native_linear_group)
             ++native_linear_deferred_groups;
         else
@@ -2866,7 +2823,7 @@ FixArray Bert_ckks::heterogeneous_attention_norm_a1(
             softmax_heads += group_heads;
             if (public_attention_mask_ready) {
                 if (public_attention_mask.size() != static_cast<size_t>(tokens))
-                    throw runtime_error("A1 public attention mask shape mismatch");
+                    throw runtime_error("HETERO public attention mask shape mismatch");
                 if (party == sci::BOB) {
                     for (int group_head = 0; group_head < group_heads;
                          ++group_head) {
@@ -2933,50 +2890,11 @@ FixArray Bert_ckks::heterogeneous_attention_norm_a1(
         } else if (protocols[group_start] ==
                    ours_vit::HeadProtocol::HeLinear) {
             linear_heads += group_heads;
-            if (native_he_linear) {
-                // A3/A4 QKV export deliberately leaves these public head
-                // positions as additive zeros. Their real QK/V ciphertexts
-                // never entered MPC and are consumed by the native he1 path.
-                normalized = FixArray(party, group_values, true,
-                                      input.ell, input.s);
-                fill(normalized.data, normalized.data + normalized.size, 0);
-            } else {
-            vector<uint64_t> alpha_values(group_values, 0);
-            for (int group_head = 0; group_head < group_heads; ++group_head) {
-                const int head = group_start + group_head;
-                if (!isfinite(alphas[head]))
-                    throw runtime_error("A1 HE-linear alpha is not finite");
-                const long double scaled =
-                    static_cast<long double>(alphas[head]) *
-                    static_cast<long double>(uint64_t(1) << input.s);
-                if (scaled <
-                        static_cast<long double>(numeric_limits<int64_t>::min()) ||
-                    scaled >
-                        static_cast<long double>(numeric_limits<int64_t>::max()))
-                    throw runtime_error(
-                        "A1 HE-linear alpha exceeds fixed-point range");
-                const uint64_t alpha_raw =
-                    static_cast<uint64_t>(llround(scaled)) & ring_mask;
-                fill(alpha_values.begin() +
-                         static_cast<size_t>(group_head) * per_head,
-                     alpha_values.begin() +
-                         static_cast<size_t>(group_head + 1) * per_head,
-                     alpha_raw);
-            }
-            FixArray alpha = fix->input(sci::PUBLIC, group_values,
-                                        alpha_values.data(), true,
-                                        input.ell, input.s);
-            normalized = fix->mul(group_input, alpha, input.ell + input.s);
-            normalized = fix->truncate_reduce(normalized, input.s);
-            for (int group_head = 0; group_head < group_heads; ++group_head)
-                for (int query = 0; query < tokens; ++query)
-                    for (int key = logical_tokens; key < tokens; ++key)
-                        normalized.data[
-                            (static_cast<size_t>(group_head) * tokens + query) *
-                                tokens + key] = 0;
-            }
+            // Linear operands stay in CKKS; these positions are public zeros.
+            normalized = FixArray(party, group_values, true, input.ell, input.s);
+            fill(normalized.data, normalized.data + normalized.size, 0);
         } else {
-            throw runtime_error("A1 head protocol code is invalid");
+            throw runtime_error("HETERO head protocol code is invalid");
         }
         memcpy(result.data + static_cast<size_t>(group_start) * per_head,
                normalized.data,
@@ -3001,18 +2919,11 @@ FixArray Bert_ckks::heterogeneous_attention_norm_a1(
         const uint64_t group_he_rescales =
             linear.rescale_count - group_rescale_start +
             he_rescale_count - group_he_rescale_start;
-        // A1/A2 deliberately exercise the Linear normalization semantics in
-        // MPC.  Keep that surrogate visibly distinct from A4's real CKKS
-        // implementation so calibration cannot mistake the two costs.
         const char *execution_domain =
             protocols[group_start] == ours_vit::HeadProtocol::HeLinear
-                ? (native_he_linear ? "CKKS_deferred" : "MPC_surrogate")
-                : "MPC_CKKS_hybrid";
+                ? "CKKS_deferred" : "MPC_CKKS_hybrid";
         cout << "OURS_HETERO_PATH_PROFILE status=PASS"
-             << " ablation="
-             << (native_he_linear
-                     ? ours_vit::to_string(heterogeneous_ablation)
-                     : (group_contiguous_protocols ? "A2" : "A1"))
+             << " version=" << ours_vit::to_string(heterogeneous_version)
              << " layer=" << layer_id
              << " protocol=" << ours_vit::to_string(protocols[group_start])
              << " physical_head_begin=" << group_start
@@ -3029,14 +2940,11 @@ FixArray Bert_ckks::heterogeneous_attention_norm_a1(
              << " rounds=" << group_rounds
              << " execution_domain=" << execution_domain
              << " conversion_scope="
-             << (native_he_linear ? "selective_group" : "shared_full_boundary")
+             << "selective_group"
              << " private_dynamic_branch=0" << defaultfloat << endl;
         group_start = group_end;
     }
-    cout << (native_he_linear
-                 ? "OURS_A3_GROUPED_NORMALIZATION"
-                 : (group_contiguous_protocols ? "OURS_A2_NORMALIZATION" :
-                                                 "OURS_A1_NORMALIZATION"))
+    cout << "OURS_HETERO_NORMALIZATION"
          << " status=PASS layer_scope=current"
          << " softmax_heads=" << softmax_heads
          << " relu_heads=" << relu_heads
@@ -3047,8 +2955,8 @@ FixArray Bert_ckks::heterogeneous_attention_norm_a1(
          << native_linear_deferred_groups
          << " grouping=" << (group_contiguous_protocols ? 1 : 0)
          << " linear_location="
-         << (native_he_linear ? "native_CKKS_deferred" : "MPC_surrogate")
-         << " selective_conversion=" << (native_he_linear ? 1 : 0)
+         << "native_CKKS_deferred"
+         << " selective_conversion=" << 1
          << " private_dynamic_branch=0" << endl;
     return result;
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ViT entry point: HAP-ViT.json, full inference by default."""
+"""ViT entry point: experiment.json, full inference by default."""
 import runpy
 import sys
 from pathlib import Path

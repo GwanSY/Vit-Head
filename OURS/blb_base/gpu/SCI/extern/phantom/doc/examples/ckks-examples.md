@@ -1,2 +1,0 @@
-# CKKS Examples
-

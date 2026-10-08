@@ -1,0 +1,74 @@
+{
+  "paths": {
+    "model": "checkpoints/vit_b16/bolt_model.txt",
+    "model_manifest": "checkpoints/vit_b16/manifest.json",
+    "preprocess_manifest": "checkpoints/vit_b16/manifest.json",
+    "public_manifest": "../../datasets/imagenet2012/val/validation_manifest.csv",
+    "image_root": "../../datasets/imagenet2012/val",
+    "allocator_costs": "outputs/matrix/inputs/allocator_costs.csv",
+    "supplemental_costs": "outputs/matrix/inputs/training_costs.csv",
+    "probe_manifest": "outputs/matrix/inputs/probe_manifest.csv",
+    "output_dir": "outputs/matrix/experiment_01"
+  },
+  "accuracy": {
+    "budgets_pp": [
+      0.1,
+      0.5,
+      1.0
+    ],
+    "comparison_budget_pp": 0.5
+  },
+  "data": {
+    "calibration_count": 1000,
+    "calibration_start": 0,
+    "heldout_count": 1000,
+    "heldout_start": null
+  },
+  "search": {
+    "workers": 8,
+    "batch_size": 8,
+    "max_frontier": 1024,
+    "max_candidates": 24,
+    "logit_weight": 0.25
+  },
+  "cost_model": {
+    "cost_ridge": 0.001,
+    "allow_missing_probes": true
+  },
+  "comparisons": {
+    "random_seed": 20260905,
+    "random_repeats": 20,
+    "oracle_layer": 0,
+    "oracle_heads": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "secure": {
+    "backend": "gpu",
+    "gpu_id": 7,
+    "gpu_pair": [
+      0,
+      1
+    ],
+    "image": "ours:restored-fast-20260903d",
+    "binary_override": "build/container-gpu/bin/ours_vit_b16_main",
+    "phantom_library_override": "build/container-gpu/extern/phantom/lib/libPhantom.so",
+    "input": "inputs/vit_b16/bob_image.txt",
+    "gpu_direct_plaintext": 1,
+    "gpu_linear_streams": 8,
+    "omp_threads": 64,
+    "port": 31003,
+    "timeout_seconds": 21600,
+    "assignment": null,
+    "output_dir": null,
+    "head_plan": null,
+    "min_free_memory_mib": 70000,
+    "max_gpu_utilization_percent": 5,
+    "network_mode": "netem",
+    "version": "B",
+    "paired_config": null
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "B": {"plan_source": "all_softmax", "allocator": false, "packing": false, "paired_with": null},
+  "H": {"plan_source": "manual", "allocator": false, "packing": false, "paired_with": null},
+  "HA": {"plan_source": "allocator_unpacked", "allocator": true, "packing": false, "paired_with": null},
+  "HP": {"plan_source": "reuse_H", "allocator": false, "packing": true, "paired_with": "H"},
+  "HAP": {"plan_source": "reuse_HA", "allocator": false, "packing": true, "paired_with": "HA"},
+  "J": {"plan_source": "allocator_packed", "allocator": true, "packing": true, "paired_with": null},
+  "BP": {"plan_source": "all_softmax", "allocator": false, "packing": true, "paired_with": "B"}
+}

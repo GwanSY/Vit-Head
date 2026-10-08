@@ -56,20 +56,20 @@ def main() -> None:
                 "composition": name,
                 "S_heads": str(counts[0]), "R_heads": str(counts[1]),
                 "L_heads": str(counts[2]), "split": split,
-                "ablation": "A4" if counts[2] else "A3",
+                "version": "H",
                 "plan": str(path.resolve()),
             })
     manifest = args.output_dir / "composition_probe_manifest.csv"
     with manifest.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=[
             "composition", "S_heads", "R_heads", "L_heads", "split",
-            "ablation", "plan"])
+            "version", "plan"])
         writer.writeheader()
         writer.writerows(rows)
     print(f"OURS_COMPOSITION_PROBE_SUITE status=PASS output={manifest}")
     for row in rows:
         print(f"composition={row['composition']} split={row['split']} "
-              f"ablation={row['ablation']} plan={row['plan']}")
+              f"version={row['version']} plan={row['plan']}")
 
 
 if __name__ == "__main__":

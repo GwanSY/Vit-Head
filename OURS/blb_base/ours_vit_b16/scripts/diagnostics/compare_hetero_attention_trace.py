@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare a real A3/A4 secure attention result with fixed-clear ViT.
+"""Compare a real heterogeneous secure attention result with fixed-clear ViT.
 
 The secure trace is opened only after QK, normalization, AV, WO, and the
 attention residual have completed.  It is a validation sink: its values are
@@ -116,8 +116,8 @@ def main() -> None:
     parser.add_argument("--head-plan", type=Path, required=True)
     parser.add_argument(
         "--secure-input-trace", type=Path,
-        help=("optional opened block input; when supplied, validates A3/A4 "
-              "in isolation from the upstream A0 prefix"))
+        help=("optional opened block input; when supplied, validates heterogeneous "
+              "in isolation from the upstream B prefix"))
     parser.add_argument("--secure-trace", type=Path, required=True)
     parser.add_argument("--peer-input-trace", type=Path)
     parser.add_argument("--peer-trace", type=Path)
@@ -203,8 +203,8 @@ def main() -> None:
         failures.append("logical_relative_l2")
     if float(logical["max_abs"]) > args.max_abs:
         failures.append("logical_max_abs")
-    # A secure-input comparison deliberately isolates A3/A4 from the paused
-    # A0 prefix.  Preserve and report its padded-row defect, but do not charge
+    # A secure-input comparison deliberately isolates heterogeneous from the paused
+    # B prefix.  Preserve and report its padded-row defect, but do not charge
     # that upstream defect to the isolated attention-path gate.
     if not isolated_from_secure_input and padding_max_abs > args.max_padding_abs:
         failures.append("padding_max_abs")
@@ -227,7 +227,7 @@ def main() -> None:
                        if args.peer_trace is not None else None),
         "fixed_clear_reference": "vit_reference.Graph(fixed=True)",
         "reference_scope": (
-            "A3/A4 attention isolated from opened secure block input"
+            "heterogeneous attention isolated from opened secure block input"
             if isolated_from_secure_input else
             "canonical input through complete fixed-clear prefix"),
         "compared_tensor": compared_tensor,

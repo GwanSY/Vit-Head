@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Public fixed-clear oracle for A1's three paths and mixed head execution."""
+"""Public fixed-clear oracle for heterogeneous's three paths and mixed head execution."""
 
 from __future__ import annotations
 
@@ -100,7 +100,7 @@ def main() -> None:
     if any(count == 0 for count in counts.values()):
         failures.append("manual plan did not execute all three paths")
     report = {
-        "format": "OURS_VIT_A1_MANUAL_MIXED_ORACLE_V1",
+        "format": "OURS_VIT_HETERO_MANUAL_MIXED_ORACLE_V1",
         "status": "PASS" if not failures else "FAIL",
         "model": str(args.model.resolve()),
         "input": str(args.input.resolve()),
@@ -114,10 +114,10 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n",
                            encoding="utf-8")
-    print(f"OURS_A1_MANUAL_MIXED_ORACLE status={report['status']}")
-    print(f"OURS_A1_MANUAL_MIXED_REPORT={args.output}")
+    print(f"OURS_HETERO_MANUAL_MIXED_ORACLE status={report['status']}")
+    print(f"OURS_HETERO_MANUAL_MIXED_REPORT={args.output}")
     if failures:
-        raise SystemExit("A1 manual mixed oracle failed")
+        raise SystemExit("heterogeneous manual mixed oracle failed")
 
 
 if __name__ == "__main__":

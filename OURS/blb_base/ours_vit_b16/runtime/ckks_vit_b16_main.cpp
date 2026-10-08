@@ -5,9 +5,9 @@
 // layers.  The only ViT-specific code here is model/input adaptation and the
 // two pre-norm residual boundaries required by the ViT graph.  No BFV/BOLT
 // operator, heterogeneous attention, alternate Softmax, alternate GELU, or
-// alternate LayerNorm is selected by the A0 execution path. A public,
-// pre-inference head plan selects A1 normalization and A2 synchronized
-// reorder/grouping. A3 adds grouped selective CKKS<->MPC conversion and A4
+// alternate LayerNorm is selected by the B execution path. A public,
+// pre-inference head plan selects heterogeneous normalization and synchronized
+// reorder/grouping. SELECTIVE adds grouped selective CKKS<->MPC conversion and NATIVE
 // keeps Linear heads on the native CKKS path through QK, AV, and WO.
 
 #include "ckks_bert.h"
@@ -80,7 +80,7 @@ struct Args {
   // Profiling-only early stop.  The default remains the complete 12-block
   // ViT graph; stopping after a block never changes the operator path.
   int stop_after_block = kLayers;
-  ours_vit::Ablation ablation = ours_vit::Ablation::A0;
+  ours_vit::Version version = ours_vit::Version::B;
   string head_plan;
   bool validate_plan_only = false;
   string role;
@@ -205,7 +205,7 @@ static void usage(const char *name) {
   cerr << "usage: " << name
        << " --party 1|2 --port P --address HOST --model FILE"
           " --input FILE --output DIR --backend gpu|cpu"
-          " --stop-after-block N --ablation a0|a1|a2|a3|a4"
+          " --stop-after-block N --version B|H|HA|HP|HAP|J|BP"
           " [--role cloud|edge] [--head-plan FILE] [--validate-plan-only]\n";
 }
 
@@ -233,8 +233,8 @@ static Args parse_args(int argc, char **argv) {
     else if (key == "--physical-tokens") args.physical_tokens = stoi(next(i, key));
     else if (key == "--stop-after-block")
       args.stop_after_block = stoi(next(i, key));
-    else if (key == "--ablation")
-      args.ablation = ours_vit::parse_ablation(next(i, key));
+    else if (key == "--version")
+      args.version = ours_vit::parse_version(next(i, key));
     else if (key == "--head-plan") args.head_plan = next(i, key);
     else if (key == "--validate-plan-only") args.validate_plan_only = true;
     else if (key == "--help" || key == "-h") {
@@ -272,16 +272,16 @@ static uint64_t ring_mask(int ell) {
   return (uint64_t{1} << ell) - 1;
 }
 
-static FixArray a0_projected_tensor_to_token_major(
+static FixArray b_projected_tensor_to_token_major(
     const FixArray &packed, int party, int tokens) {
   const size_t expected =
       static_cast<size_t>(tokens) * kHeads * kHeadDim;
   if (packed.size != static_cast<int>(expected))
-    throw runtime_error("A0 projected-tensor observer shape mismatch");
+    throw runtime_error("B projected-tensor observer shape mismatch");
   const int slots = tokens * kHeadDim;
   if (slots % 2 != 0 || packed.size % slots != 0 ||
       packed.size / slots != kHeads)
-    throw runtime_error("A0 projected-tensor packing is incompatible");
+    throw runtime_error("B projected-tensor packing is incompatible");
   FixArray result(party, packed.size, packed.signed_, packed.ell, packed.s);
   for (int ciphertext = 0; ciphertext < kHeads; ++ciphertext) {
     for (int slot = 0; slot < slots; ++slot) {
@@ -309,7 +309,7 @@ static void write_validation_stage(Bert_ckks &bert, const FixArray &share,
                                    const string &log_event) {
   size_t elements = 1;
   for (int extent : shape) {
-    if (extent <= 0) throw invalid_argument("A0 stage shape is invalid");
+    if (extent <= 0) throw invalid_argument("B stage shape is invalid");
     elements *= static_cast<size_t>(extent);
   }
   if (elements != static_cast<size_t>(share.size))
@@ -347,12 +347,12 @@ static void write_validation_stage(Bert_ckks &bert, const FixArray &share,
        << " feeds_secure_graph=0 reencrypt=0" << endl;
 }
 
-static void write_a0_stage(Bert_ckks &bert, const FixArray &share,
+static void write_b_stage(Bert_ckks &bert, const FixArray &share,
                            const string &stage,
                            const vector<int> &shape) {
   write_validation_stage(bert, share, stage, shape,
-                         string(getenv("OURS_VIT_A0_TRACE_DIR")), "a0_",
-                         "OURS_VIT_A0_STAGE_V1", "OURS_A0_STAGE");
+                         string(getenv("OURS_VIT_B_TRACE_DIR")), "b_",
+                         "OURS_VIT_B_STAGE_V1", "OURS_B_STAGE");
 }
 
 static void write_hetero_attention_stage(Bert_ckks &bert,
@@ -730,7 +730,8 @@ static void write_online_stage_profiles(
   ofstream out(dir + "/block_online_profile_party" + to_string(party) +
                ".csv");
   if (!out) throw runtime_error("cannot write block online profile");
-  out << "block,stage,wall_ms,send_bytes,rounds\n";
+  out << "block,stage,wall_ms,send_bytes,rounds,he_rotations,he_ct_pt_multiply,"
+         "he_ct_ct_multiply,he_rescales,conversion_ciphertexts,plaintext_device_encode_ms\n";
   out << fixed << setprecision(6);
   for (const BlockProfile &profile : profiles) {
     for (size_t index = 0; index < kBlbViTProfileStageCount; ++index) {
@@ -738,12 +739,14 @@ static void write_online_stage_profiles(
       const auto &metric = profile.online_stages[index];
       out << profile.block << ',' << profile_stage_name(stage) << ','
           << metric.wall_ms << ',' << metric.send_bytes << ','
-          << metric.rounds << '\n';
+          << metric.rounds;
+      for (auto count : metric.operators) out << ',' << count;
+      out << ',' << metric.plaintext_device_encode_ms << '\n';
     }
     out << profile.block << ",BLOCK_ONLINE_TIME,"
-        << profile.block_online_time_ms << ",0,0\n";
+        << profile.block_online_time_ms << ",0,0,,,,,,\n";
     out << profile.block << ",BLOCK_ONLINE_COMM,0,"
-        << profile.block_online_comm_bytes << ",0\n";
+        << profile.block_online_comm_bytes << ",0,,,,,,\n";
   }
 }
 
@@ -891,20 +894,20 @@ int main(int argc, char **argv) {
     cout << "TRUNCATION_MODE mode=original_blb_interactive" << endl;
     filesystem::create_directories(args.output);
 
-    if (args.ablation == ours_vit::Ablation::A0 && !args.head_plan.empty())
-      throw invalid_argument("A0 is immutable and does not accept --head-plan");
-    if (args.ablation != ours_vit::Ablation::A0 && args.head_plan.empty())
-      throw invalid_argument("A1-A4 require a public offline --head-plan");
+    if (args.version == ours_vit::Version::B && !args.head_plan.empty())
+      throw invalid_argument("B is immutable and does not accept --head-plan");
+    if (args.version != ours_vit::Version::B && args.head_plan.empty())
+      throw invalid_argument("heterogeneous require a public offline --head-plan");
     ours_vit::HeteroPlan head_plan =
-        args.ablation == ours_vit::Ablation::A0
-            ? ours_vit::HeteroPlan::all_softmax_a0()
+        args.version == ours_vit::Version::B
+            ? ours_vit::HeteroPlan::all_softmax()
             : ours_vit::HeteroPlan::load_file(args.head_plan);
-    head_plan.validate(args.ablation);
+    head_plan.validate(args.version);
     ours_vit::EdgeCloudRuntime edge_cloud(
         args.party,
         {"ours_vit_b16_pre_norm_v1", kLogicalTokens, kPhysicalTokens, kDim,
          kHeadDim, kClasses, args.stop_after_block},
-        head_plan, args.ablation);
+        head_plan, args.version);
     {
       ofstream contract(args.output + "/edge_cloud_contract_party" +
                         to_string(args.party) + ".txt");
@@ -913,10 +916,10 @@ int main(int argc, char **argv) {
     }
     head_plan.write_audit_csv(
         args.output + "/head_plan_party" + to_string(args.party) + ".csv",
-        args.ablation);
-    cout << "OURS_HEAD_PLAN status=VALID ablation="
-         << ours_vit::to_string(args.ablation)
-         << " source=" << (args.head_plan.empty() ? "built_in_a0" : args.head_plan)
+        args.version);
+    cout << "OURS_HEAD_PLAN status=VALID version="
+         << ours_vit::to_string(args.version)
+         << " source=" << (args.head_plan.empty() ? "built_in_b" : args.head_plan)
          << " public_pre_inference=1 private_dynamic_branch=0" << endl;
     if (args.validate_plan_only) {
       cout << "OURS_HEAD_PLAN_VALIDATION status=PASS execution=NOT_RUN" << endl;
@@ -928,8 +931,13 @@ int main(int argc, char **argv) {
     BertModel blb_model;
     if (edge_cloud.is_cloud()) {
       vit = load_vit_model(args.model);
-      if (args.ablation >= ours_vit::Ablation::A2)
+      const auto reorder_start = chrono::steady_clock::now();
+      if (args.version != ours_vit::Version::B)
         reorder_vit_attention_heads(vit, head_plan);
+      cout << "OURS_OFFLINE_HEAD_REORDER milliseconds="
+           << chrono::duration<double, milli>(
+                  chrono::steady_clock::now() - reorder_start).count()
+           << " scope=whole_model included_in_online=0" << endl;
       blb_model = convert_vit_to_blb_model(vit);
     }
 
@@ -938,7 +946,7 @@ int main(int argc, char **argv) {
                    edge_cloud.is_cloud() ? &blb_model : nullptr,
                    args.physical_tokens, false,
                    max(1, args.stop_after_block),
-                   args.ablation == ours_vit::Ablation::A4);
+                   head_plan.has_linear());
     edge_cloud.agree(*bert.io);
     cout << "OURS_EDGE_CLOUD role=" << edge_cloud.role_name()
          << " contract=" << edge_cloud.contract_digest()
@@ -991,32 +999,22 @@ int main(int argc, char **argv) {
     comm.mark("initialization_boundary");
     const auto online_start = chrono::steady_clock::now();
     double secure_protocol_seconds = 0.0;
-    const bool a0_trace = getenv("OURS_VIT_A0_TRACE") != nullptr &&
-                          string(getenv("OURS_VIT_A0_TRACE")) == "1";
+    const bool b_trace = getenv("OURS_VIT_B_TRACE") != nullptr &&
+                          string(getenv("OURS_VIT_B_TRACE")) == "1";
     const bool hetero_attention_trace =
         getenv("OURS_VIT_HETERO_ATTENTION_TRACE") != nullptr &&
         string(getenv("OURS_VIT_HETERO_ATTENTION_TRACE")) == "1";
-    bool heterogeneous_group_packing = true;
-    if (getenv("OURS_VIT_GROUP_PACKING") != nullptr) {
-      const string value(getenv("OURS_VIT_GROUP_PACKING"));
-      if (value != "0" && value != "1")
-        throw runtime_error("OURS_VIT_GROUP_PACKING must be 0 or 1");
-      heterogeneous_group_packing = value == "1";
-    }
-    if (!heterogeneous_group_packing &&
-        args.ablation < ours_vit::Ablation::A3)
-      throw runtime_error(
-          "unpacked attention is a validation-only A3/A4 ablation");
+    const bool heterogeneous_group_packing = ours_vit::uses_packing(args.version);
     bert.heterogeneous_group_packing_enabled =
         heterogeneous_group_packing;
-    if (a0_trace) {
-      if (args.ablation != ours_vit::Ablation::A0 ||
+    if (b_trace) {
+      if (args.version != ours_vit::Version::B ||
           (args.stop_after_block != 1 && args.stop_after_block != 2) ||
-          getenv("OURS_VIT_A0_TRACE_DIR") == nullptr ||
-          string(getenv("OURS_VIT_A0_TRACE_DIR")).empty()) {
+          getenv("OURS_VIT_B_TRACE_DIR") == nullptr ||
+          string(getenv("OURS_VIT_B_TRACE_DIR")).empty()) {
         throw runtime_error(
-            "A0 trace requires ablation=A0, stop-after-block=1 or 2 and "
-            "OURS_VIT_A0_TRACE_DIR");
+            "B trace requires version=B, stop-after-block=1 or 2 and "
+            "OURS_VIT_B_TRACE_DIR");
       }
     }
     const bool diagnostic_cls_open =
@@ -1027,39 +1025,37 @@ int main(int argc, char **argv) {
     const bool diagnostic_partial_classifier =
         diagnostic_cls_open ||
         getenv("OURS_VIT_PARTIAL_FINAL_LOGITS") != nullptr ||
-        getenv("OURS_VIT_A0_PARTIAL_FINAL_LOGITS") != nullptr;
+        getenv("OURS_VIT_B_PARTIAL_FINAL_LOGITS") != nullptr;
     const bool diagnostic_stop_after_attention =
         getenv("OURS_VIT_STOP_AFTER_ATTENTION") != nullptr ||
-        getenv("OURS_VIT_A0_STOP_AFTER_ATTENTION") != nullptr;
+        getenv("OURS_VIT_B_STOP_AFTER_ATTENTION") != nullptr;
     if (hetero_attention_trace &&
-        (args.ablation < ours_vit::Ablation::A3 ||
+        (args.version == ours_vit::Version::B ||
          args.stop_after_block != 1 || !diagnostic_stop_after_attention ||
          getenv("OURS_VIT_HETERO_ATTENTION_TRACE_DIR") == nullptr ||
          string(getenv("OURS_VIT_HETERO_ATTENTION_TRACE_DIR")).empty())) {
       throw runtime_error(
-          "heterogeneous attention trace requires ablation=A3/A4, "
+          "heterogeneous attention trace requires version=heterogeneous, "
           "stop-after-block=1, OURS_VIT_STOP_AFTER_ATTENTION, and "
           "OURS_VIT_HETERO_ATTENTION_TRACE_DIR");
     }
-    const bool diagnostic_stop_after_normalization =
-        getenv("OURS_VIT_STOP_AFTER_NORMALIZATION") != nullptr;
     const bool diagnostic_skip_final_ln =
-        getenv("OURS_VIT_A0_SKIP_FINAL_LN") != nullptr;
+        getenv("OURS_VIT_B_SKIP_FINAL_LN") != nullptr;
     const bool diagnostic_skip_bsgs2_flood =
-        getenv("OURS_VIT_A0_SKIP_BSGS2_FLOOD") != nullptr;
+        getenv("OURS_VIT_B_SKIP_BSGS2_FLOOD") != nullptr;
     const bool diagnostic_public_classifier_fixture =
-        getenv("OURS_VIT_A0_PUBLIC_CLASSIFIER_FIXTURE") != nullptr;
+        getenv("OURS_VIT_B_PUBLIC_CLASSIFIER_FIXTURE") != nullptr;
     const bool diagnostic_aggregate_max =
-        getenv("OURS_VIT_A0_AGGREGATE_MAX") != nullptr;
+        getenv("OURS_VIT_B_AGGREGATE_MAX") != nullptr;
     const string diagnostic_aggregate_filter =
-        getenv("OURS_VIT_A0_AGGREGATE_FILTER") == nullptr
+        getenv("OURS_VIT_B_AGGREGATE_FILTER") == nullptr
             ? ""
-            : string(getenv("OURS_VIT_A0_AGGREGATE_FILTER"));
+            : string(getenv("OURS_VIT_B_AGGREGATE_FILTER"));
     if (diagnostic_skip_final_ln &&
-        (args.ablation != ours_vit::Ablation::A0 ||
+        (args.version != ours_vit::Version::B ||
          args.stop_after_block != 0 || !diagnostic_partial_classifier)) {
       throw runtime_error(
-          "skip-final-LN diagnostic requires A0 stop-after-block=0 with "
+          "skip-final-LN diagnostic requires B stop-after-block=0 with "
           "partial final logits");
     }
     if (diagnostic_stop_after_attention &&
@@ -1067,34 +1063,28 @@ int main(int argc, char **argv) {
       throw runtime_error(
           "stop-after-attention diagnostic requires stop-after-block=1");
     }
-    if (diagnostic_stop_after_normalization &&
-        (args.ablation != ours_vit::Ablation::A2 ||
-         args.stop_after_block != 1 || diagnostic_stop_after_attention)) {
-      throw runtime_error(
-          "normalization-only cost diagnostic requires A2, "
-          "stop-after-block=1, and no stop-after-attention diagnostic");
-    }
+
     if (diagnostic_skip_bsgs2_flood &&
-        (args.ablation != ours_vit::Ablation::A0 ||
+        (args.version != ours_vit::Version::B ||
          args.stop_after_block != 0 || !diagnostic_partial_classifier ||
          !diagnostic_skip_final_ln ||
-         getenv("OURS_VIT_A0_FINAL_HE_LOGITS_PATH") == nullptr)) {
+         getenv("OURS_VIT_B_FINAL_HE_LOGITS_PATH") == nullptr)) {
       throw runtime_error(
-          "skip-BSGS2-flood diagnostic requires A0 stop-after-block=0, "
+          "skip-BSGS2-flood diagnostic requires B stop-after-block=0, "
           "skip-final-LN and final HE logits capture");
     }
     if (diagnostic_public_classifier_fixture &&
         (!diagnostic_skip_bsgs2_flood || !diagnostic_skip_final_ln ||
          args.stop_after_block != 0)) {
       throw runtime_error(
-          "public classifier fixture requires the A0 stop-0, skip-final-LN, "
+          "public classifier fixture requires the B stop-0, skip-final-LN, "
           "skip-BSGS2-flood diagnostic");
     }
     if (diagnostic_aggregate_max &&
-        (args.ablation != ours_vit::Ablation::A0 ||
+        (args.version != ours_vit::Version::B ||
          args.stop_after_block != 1 || !diagnostic_partial_classifier)) {
       throw runtime_error(
-          "aggregate-max diagnostic requires A0 stop-after-block=1 with "
+          "aggregate-max diagnostic requires B stop-after-block=1 with "
           "partial final logits");
     }
     auto write_diagnostic_cls = [&](const FixArray &tensor,
@@ -1136,7 +1126,7 @@ int main(int argc, char **argv) {
         throw runtime_error("aggregate max did not reduce to one scalar");
       FixArray opened = fpmath->fix->output(sci::PUBLIC, maximum);
       const uint64_t raw = opened.data[0] & ring_mask(opened.ell);
-      cout << "OURS_A0_AGGREGATE stage=" << stage
+      cout << "OURS_B_AGGREGATE stage=" << stage
            << " metric=max_abs value=" << setprecision(17)
            << ldexp(static_cast<double>(raw), -opened.s)
            << defaultfloat << " ell=" << opened.ell
@@ -1217,8 +1207,8 @@ int main(int argc, char **argv) {
     cout << "OURS_VIT_PUBLIC_PATCH_ROW_MASK status=PASS cls_zeroed=1"
          << " logical_patch_rows=196 padding_rows="
          << args.physical_tokens - kLogicalTokens << endl;
-    if (a0_trace)
-      write_a0_stage(bert, hidden, "patch_projection_padded",
+    if (b_trace)
+      write_b_stage(bert, hidden, "patch_projection_padded",
                      {kPhysicalTokens, kDim});
     comm.mark("patch_embedding");
 
@@ -1245,11 +1235,11 @@ int main(int argc, char **argv) {
         true, kBitwidth, kScale);
     hidden = fpmath->fix->add(hidden, embedding_share);
     write_diagnostic_aggregate_max(hidden, "embedding");
-    if (a0_trace)
-      write_a0_stage(bert, hidden, "embedding", {kPhysicalTokens, kDim});
-    if (a0_trace && getenv("OURS_VIT_A0_TRACE_STOP_AFTER") != nullptr &&
-        string(getenv("OURS_VIT_A0_TRACE_STOP_AFTER")) == "embedding") {
-      cout << "OURS_A0_TRACE status=PARTIAL stop_after=embedding"
+    if (b_trace)
+      write_b_stage(bert, hidden, "embedding", {kPhysicalTokens, kDim});
+    if (b_trace && getenv("OURS_VIT_B_TRACE_STOP_AFTER") != nullptr &&
+        string(getenv("OURS_VIT_B_TRACE_STOP_AFTER")) == "embedding") {
+      cout << "OURS_B_TRACE status=PARTIAL stop_after=embedding"
            << " production_path=0" << endl;
       return 0;
     }
@@ -1263,33 +1253,25 @@ int main(int argc, char **argv) {
     fill(attention_mask.begin(), attention_mask.begin() + kLogicalTokens, 0);
     bert.set_public_attention_mask(attention_mask);
     cout << "OURS_VIT_RUNTIME protocol="
-         << (args.ablation == ours_vit::Ablation::A0
-                 ? "original_blb_ckks_mpc"
-                 : args.ablation == ours_vit::Ablation::A1
-                       ? "a1_heterogeneous_all_cross_domain"
-                       : args.ablation == ours_vit::Ablation::A2
-                             ? "a2_reordered_grouped_all_cross_domain"
-                             : args.ablation == ours_vit::Ablation::A3
-                                   ? "a3_selective_group_conversion"
-                                   : "a4_native_ckks_linear")
+         << (args.version == ours_vit::Version::B ? "original_blb_ckks_mpc" : "heterogeneous_ckks_mpc")
          << " architecture=vit_b16_full pre_norm=1 logical_tokens="
          << kLogicalTokens << " physical_tokens=" << kPhysicalTokens
          << " backend=" << (backend == LOCATION::DEVICE ? "gpu" : "cpu")
          << " layers=" << kLayers << endl;
     cout << "OURS_VIT_RUNTIME boundary=padding logical_rows=197 physical_rows=256"
          << " padding_is_public_key_mask=1 alternate_protocol="
-         << (args.ablation == ours_vit::Ablation::A0 ? 0 : 1)
+         << (args.version == ours_vit::Version::B ? 0 : 1)
          << " selective_conversion="
-         << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0)
+         << (args.version != ours_vit::Version::B ? 1 : 0)
          << " attention_diagonal_kernel=complete_v1"
          << " blb_fast_attention_packing=0"
          << " heterogeneous_head_grouping="
-         << (args.ablation >= ours_vit::Ablation::A3 &&
+         << (args.version != ours_vit::Version::B &&
                      heterogeneous_group_packing
                  ? 1
                  : 0)
          << " attention_packing="
-         << (args.ablation >= ours_vit::Ablation::A3
+         << (args.version != ours_vit::Version::B
                  ? (heterogeneous_group_packing ? "packed" : "unpacked")
                  : "not_applicable")
          << endl;
@@ -1307,25 +1289,17 @@ int main(int argc, char **argv) {
            << "edge_cloud_online_dispatch=inline_native\n"
            << "edge_cloud_output_policy=public_to_both\n";
       meta << "field_to_ring_protocol=fused_prime_wrap\n"
-           << "mpc_to_ckks_protocol=integer_lift_single_extension\n"
+           << "mpc_to_ckks_protocol=encode_then_coefficient_ring_to_field\n"
            << "input_ciphertext_transport=seal_seeded_symmetric\n"
            << "real_output_packing=adjacent_real_imag\n"
            << "softmax_public_padding_compaction=1\n"
-           << "vit_residual_addition=local_mpc\n";
+           << "vit_residual_addition=ckks_fused\n";
       meta << "protocol="
-           << (args.ablation == ours_vit::Ablation::A0
-                   ? "original_blb_ckks_mpc"
-                   : args.ablation == ours_vit::Ablation::A1
-                         ? "ours_a1_all_cross_domain"
-                         : args.ablation == ours_vit::Ablation::A2
-                               ? "ours_a2_reordered_grouped_all_cross_domain"
-                               : args.ablation == ours_vit::Ablation::A3
-                                     ? "ours_a3_selective_group_conversion"
-                                     : "ours_a4_native_ckks_linear")
+           << (args.version == ours_vit::Version::B ? "original_blb_ckks_mpc" : "heterogeneous_ckks_mpc")
            << '\n'
-           << "ablation=" << ours_vit::to_string(args.ablation) << '\n'
+           << "version=" << ours_vit::to_string(args.version) << '\n'
            << "head_plan="
-           << (args.ablation == ours_vit::Ablation::A0
+           << (args.version == ours_vit::Version::B
                    ? "built_in_all_softmax_original_order"
                    : args.head_plan)
            << '\n'
@@ -1346,18 +1320,17 @@ int main(int argc, char **argv) {
       };
       meta << "conversion_path=wide_shared_rns_v1\n"
            << "ckks_to_mpc_conversion=wide_centered\n"
-           << "mpc_to_ckks_conversion=wide_shared_rns_extension\n"
-           << "softmax_product=mpc_batched\n"
-           << "gelu_polynomial=even_quartic\n"
+           << "mpc_to_ckks_conversion=algorithm2_coefficient_extension\n"
+           << "softmax_product=ckks\n"
+           << "softmax_reciprocal=rsqrt_square_full_ring\n"
+           << "gelu_polynomial=blb_F0_F1\n"
            << "gelu_conversion_scale_bits="
            << Bert_ckks::kGeluConversionScaleBits << '\n'
-           << "secure_exp_clamp="
-           << (enabled_env("OURS_VIT_SECURE_EXP_CLAMP") ? 1 : 0) << '\n'
-           << "softmax_exp_polynomial="
-           << (enabled_env("OURS_VIT_SECURE_EXP_CLAMP")
-                   ? "clipped_(1+x/64)^64_reference"
-                   : "comparison_free_(1+x/128)^128")
-           << '\n';
+           << "secure_exp_clamp=1\n"
+           << "softmax_exp_polynomial=clipped_(1+x/64)^64\n"
+           << "strict_blb_status=candidate_not_frozen\n"
+           << "strict_fusion_verified=0\n"
+           << "strict_algorithm2_equivalence_verified=0\n";
       auto write_he_context = [&](const char *name, HE_CKKS *he) {
         meta << name << "_poly_modulus_degree=" << he->poly_modulus_degree
              << '\n'
@@ -1379,40 +1352,33 @@ int main(int argc, char **argv) {
       write_he_context("he_softmax", bert.linear.he_softmax);
       write_he_context("he_onetime", bert.linear.he_onetime);
       meta << "attention_normalization="
-           << (args.ablation == ours_vit::Ablation::A0
-                   ? "original_blb_softmax_he_mpc"
-                   : args.ablation == ours_vit::Ablation::A1
-                         ? "public_plan_per_head_mpc"
-                         : "public_plan_contiguous_protocol_groups_mpc")
+           << (args.version == ours_vit::Version::B ? "original_blb_softmax_he_mpc" : "public_plan_selective_mpc_native_linear")
            << '\n'
            << "protocol_aware_head_reorder="
-           << (args.ablation >= ours_vit::Ablation::A2 ? 1 : 0) << '\n'
+           << (args.version != ours_vit::Version::B ? 1 : 0) << '\n'
            << "selective_conversion="
-           << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0) << '\n'
+           << (args.version != ours_vit::Version::B ? 1 : 0) << '\n'
            << "attention_diagonal_kernel=complete_v1\n"
            << "blb_fast_attention_packing=0\n"
            << "heterogeneous_head_grouping="
-           << (args.ablation >= ours_vit::Ablation::A3 &&
+           << (args.version != ours_vit::Version::B &&
                        heterogeneous_group_packing
                    ? 1
                    : 0)
            << '\n'
            << "attention_packing="
-           << (args.ablation >= ours_vit::Ablation::A3
+           << (args.version != ours_vit::Version::B
                    ? (heterogeneous_group_packing ? "packed" : "unpacked")
                    : "not_applicable")
            << '\n'
            << "native_ckks_linear="
-           << (args.ablation == ours_vit::Ablation::A4 ? 1 : 0) << '\n'
+           << (head_plan.has_linear() ? 1 : 0) << '\n'
            << "client_decrypt_reencrypt=0\n"
            << "mpc_linear_surrogate="
-           << (args.ablation == ours_vit::Ablation::A1 ||
-                       args.ablation == ours_vit::Ablation::A2
-                   ? 1
-                   : 0)
+           << 0
            << '\n'
            << "layernorm=original_blb_layer_norm_mpc_ckks_affine\n"
-           << "gelu=symmetric_even_quartic_ckks_plus_half_x_mpc_tail\n"
+           << "gelu=blb_F0_F1_ckks_mpc_selection\n"
            << "classifier=cls_only_original_bsgs2_ckks\n"
            << "classifier_logical_outputs=1000\n"
            << "classifier_physical_outputs=1024\n"
@@ -1422,14 +1388,9 @@ int main(int argc, char **argv) {
            << "backend=" << (backend == LOCATION::DEVICE ? "gpu" : "cpu")
            << "\nsetup_seconds=" << fixed << setprecision(6) << setup_seconds
            << '\n';
-      if (diagnostic_stop_after_normalization)
-        meta << "cost_scope=a2_normalization_only\n"
-             << "completed_transformer_blocks=0\n"
-             << "completed_attention_normalizations=1\n"
-             << "conversion_cost_included=0\n"
-             << "conversion_cost_deferred_to=A3\n";
       if (prediction_ready) meta << "prediction=" << prediction << '\n';
     };
+    map<char *, FixArray> next_ln1_statistics;
     for (int layer = 0; layer < args.stop_after_block; ++layer) {
       const auto &protocols = edge_cloud.layer_plan(layer).protocols;
       const auto &alphas = edge_cloud.layer_plan(layer).alphas;
@@ -1489,22 +1450,26 @@ int main(int argc, char **argv) {
       FixArray ln1_b = input_layernorm_share(
           bert, bert.linear.b_ln_1, layer, args.physical_tokens, kDim);
       auto ln1 = edge_cloud.execute_node(layer, "ln1", [&]() {
-        return bert.layer_norm_part1_real(hidden, ln1_w, ln1_b);
+        if (next_ln1_statistics.empty())
+          return bert.layer_norm_part1_real(hidden, ln1_w, ln1_b);
+        next_ln1_statistics["w"] = ln1_w;
+        next_ln1_statistics["b"] = ln1_b;
+        return bert.layer_norm_nonlinear(next_ln1_statistics);
       });
       mask_layernorm_padding(ln1, "block_" + to_string(layer) + "_ln1");
-      if (a0_trace) {
-        write_a0_stage(bert, ln1.at("x_flat_avg"),
+      if (b_trace) {
+        write_b_stage(bert, ln1.at("x_flat_avg"),
                        "block_" + to_string(layer) + "_ln1_centered", {kPhysicalTokens, kDim});
-        write_a0_stage(bert, ln1.at("sigma_flat"),
+        write_b_stage(bert, ln1.at("sigma_flat"),
                        "block_" + to_string(layer) + "_ln1_sigma", {kPhysicalTokens, kDim});
       }
       profile.nonlinear_layernorm_bucket_ms += chrono::duration<double, milli>(
           chrono::steady_clock::now() - ln1_start).count();
       comm.mark("block_" + to_string(layer) + "_layer_norm_1");
-      if (a0_trace && layer == 0 &&
-          getenv("OURS_VIT_A0_TRACE_STOP_AFTER") != nullptr &&
-          string(getenv("OURS_VIT_A0_TRACE_STOP_AFTER")) == "ln1") {
-        cout << "OURS_A0_TRACE status=PARTIAL stop_after=ln1"
+      if (b_trace && layer == 0 &&
+          getenv("OURS_VIT_B_TRACE_STOP_AFTER") != nullptr &&
+          string(getenv("OURS_VIT_B_TRACE_STOP_AFTER")) == "ln1") {
+        cout << "OURS_B_TRACE status=PARTIAL stop_after=ln1"
              << " production_path=0" << endl;
         return 0;
       }
@@ -1517,9 +1482,9 @@ int main(int argc, char **argv) {
       bert.attention_input_residual_share = hidden;
       bert.attention_input_residual_ready = true;
       bert.pre_norm_attention_output_only = true;
-      // A2 consumes this complete, directly measured assignment boundary.
+      // The allocator consumes this complete, directly measured assignment boundary.
       // It deliberately spans the common QKV/QK prefix, all selective
-      // conversions, grouped MPC normalization, native A4 QK->AV->WO, and
+      // conversions, grouped MPC normalization, native NATIVE QK->AV->WO, and
       // the genuine Algorithm-1 output conversion.  No per-head division or
       // cross-run extrapolation is needed to compare complete candidates.
       const auto assignment_start = chrono::steady_clock::now();
@@ -1527,6 +1492,7 @@ int main(int argc, char **argv) {
       const uint64_t assignment_round_start = bert.current_round();
       const double assignment_he_start = bert.he_compute_la;
       const double assignment_conversion_start = bert.ct_transfer_la;
+      const uint64_t assignment_ciphertexts_start = bert.conversion_ciphertexts;
       const uint64_t assignment_ct_pt_start =
           bert.linear.ct_pt_multiply_count;
       const uint64_t assignment_ct_ct_start =
@@ -1556,23 +1522,23 @@ int main(int argc, char **argv) {
             bert, qk_row, "block_0_qk",
             {kHeads, kPhysicalTokens, kPhysicalTokens});
       }
-      if (a0_trace) {
-        if (!bert.a0_qkv_ready)
-          throw runtime_error("A0 Q/K/V observer was not populated");
-        const FixArray q = a0_projected_tensor_to_token_major(
-            bert.a0_q_share, bert.party, args.physical_tokens);
-        const FixArray k = a0_projected_tensor_to_token_major(
-            bert.a0_k_share, bert.party, args.physical_tokens);
-        const FixArray observed_v = a0_projected_tensor_to_token_major(
-            bert.a0_v_share, bert.party, args.physical_tokens);
-        write_a0_stage(bert, q, "block_" + to_string(layer) + "_q", {kPhysicalTokens, kDim});
-        write_a0_stage(bert, k, "block_" + to_string(layer) + "_k", {kPhysicalTokens, kDim});
-        write_a0_stage(bert, observed_v, "block_" + to_string(layer) + "_v",
+      if (b_trace) {
+        if (!bert.b_qkv_ready)
+          throw runtime_error("B Q/K/V observer was not populated");
+        const FixArray q = b_projected_tensor_to_token_major(
+            bert.b_q_share, bert.party, args.physical_tokens);
+        const FixArray k = b_projected_tensor_to_token_major(
+            bert.b_k_share, bert.party, args.physical_tokens);
+        const FixArray observed_v = b_projected_tensor_to_token_major(
+            bert.b_v_share, bert.party, args.physical_tokens);
+        write_b_stage(bert, q, "block_" + to_string(layer) + "_q", {kPhysicalTokens, kDim});
+        write_b_stage(bert, k, "block_" + to_string(layer) + "_k", {kPhysicalTokens, kDim});
+        write_b_stage(bert, observed_v, "block_" + to_string(layer) + "_v",
                        {kPhysicalTokens, kDim});
         FixArray qk_row(bert.party, qk.size, qk.signed_, qk.ell, qk.s);
         bert.linear.plain_cross_packing_postprocess(
             qk.data, qk_row.data, false, bert.linear.data_lin1_0);
-        write_a0_stage(bert, qk_row, "block_" + to_string(layer) + "_qk",
+        write_b_stage(bert, qk_row, "block_" + to_string(layer) + "_qk",
                        {kHeads, kPhysicalTokens, kPhysicalTokens});
       }
       bert.attention_v_share = std::move(v);
@@ -1580,9 +1546,9 @@ int main(int argc, char **argv) {
       bert.profile_switch(BlbViTProfileStage::SOFTMAX);
 
       const auto softmax_start = chrono::steady_clock::now();
-      qk = edge_cloud.attention_norm(bert, qk, layer, heterogeneous_group_packing);
-      if (a0_trace)
-        write_a0_stage(bert, qk, "block_" + to_string(layer) + "_softmax",
+      qk = edge_cloud.attention_norm(bert, qk, layer);
+      if (b_trace)
+        write_b_stage(bert, qk, "block_" + to_string(layer) + "_softmax",
                        {kHeads, kPhysicalTokens, kPhysicalTokens});
       if (hetero_attention_trace && layer == 0)
         write_hetero_attention_stage(
@@ -1595,45 +1561,7 @@ int main(int argc, char **argv) {
           chrono::steady_clock::now() - softmax_start).count();
       comm.mark("block_" + to_string(layer) + "_attention_normalization");
 
-      if (diagnostic_stop_after_normalization) {
-        // A2 compares only the three grouped secure normalization kernels.
-        // The common QKV/CKKS->MPC prefix is executed to supply real shares,
-        // but is not folded into OURS_HETERO_PATH_PROFILE.  MPC->CKKS, AV,
-        // and WO are deliberately deferred to the A3 grouped-conversion cost
-        // accounting instead of allocating their much larger HE working set.
-        bert.profile_stop();
-        bert.io->sync();
-        comm.mark("a2_normalization_only_stop_sync");
-        double secure_prefix_seconds = 0.0;
-        for (size_t stage_index = 0;
-             stage_index < kBlbViTProfileStageCount; ++stage_index) {
-          const auto stage = static_cast<BlbViTProfileStage>(stage_index);
-          secure_prefix_seconds += bert.profile_metric(stage).wall_ms / 1000.0;
-        }
-        const uint64_t online_bytes =
-            bert.current_comm() - initialization_bytes;
-        const uint64_t online_rounds =
-            bert.current_round() - initialization_rounds;
-        write_communication_breakdown(
-            args.output, args.party, comm.stages(), initialization_bytes,
-            initialization_rounds, online_bytes, online_rounds);
-        write_latency_summary(
-            args.output, args.party, secure_prefix_seconds,
-            initialization_bytes, online_bytes, online_rounds,
-            bert.ckks_to_mpc_conversions, bert.conversion_ciphertexts);
-        write_run_metadata(-1, false);
-        cout << fixed << setprecision(6)
-             << "OURS_NORMALIZATION_COST_STOP status=PASS"
-             << " ablation=A2 layer=" << layer
-             << " cost_scope=a2_normalization_only"
-             << " secure_prefix_latency_ms="
-             << secure_prefix_seconds * 1000.0
-             << " online_communication_bytes=" << online_bytes
-             << " online_rounds=" << online_rounds
-             << " mpc_to_ckks_included=0 av_included=0 wo_included=0"
-             << endl;
-        return 0;
-      }
+
 
       // Original BLB Softmax*V and output-projection path.  The pre-norm
       // branch exits at the same CKKS residual boundary that ViT requires;
@@ -1644,21 +1572,21 @@ int main(int argc, char **argv) {
           (bert.he_compute_la - he_before_linear2) * 1000.0;
       bert.pre_norm_attention_output_only = false;
       hidden = attention_result.at("residual");
-      if (a0_trace) {
-        if (!bert.a0_av_wo_ready)
-          throw runtime_error("A0 AV/W_O observers were not populated");
-        const FixArray av = a0_projected_tensor_to_token_major(
-            bert.a0_av_share, bert.party, args.physical_tokens);
-        write_a0_stage(bert, av, "block_" + to_string(layer) + "_av",
+      if (b_trace) {
+        if (!bert.b_av_wo_ready)
+          throw runtime_error("B AV/W_O observers were not populated");
+        const FixArray av = b_projected_tensor_to_token_major(
+            bert.b_av_share, bert.party, args.physical_tokens);
+        write_b_stage(bert, av, "block_" + to_string(layer) + "_av",
                        {kPhysicalTokens, kDim});
-        write_a0_stage(bert, bert.a0_wo_share, "block_" + to_string(layer) + "_wo",
+        write_b_stage(bert, bert.b_wo_share, "block_" + to_string(layer) + "_wo",
                        {kPhysicalTokens, kDim});
       }
       if (hetero_attention_trace && layer == 0) {
         if (!bert.heterogeneous_av_wo_ready)
           throw runtime_error(
               "Packed/Unpacked AV/W_O observers were not populated");
-        const FixArray av = a0_projected_tensor_to_token_major(
+        const FixArray av = b_projected_tensor_to_token_major(
             bert.heterogeneous_av_share, bert.party,
             args.physical_tokens);
         write_hetero_attention_stage(
@@ -1667,7 +1595,7 @@ int main(int argc, char **argv) {
             bert, bert.heterogeneous_wo_share, "block_0_wo",
             {kPhysicalTokens, kDim});
       }
-      if (args.ablation >= ours_vit::Ablation::A3) {
+      if (args.version != ours_vit::Version::B) {
         const int softmax_heads = static_cast<int>(count(
             protocols.begin(), protocols.end(),
             ours_vit::HeadProtocol::SoftmaxMpc));
@@ -1699,8 +1627,8 @@ int main(int argc, char **argv) {
           native_linear_groups = linear_heads;
         }
         cout << fixed << setprecision(6)
-             << "OURS_A3_A4_ASSIGNMENT_PROFILE status=PASS"
-             << " ablation=" << ours_vit::to_string(args.ablation)
+             << "OURS_HETERO_ASSIGNMENT_PROFILE status=PASS"
+             << " version=" << ours_vit::to_string(args.version)
              << " layer=" << layer
              << " latency_ms="
              << chrono::duration<double, milli>(
@@ -1712,6 +1640,9 @@ int main(int argc, char **argv) {
              << (bert.he_compute_la - assignment_he_start) * 1000.0
              << " conversion_instrumented_ms="
              << (bert.ct_transfer_la - assignment_conversion_start) * 1000.0
+             << " conversion_ciphertexts="
+             << bert.conversion_ciphertexts - assignment_ciphertexts_start
+             << " normalization_hybrid_ms=" << profile.nonlinear_softmax_bucket_ms
              << " softmax_heads=" << softmax_heads
              << " relu_heads=" << relu_heads
              << " linear_heads=" << linear_heads
@@ -1739,8 +1670,8 @@ int main(int argc, char **argv) {
       }
       write_diagnostic_aggregate_max(hidden,
                                      "block_0_attention_residual");
-      if (a0_trace)
-        write_a0_stage(bert, hidden, "block_" + to_string(layer) + "_attention_residual",
+      if (b_trace)
+        write_b_stage(bert, hidden, "block_" + to_string(layer) + "_attention_residual",
                        {kPhysicalTokens, kDim});
       if (hetero_attention_trace && layer == 0)
         write_hetero_attention_stage(
@@ -1757,7 +1688,11 @@ int main(int argc, char **argv) {
       FixArray ln2_b = input_layernorm_share(
           bert, bert.linear.b_ln_2, layer, args.physical_tokens, kDim);
       auto ln2 = edge_cloud.execute_node(layer, "ln2", [&]() {
-        return bert.layer_norm_part1_real(hidden, ln2_w, ln2_b);
+        if (args.version != ours_vit::Version::B)
+          return bert.layer_norm_part1_real(hidden, ln2_w, ln2_b);
+        attention_result["w"] = ln2_w;
+        attention_result["b"] = ln2_b;
+        return bert.layer_norm_nonlinear(attention_result);
       });
       mask_layernorm_padding(ln2, "block_" + to_string(layer) + "_ln2");
       profile.nonlinear_layernorm_bucket_ms += chrono::duration<double, milli>(
@@ -1777,8 +1712,8 @@ int main(int argc, char **argv) {
       auto ffn1 = edge_cloud.execute_node(layer, "ffn1", [&]() {
         return bert.ln_part2_linear3_gelu_part1(ln2, layer);
       });
-      if (a0_trace)
-        write_a0_stage(bert, ffn1.at("x_array"), "block_" + to_string(layer) + "_fc1",
+      if (b_trace)
+        write_b_stage(bert, ffn1.at("x_array"), "block_" + to_string(layer) + "_fc1",
                        {kPhysicalTokens, kFfDim});
       profile.linear3_he_ms = (bert.he_compute_la - he_before_linear3) * 1000.0;
       bert.pre_norm_ffn_residual_from_external = false;
@@ -1789,8 +1724,8 @@ int main(int argc, char **argv) {
       FixArray gelu = edge_cloud.execute_node(layer, "gelu", [&]() {
         return bert.gelu_nonlinear(ffn1);
       });
-      if (a0_trace)
-        write_a0_stage(bert, gelu, "block_" + to_string(layer) + "_gelu",
+      if (b_trace)
+        write_b_stage(bert, gelu, "block_" + to_string(layer) + "_gelu",
                        {kPhysicalTokens, kFfDim});
       profile.nonlinear_gelu_core_ms = chrono::duration<double, milli>(
           chrono::steady_clock::now() - gelu_start).count();
@@ -1808,12 +1743,13 @@ int main(int argc, char **argv) {
       profile.linear4_he_ms = (bert.he_compute_la - he_before_linear4) * 1000.0;
       bert.pre_norm_ffn_output_only = false;
       hidden = ffn2_result.at("residual");
-      if (a0_trace)
-        write_a0_stage(bert, hidden, "block_" + to_string(layer) + "_ffn_residual",
+      next_ln1_statistics = ffn2_result;
+      if (b_trace)
+        write_b_stage(bert, hidden, "block_" + to_string(layer) + "_ffn_residual",
                        {kPhysicalTokens, kDim});
       } else {
-        cout << "OURS_ATTENTION_PREFIX status=PASS ablation="
-             << ours_vit::to_string(args.ablation)
+        cout << "OURS_ATTENTION_PREFIX status=PASS version="
+             << ours_vit::to_string(args.version)
              << " stop_after=attention_residual"
              << " final_logits=" << (diagnostic_partial_classifier ? 1 : 0)
              << " intermediate_reconstruction=0" << endl;
@@ -1972,8 +1908,8 @@ int main(int argc, char **argv) {
            << profiles.front().block_online_comm_bytes << " bytes\n"
            << "Total communication (this party, including initialization): "
            << initialization_bytes + online_bytes << " bytes\n"
-           << "OURS_VIT_RUNTIME status=PARTIAL ablation="
-           << ours_vit::to_string(args.ablation) << " executed_blocks="
+           << "OURS_VIT_RUNTIME status=PARTIAL version="
+           << ours_vit::to_string(args.version) << " executed_blocks="
            << args.stop_after_block
            << " full_structure=0 protocol_substitution=0" << endl;
       return 0;
@@ -1992,12 +1928,18 @@ int main(int argc, char **argv) {
           bert, final_ln_w, args.physical_tokens, kDim, kBitwidth, kScale);
       FixArray final_b = input_parameter_share(
           bert, final_ln_b, args.physical_tokens, kDim, kBitwidth, kScale);
-      map<char *, FixArray> final_ln =
-          bert.layer_norm_part1_real(hidden, final_w, final_b);
+      map<char *, FixArray> final_ln;
+      if (next_ln1_statistics.empty()) {
+        final_ln = bert.layer_norm_part1_real(hidden, final_w, final_b);
+      } else {
+        next_ln1_statistics["w"] = final_w;
+        next_ln1_statistics["b"] = final_b;
+        final_ln = bert.layer_norm_nonlinear(next_ln1_statistics);
+      }
       mask_layernorm_padding(final_ln, "final_ln");
       hidden = bert.layer_norm_affine_ckks(final_ln);
-      if (a0_trace)
-        write_a0_stage(bert, hidden, "final_ln",
+      if (b_trace)
+        write_b_stage(bert, hidden, "final_ln",
                        {kPhysicalTokens, kDim});
       write_diagnostic_cls(hidden, "final_ln");
       comm.mark("final_layer_norm");
@@ -2010,7 +1952,7 @@ int main(int argc, char **argv) {
            << endl;
     } else {
       comm.mark("diagnostic_skip_final_layer_norm");
-      cout << "OURS_A0_DIAGNOSTIC stage=final_layer_norm status=SKIPPED"
+      cout << "OURS_B_DIAGNOSTIC stage=final_layer_norm status=SKIPPED"
            << " intermediate_reconstruction=0 final_logits_only=1" << endl;
     }
 
@@ -2031,7 +1973,7 @@ int main(int argc, char **argv) {
       hidden = fpmath->fix->input(
           sci::ALICE, static_cast<int>(fixture.size()), fixture.data(), true,
           kBitwidth, kScale);
-      cout << "OURS_A0_PUBLIC_CLASSIFIER_FIXTURE status=ACTIVE"
+      cout << "OURS_B_PUBLIC_CLASSIFIER_FIXTURE status=ACTIVE"
            << " deterministic=1 input_scale=12 final_output_only=1" << endl;
     }
 
@@ -2141,14 +2083,14 @@ int main(int argc, char **argv) {
          << "MPC->CKKS conversions: " << bert.mpc_to_ckks_conversions << '\n'
          << "Conversion ciphertexts: " << bert.conversion_ciphertexts << '\n'
          << "Prediction: " << prediction << '\n'
-         << "OURS_VIT_RUNTIME status=PASS ablation="
-         << ours_vit::to_string(args.ablation)
+         << "OURS_VIT_RUNTIME status=PASS version="
+         << ours_vit::to_string(args.version)
          << " full_structure=" << (args.stop_after_block == kLayers ? 1 : 0)
          << " executed_blocks=" << args.stop_after_block
          << " protocol_substitution="
-         << (args.ablation == ours_vit::Ablation::A0 ? 0 : 1)
+         << (args.version == ours_vit::Version::B ? 0 : 1)
          << " selective_conversion="
-         << (args.ablation >= ours_vit::Ablation::A3 ? 1 : 0)
+         << (args.version != ours_vit::Version::B ? 1 : 0)
          << " local_truncation=0" << endl;
     return 0;
   } catch (const exception &error) {

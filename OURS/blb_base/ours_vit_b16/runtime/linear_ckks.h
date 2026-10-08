@@ -133,10 +133,11 @@ public:
 	HE_CKKS *he4;
 	HE_CKKS *he_softmax;
 	HE_CKKS *he_onetime;
-	// A4 is an explicit circuit choice made before key generation.  It gives
-	// he1 one additional data level for native QK->AV->WO; A0--A3 keep the
+	// NATIVE is an explicit circuit choice made before key generation.  It gives
+	// he1 one additional data level for native QK->AV->WO; B--SELECTIVE keep the
 	// published BLB Block-2 chain byte-for-byte unchanged.
-	bool a4_native_linear_enabled = false;
+	bool native_linear_enabled = false;
+	bool bert_post_norm = false;
 
 	FCMetadata data_lin1_0;
 	FCMetadata data_lin1_1;
@@ -150,11 +151,11 @@ public:
 	vector<PreprocessParams_1> pp_1;
 	vector<PreprocessParams_2> pp_2;
 	// Assignment-specific output projections. pp_2 remains the original BLB
-	// cache for A0--A3.  In A4, pp_2_mpc contains only Softmax/ReLU input rows
-	// (and owns b_o), while pp_2_a4 contains only Linear rows with alpha_h
+	// cache for B--SELECTIVE.  In NATIVE, pp_2_mpc contains only Softmax/ReLU input rows
+	// (and owns b_o), while pp_2_native contains only Linear rows with alpha_h
 	// fused into W_O and has zero bias.
 	vector<PreprocessParams_2> pp_2_mpc;
-	vector<PreprocessParams_2> pp_2_a4;
+	vector<PreprocessParams_2> pp_2_native;
 	vector<vector<int>> heterogeneous_protocols;
 	vector<vector<double>> heterogeneous_alphas;
 	vector<PreprocessParams_2> pp_3;
@@ -199,7 +200,7 @@ public:
 
 	Linear_ckks();
 	Linear_ckks(int party, sci::NetIO *io, LOCATION backend,
-	            bool enable_a4_native_linear = false);
+	            bool enable_native_linear = false);
 
 	// BERT's packing constants were written for 128 tokens.  ViT-B/16 has
 	// 197 logical tokens, but the original BLB packing requires the physical
@@ -257,7 +258,7 @@ public:
 		PreprocessParams_1 &pp,
 		const FCMetadata &data,
 		vector<UnifiedCiphertext> &output,
-		vector<UnifiedCiphertext> *a0_qkv_observer = nullptr
+		vector<UnifiedCiphertext> *b_qkv_observer = nullptr
 		);
 	
 	void linear_2(
@@ -461,7 +462,7 @@ public:
 		const vector<bool> *active_heads = nullptr);
 
 	// for different applications, we need to set different HE parameters
-	void set_HE(LOCATION backend, bool enable_a4_native_linear = false);
+	void set_HE(LOCATION backend, bool enable_native_linear = false);
 	// void element_wise_mult(int32_t dim, FixArray input, FixArray weight, FixArray output);
 
 	// void ckks_to_mpc(Plaintext pt, uint64_t* output, int length, uint64_t Q);

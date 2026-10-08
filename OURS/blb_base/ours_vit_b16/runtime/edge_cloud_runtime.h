@@ -49,10 +49,10 @@ struct CompiledHeadLayer {
 class EdgeCloudRuntime {
  public:
   EdgeCloudRuntime(int party, EdgeCloudModelSpec model, const HeteroPlan &plan,
-                   Ablation ablation)
+                   Version version)
       : role_(edge_cloud_role(party)), model_(std::move(model)),
-        ablation_(ablation) {
-    plan.validate(ablation);
+        version_(version) {
+    plan.validate(version);
     if (model_.revision.empty() || model_.logical_tokens <= 0 ||
         model_.physical_tokens < model_.logical_tokens || model_.width <= 0 ||
         model_.head_dim <= 0 || model_.classes <= 0 || model_.executed_blocks < 0 ||
@@ -64,10 +64,10 @@ class EdgeCloudRuntime {
     contract << "OURS_EDGE_CLOUD_V1\n" << model_.revision << '\n'
              << model_.logical_tokens << ' ' << model_.physical_tokens << ' '
              << model_.width << ' ' << model_.head_dim << ' ' << model_.classes
-             << ' ' << model_.executed_blocks << ' ' << to_string(ablation_) << '\n'
+             << ' ' << model_.executed_blocks << ' ' << to_string(version_) << '\n'
              << "output=public_to_both;crypto=ckks_mpc_wide_shared_rns_v1;"
-             << "attention=complete_diagonal_mpc_product_v1;"
-             << "conversion=integer_lift_real_pairs_v3;softmax=public_compact_bounded_v2;input_ciphertext=seeded_v1\n";
+             << "attention=complete_diagonal_he_product_v1;"
+             << "conversion=algorithm2_coefficient_extension_v1;softmax=blb_t6_threshold_minus13_v1;input_ciphertext=seeded_v1\n";
     for (const auto &node : model_.block_nodes) {
       if (node.empty() || node.find_first_of("\n\r ") != std::string::npos)
         throw std::invalid_argument("invalid public node identifier");
@@ -87,16 +87,15 @@ class EdgeCloudRuntime {
     }
     // Bind public behavior, not model/input/output paths or CUDA device IDs.
     for (const char *key : {
-        "OURS_VIT_GROUP_PACKING",
         "OURS_VIT_MPC_WORKERS",
         "OURS_VIT_SECURE_EXP_CLAMP",
-        "OURS_VIT_A0_TRACE", "OURS_VIT_HETERO_ATTENTION_TRACE",
-        "OURS_VIT_PARTIAL_FINAL_LOGITS", "OURS_VIT_A0_PARTIAL_FINAL_LOGITS",
-        "OURS_VIT_STOP_AFTER_ATTENTION", "OURS_VIT_A0_STOP_AFTER_ATTENTION",
-        "OURS_VIT_STOP_AFTER_NORMALIZATION", "OURS_VIT_A0_TRACE_STOP_AFTER",
-        "OURS_VIT_A0_SKIP_FINAL_LN", "OURS_VIT_A0_SKIP_BSGS2_FLOOD",
-        "OURS_VIT_A0_PUBLIC_CLASSIFIER_FIXTURE", "OURS_VIT_A0_AGGREGATE_MAX",
-        "OURS_VIT_A0_AGGREGATE_FILTER", "OURS_VIT_A0_NATIVE_OBSERVER_CHECK",
+        "OURS_VIT_B_TRACE", "OURS_VIT_HETERO_ATTENTION_TRACE",
+        "OURS_VIT_PARTIAL_FINAL_LOGITS", "OURS_VIT_B_PARTIAL_FINAL_LOGITS",
+        "OURS_VIT_STOP_AFTER_ATTENTION", "OURS_VIT_B_STOP_AFTER_ATTENTION",
+        "OURS_VIT_B_TRACE_STOP_AFTER",
+        "OURS_VIT_B_SKIP_FINAL_LN", "OURS_VIT_B_SKIP_BSGS2_FLOOD",
+        "OURS_VIT_B_PUBLIC_CLASSIFIER_FIXTURE", "OURS_VIT_B_AGGREGATE_MAX",
+        "OURS_VIT_B_AGGREGATE_FILTER", "OURS_VIT_B_NATIVE_OBSERVER_CHECK",
         "OURS_VIT_CONVERSION_EXP_DIRECT_CHECK", "OURS_VIT_SOFTMAX_INTERNAL_DIAGNOSTIC",
         "BLB_VIT_DIAGNOSTIC_PARTIAL_CLASSIFIER", "BLB_QKV_AGGREGATE",
         "BLB_LN_COMPONENTS_AGGREGATE"}) {
@@ -145,9 +144,9 @@ class EdgeCloudRuntime {
         layer >= model_.executed_blocks)
       throw std::logic_error("invalid edge/cloud layer preparation order");
     const auto &compiled = layers_.at(layer);
-    if (ablation_ >= Ablation::A3)
+    if (version_ != Version::B)
       backend.configure_heterogeneous_attention_layer(
-          layer, compiled.protocols, compiled.alphas, ablation_);
+          layer, compiled.protocols, compiled.alphas, version_);
     if (is_cloud()) backend.linear.weights_preprocess_layer(weights, layer);
     active_ = layer;
     next_node_ = 0;
@@ -163,22 +162,21 @@ class EdgeCloudRuntime {
   }
 
   template <class Backend, class Tensor>
-  auto attention_norm(Backend &backend, Tensor &qk, int layer, bool group_packing) {
+  auto attention_norm(Backend &backend, Tensor &qk, int layer) {
     const auto &compiled = layers_.at(layer);
     return execute_node(layer, "attention_norm", [&]() {
-      if (ablation_ == Ablation::A0) return backend.softmax_he(qk);
-      return backend.heterogeneous_attention_norm_a1(
+      if (version_ == Version::B) return backend.softmax_he(qk);
+      return backend.heterogeneous_attention_norm(
           qk, compiled.protocols, compiled.alphas, model_.logical_tokens, layer,
-          ablation_ >= Ablation::A2 && (ablation_ < Ablation::A3 || group_packing),
-          ablation_ >= Ablation::A3);
+          uses_packing(version_));
     });
   }
 
   template <class Backend, class Tensor>
   auto attention_output(Backend &backend, Tensor &qk, int layer) {
     return execute_node(layer, "attention_output", [&]() {
-      return ablation_ >= Ablation::A3
-          ? backend.heterogeneous_attention_output_a3_a4(qk, layer)
+      return version_ != Version::B
+          ? backend.heterogeneous_attention_output(qk, layer)
           : backend.Softmax_v_linear_layer_norm_part1(qk, layer);
     });
   }
@@ -197,7 +195,7 @@ class EdgeCloudRuntime {
  private:
   EdgeCloudRole role_;
   EdgeCloudModelSpec model_;
-  Ablation ablation_;
+  Version version_;
   std::vector<CompiledHeadLayer> layers_;
   std::string contract_;
   std::array<unsigned char, SHA256_DIGEST_LENGTH> digest_{};

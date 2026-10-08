@@ -68,24 +68,33 @@ double parse_double(const std::string &value, const std::string &field,
 
 }  // namespace
 
-Ablation parse_ablation(const std::string &value) {
-  if (value == "a0" || value == "A0") return Ablation::A0;
-  if (value == "a1" || value == "A1") return Ablation::A1;
-  if (value == "a2" || value == "A2") return Ablation::A2;
-  if (value == "a3" || value == "A3") return Ablation::A3;
-  if (value == "a4" || value == "A4") return Ablation::A4;
-  throw std::invalid_argument("--ablation must be one of a0,a1,a2,a3,a4");
+Version parse_version(const std::string &value) {
+  if (value == "B") return Version::B;
+  if (value == "H") return Version::H;
+  if (value == "HA") return Version::HA;
+  if (value == "HP") return Version::HP;
+  if (value == "HAP") return Version::HAP;
+  if (value == "J") return Version::J;
+  if (value == "BP") return Version::BP;
+  throw std::invalid_argument("--version must be B,H,HA,HP,HAP,J,BP");
 }
-
-const char *to_string(Ablation value) {
+const char *to_string(Version value) {
   switch (value) {
-    case Ablation::A0: return "A0";
-    case Ablation::A1: return "A1";
-    case Ablation::A2: return "A2";
-    case Ablation::A3: return "A3";
-    case Ablation::A4: return "A4";
+    case Version::B: return "B";
+    case Version::H: return "H";
+    case Version::HA: return "HA";
+    case Version::HP: return "HP";
+    case Version::HAP: return "HAP";
+    case Version::J: return "J";
+    case Version::BP: return "BP";
   }
-  return "invalid";
+  throw std::invalid_argument("invalid version");
+}
+bool HeteroPlan::has_linear() const {
+  for (const auto &layer : layers_)
+    for (const auto &head : layer.heads)
+      if (head.protocol == HeadProtocol::HeLinear) return true;
+  return false;
 }
 
 const char *to_string(HeadProtocol value) {
@@ -97,7 +106,7 @@ const char *to_string(HeadProtocol value) {
   return "invalid";
 }
 
-HeteroPlan HeteroPlan::all_softmax_a0() {
+HeteroPlan HeteroPlan::all_softmax() {
   HeteroPlan plan;
   plan.layers_.resize(kPlanLayers);
   for (auto &layer : plan.layers_) {
@@ -178,16 +187,14 @@ HeteroPlan HeteroPlan::parse(std::istream &input, const std::string &source) {
   return plan;
 }
 
-void HeteroPlan::validate(Ablation ablation) const {
+void HeteroPlan::validate(Version version) const {
   if (layers_.size() != kPlanLayers)
     throw std::invalid_argument("head plan must contain 12 layers");
-  bool plan_has_linear = false;
   for (int layer = 0; layer < kPlanLayers; ++layer) {
     if (layers_[layer].heads.size() != kPlanHeads)
       throw std::invalid_argument("head plan layer must contain 12 heads");
     std::array<bool, kPlanHeads> original_seen{};
     std::array<bool, 3> protocol_group_seen{};
-    bool has_linear = false;
     for (int physical = 0; physical < kPlanHeads; ++physical) {
       const auto &head = layers_[layer].heads[physical];
       if (head.original_head < 0 || head.original_head >= kPlanHeads ||
@@ -201,44 +208,28 @@ void HeteroPlan::validate(Ablation ablation) const {
           std::abs(head.alpha - 1.0) > 1e-12)
         throw std::invalid_argument(
             "alpha is only legal for he_linear heads; use 1 for MPC heads");
-      has_linear = has_linear || head.protocol == HeadProtocol::HeLinear;
-      plan_has_linear = plan_has_linear ||
-                        head.protocol == HeadProtocol::HeLinear;
-      if (ablation == Ablation::A0 &&
+      if ((version == Version::B || version == Version::BP) &&
           (head.protocol != HeadProtocol::SoftmaxMpc ||
            head.original_head != physical || std::abs(head.alpha - 1.0) > 1e-12))
         throw std::invalid_argument(
-            "A0 must be all-softmax with the original head order and alpha=1");
-      if (ablation == Ablation::A1 && head.original_head != physical)
-        throw std::invalid_argument(
-            "A1 changes normalization only and requires the original head order");
-      if (ablation >= Ablation::A2 &&
+            "B must be all-softmax with the original head order and alpha=1");
+      if (version != Version::B &&
           (physical == 0 ||
            head.protocol != layers_[layer].heads[physical - 1].protocol)) {
         const int protocol = static_cast<int>(head.protocol);
         if (protocol_group_seen[protocol])
           throw std::invalid_argument(
-              "A2-A4 require one contiguous group per protocol in layer " +
+              "H/HA/HP/HAP/J/BP require one contiguous group per protocol in layer " +
               std::to_string(layer));
         protocol_group_seen[protocol] = true;
       }
     }
-    if (ablation == Ablation::A3 && has_linear)
-      throw std::invalid_argument(
-          "standalone A3 cannot complete he_linear; use A4 in layer " +
-          std::to_string(layer));
   }
-  // A fixed calibration plan may intentionally keep sensitive layers entirely
-  // in MPC.  A4 only requires that the complete model exercises at least one
-  // native CKKS Linear head; it must not force a low-quality replacement into
-  // every layer.
-  if (ablation == Ablation::A4 && !plan_has_linear)
-    throw std::invalid_argument(
-        "A4 requires at least one he_linear head in the complete plan");
+
 }
 
 void HeteroPlan::write_audit_csv(const std::string &path,
-                                 Ablation ablation) const {
+                                 Version version) const {
   const auto parent = std::filesystem::path(path).parent_path();
   if (!parent.empty()) std::filesystem::create_directories(parent);
   std::ofstream output(path);
@@ -248,7 +239,7 @@ void HeteroPlan::write_audit_csv(const std::string &path,
   const double logical_utilization =
       static_cast<double>(kPlanLogicalTokens) * kPlanLogicalTokens /
       (qk_ciphertexts_per_head * slots_per_ciphertext);
-  output << "ablation,layer,physical_head,original_head,protocol,alpha,"
+  output << "version,layer,physical_head,original_head,protocol,alpha,"
             "contiguous_group,group_size,qk_ciphertexts,"
             "physical_slot_utilization,logical_slot_utilization,execution_status\n";
   output << std::fixed << std::setprecision(9);
@@ -263,20 +254,12 @@ void HeteroPlan::write_audit_csv(const std::string &path,
       const int group_size = head - group_start;
       for (int physical = group_start; physical < head; ++physical) {
         const auto &spec = layers_[layer].heads[physical];
-        output << to_string(ablation) << ',' << layer << ',' << physical << ','
+        output << to_string(version) << ',' << layer << ',' << physical << ','
                << spec.original_head << ',' << to_string(spec.protocol) << ','
                << spec.alpha << ',' << group << ',' << group_size << ','
                << qk_ciphertexts_per_head << ",1.000000000,"
                << logical_utilization << ','
-               << (ablation == Ablation::A0
-                       ? "wired_original_blb"
-                       : ablation == Ablation::A1
-                             ? "wired_all_cross_domain"
-                             : ablation == Ablation::A2
-                                   ? "wired_grouped_all_cross_domain"
-                                   : ablation == Ablation::A3
-                                         ? "wired_selective_group_conversion"
-                                         : "wired_native_ckks_linear")
+               << (version == Version::B ? "original_blb" : "selective_mpc_native_linear")
                << '\n';
       }
     }

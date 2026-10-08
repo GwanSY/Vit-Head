@@ -68,6 +68,9 @@ struct BlbViTProfileMetric {
     double wall_ms = 0.0;
     uint64_t send_bytes = 0;
     uint64_t rounds = 0;
+    // Exclusive stage deltas; order matches profile_operator_snapshot().
+    array<uint64_t, 5> operators{};
+    double plaintext_device_encode_ms = 0.0;
 };
 
 class Bert_ckks
@@ -113,33 +116,33 @@ public:
     FixArray ffn_residual_share;
     bool ffn_residual_ready = false;
     FixArray attention_v_share;
-    // Validation-only A0 shares. They are populated only when
-    // OURS_VIT_A0_TRACE=1 and are opened by the driver after the normal
+    // Validation-only B shares. They are populated only when
+    // OURS_VIT_B_TRACE=1 and are opened by the driver after the normal
     // Algorithm-1 conversion. The production inference path never allocates
     // or reconstructs these tensors.
-    FixArray a0_q_share;
-    FixArray a0_k_share;
-    FixArray a0_v_share;
-    bool a0_qkv_ready = false;
-    // A0-only observers for the two encrypted stages after normalization.
+    FixArray b_q_share;
+    FixArray b_k_share;
+    FixArray b_v_share;
+    bool b_qkv_ready = false;
+    // B-only observers for the two encrypted stages after normalization.
     // AV is retained in the same packed per-Head layout as V; W_O is stored
     // in token-major order before the block-input residual is added.  These
-    // shares are never read unless OURS_VIT_A0_TRACE=1.
-    FixArray a0_av_share;
-    FixArray a0_wo_share;
-    bool a0_av_wo_ready = false;
+    // shares are never read unless OURS_VIT_B_TRACE=1.
+    FixArray b_av_share;
+    FixArray b_wo_share;
+    bool b_av_wo_ready = false;
     // Retained for the ViT adapter only. The BERT path must not carry a V
     // ciphertext from Block 2's he1 context into Block 4's distinct he2
     // context; the official boundary exports/imports V through MPC.
     vector<UnifiedCiphertext> attention_v_he_cts;
     bool attention_v_he_ready = false;
-    // A3/A4 public plan and the native he1 operands retained only by Alice.
+    // heterogeneous public plan and the native he1 operands retained only by Alice.
     // The packed QK vector has eight ciphertexts per two-head pair; public
-    // half masks zero every non-Linear half before it reaches the A4 kernel.
+    // half masks zero every non-Linear half before it reaches the NATIVE kernel.
     vector<ours_vit::HeadProtocol> heterogeneous_protocols;
     vector<double> heterogeneous_alphas;
-    ours_vit::Ablation heterogeneous_ablation = ours_vit::Ablation::A0;
-    // Paper ablation switch.  The default is the production packed path.
+    ours_vit::Version heterogeneous_version = ours_vit::Version::B;
+    // Paper version switch.  The default is the production packed path.
     // Setting it false only splits otherwise identical public-plan groups and
     // disables diagonal reuse; it never changes the Head assignment.
     bool heterogeneous_group_packing_enabled = true;
@@ -151,9 +154,9 @@ public:
     FixArray heterogeneous_av_share;
     FixArray heterogeneous_wo_share;
     bool heterogeneous_av_wo_ready = false;
-    vector<UnifiedCiphertext> a4_linear_qk_he1_cts;
-    vector<UnifiedCiphertext> a4_linear_v_he1_cts;
-    bool a4_linear_operands_ready = false;
+    vector<UnifiedCiphertext> native_linear_qk_he1_cts;
+    vector<UnifiedCiphertext> native_linear_v_he1_cts;
+    bool native_linear_operands_ready = false;
     FixArray attention_input_residual_share;
     bool attention_v_ready = false;
     bool attention_input_residual_ready = false;
@@ -162,6 +165,9 @@ public:
     bool pre_norm_attention_output_only = false;
     bool pre_norm_ffn_residual_from_external = false;
     bool pre_norm_ffn_output_only = false;
+    // Explicit model graph: only the real BERT driver enables post-norm.
+    // ViT keeps its existing execution and conversion boundaries.
+    bool bert_post_norm = false;
     // Public BERT key mask in unscaled score units (0 for a valid key and a
     // negative value for padding).  It is added to exactly one additive MPC
     // share immediately before Softmax; no model or client-private value is
@@ -178,7 +184,7 @@ public:
               const BertModel *external_model, int sequence_length,
               bool preprocess_weights = true,
               int layers_to_preprocess = ATTENTION_LAYERS,
-              bool enable_a4_native_linear = false);
+              bool enable_native_linear = false);
     // Lightweight protocol-regression entry: reuse a caller-owned transport
     // and initialize only the MPC conversion channels. It deliberately skips
     // all model loading and the six production HE contexts; callers supply the
@@ -311,6 +317,12 @@ public:
     }
 
 private:
+    inline array<uint64_t, 5> profile_operator_snapshot() const {
+        return {linear.rotation_count, linear.ct_pt_multiply_count,
+                linear.ct_ct_multiply_count, linear.rescale_count + he_rescale_count,
+                conversion_ciphertexts};
+    }
+
     inline void profile_begin(BlbViTProfileStage stage) {
         profile_begin(static_cast<int>(stage));
     }
@@ -320,6 +332,8 @@ private:
         profile_start_time_ = chrono::steady_clock::now();
         profile_start_comm_ = current_comm();
         profile_start_round_ = current_round();
+        profile_start_operators_ = profile_operator_snapshot();
+        profile_start_encode_ = linear.plaintext_device_encode_time;
     }
 
     inline void profile_close() {
@@ -334,6 +348,14 @@ private:
             throw runtime_error("profiling communication counter moved backwards");
         profile_metrics_[stage].send_bytes += comm - profile_start_comm_;
         profile_metrics_[stage].rounds += rounds - profile_start_round_;
+        const auto operators = profile_operator_snapshot();
+        for (size_t i = 0; i < operators.size(); ++i) {
+            if (operators[i] < profile_start_operators_[i])
+                throw runtime_error("profiling operator counter moved backwards");
+            profile_metrics_[stage].operators[i] += operators[i] - profile_start_operators_[i];
+        }
+        profile_metrics_[stage].plaintext_device_encode_ms +=
+            (linear.plaintext_device_encode_time - profile_start_encode_) * 1000.0;
     }
 
     bool profile_enabled_ = false;
@@ -341,6 +363,8 @@ private:
     chrono::steady_clock::time_point profile_start_time_{};
     uint64_t profile_start_comm_ = 0;
     uint64_t profile_start_round_ = 0;
+    array<uint64_t, 5> profile_start_operators_{};
+    double profile_start_encode_ = 0.0;
     array<BlbViTProfileMetric, kBlbViTProfileStageCount> profile_metrics_{};
     array<double, kBlbViTProfileStageCount> profile_he_ms_{};
     array<BlbViTCommAuditMetric, kBlbViTCommAuditBucketCount>
@@ -471,27 +495,26 @@ public:
     vector<FixArray> softmax_fix_he(int party, FixArray x, FPMath* fpmath[],
                                     int active_heads = PACKING_NUM);
 
-    // A1 deliberately retains BLB's full CKKS->MPC->CKKS boundary for every
+    // HETERO deliberately retains BLB's full CKKS->MPC->CKKS boundary for every
     // head.  Only the public, pre-inference normalization protocol differs;
-    // HE-linear candidates use the calibrated alpha in MPC at this ablation
-    // so A1 cannot claim selective-conversion savings.
-    FixArray heterogeneous_attention_norm_a1(
+    // HE-linear candidates use the calibrated alpha in MPC at this version
+    // so HETERO cannot claim selective-conversion savings.
+    FixArray heterogeneous_attention_norm(
         FixArray input,
         const vector<ours_vit::HeadProtocol> &protocols,
         const vector<double> &alphas, int logical_tokens,
-        int layer_id, bool group_contiguous_protocols = false,
-        bool native_he_linear = false);
+        int layer_id, bool group_contiguous_protocols);
 
     // Bind one public offline assignment before preprocessing/execution of a
     // layer.  This is never called from an input-dependent branch.
     void configure_heterogeneous_attention_layer(
         int layer_id, const vector<ours_vit::HeadProtocol> &protocols,
-        const vector<double> &alphas, ours_vit::Ablation ablation);
+        const vector<double> &alphas, ours_vit::Version version);
 
-    // ViT pre-norm A3/A4 output path: grouped MPC->CKKS for Softmax/ReLU,
+    // ViT pre-norm heterogeneous output path: grouped MPC->CKKS for Softmax/ReLU,
     // native he1 Linear QK->AV->WO, then Algorithm-1 export and MPC residual
     // merge.  No decrypt/re-encrypt bridge exists in this method.
-    std::map<char*,FixArray> heterogeneous_attention_output_a3_a4(
+    std::map<char*,FixArray> heterogeneous_attention_output(
         FixArray normalized_qk, int layer_id);
 
     FixArray exp_he(const FixArray &x, bool apply_attention_mask = true);

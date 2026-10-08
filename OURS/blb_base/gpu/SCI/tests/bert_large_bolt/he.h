@@ -136,7 +136,8 @@ public:
         //此处获取2n次原根
         uint64_t m = static_cast<uint64_t>(poly_modulus_degree) << 1;
         cout << m << endl;
-        #pragma omp parallel for
+        // pos is a loop-carried recurrence. Parallel updates can give the
+        // two parties different CKKS slot maps; match the sequential ViT fix.
         for (size_t i = 0; i < num_slots; i++)
         {
             // Position in normal bit order

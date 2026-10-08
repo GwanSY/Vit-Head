@@ -15,8 +15,11 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+from version_matrix import MATRIX, require_version, plan_binding, file_hash
+from experiment_contract import CONTRACT, CONTRACT_SHA256, validate_assignment_contract
+
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "ours_vit_b16/experiments/HAP-ViT.json"
+DEFAULT_CONFIG = ROOT / "ours_vit_b16/experiments/experiment.json"
 
 
 def rooted(value: str) -> str:
@@ -66,8 +69,7 @@ def load_config(path: Path) -> dict:
     if pair is not None and (not isinstance(pair, list) or len(pair) != 2 or
                              any(type(g) is not int or g < 0 for g in pair)):
         raise ValueError("secure.gpu_pair must be null or [cloud_gpu, edge_gpu]")
-    if secure["ablation"] not in {"a0", "a2", "a3", "a4"}:
-        raise ValueError("secure.ablation must be a0, a2, a3 or a4")
+    require_version(secure["version"])
     if secure["network_mode"] not in {"netem", "none"}:
         raise ValueError("secure.network_mode must be netem or none")
     for key, upper in (("min_free_memory_mib", None), ("max_gpu_utilization_percent", 100)):
@@ -77,7 +79,7 @@ def load_config(path: Path) -> dict:
     for key, value in config["paths"].items():
         if value is not None:
             config["paths"][key] = rooted(value)
-    for key in ("input", "assignment", "head_plan", "binary_override", "phantom_library_override"):
+    for key in ("input", "assignment", "head_plan", "paired_config", "binary_override", "phantom_library_override"):
         value = config["secure"][key]
         if value is not None:
             config["secure"][key] = rooted(value)
@@ -97,7 +99,10 @@ def offline_command(config: dict) -> list[str]:
     missing = [key for key, value in config["paths"].items() if value is None]
     if missing:
         raise ValueError(f"set paths before running offline selection: {', '.join(missing)}")
+    if config['secure']['version'] not in ('HA', 'J'):
+        raise ValueError('offline search is only allowed for HA or J; HAP/HP must reuse their source plan')
     options = dict(config["paths"])
+    options['version'] = config['secure']['version']
     options["output_dir"] = str(Path(options["output_dir"]) / "offline")
     for section in ("data", "search", "cost_model", "comparisons"):
         options.update(config[section])
@@ -127,7 +132,6 @@ def secure_environment(config: dict) -> dict[str, str]:
         "binary_override": "OURS_VIT_BINARY_OVERRIDE",
         "phantom_library_override": "OURS_VIT_PHANTOM_LIBRARY_OVERRIDE",
         "input": "OURS_VIT_INPUT",
-        "group_packing": "OURS_VIT_GROUP_PACKING",
         "gpu_direct_plaintext": "BLB_VIT_GPU_DIRECT_PLAINTEXT",
         "gpu_linear_streams": "BLB_VIT_GPU_LINEAR_STREAMS",
         "omp_threads": "BLB_VIT_OMP_THREADS",
@@ -145,29 +149,79 @@ def secure_environment(config: dict) -> dict[str, str]:
 
 def secure_command(config: dict) -> tuple[list[str], dict[str, str]]:
     secure = config["secure"]
-    if secure["assignment"]:
-        runtime = json.loads(Path(secure["assignment"]).read_text())["runtime"]
-    else:
-        runtime = {"ablation": secure["ablation"], "head_plan": secure["head_plan"]}
-    if not runtime["head_plan"]:
-        if runtime["ablation"].lower() != "a0":
-            raise ValueError("set secure.head_plan or secure.assignment for A2/A3/A4")
-        runtime["head_plan"] = str(ROOT / "ours_vit_b16/experiments/all_softmax_head_plan.txt")
+    version = require_version(secure['version'])
+    plan = secure['head_plan']
+    if secure['assignment']:
+        document = json.loads(Path(secure['assignment']).read_text())
+        runtime = document['runtime']
+        owner = require_version(runtime['version'])
+        if owner != version and MATRIX[version]['paired_with'] != owner:
+            raise ValueError('assignment version does not match the requested experiment')
+        validate_assignment_contract(document)
+        plan = runtime['head_plan']
+        if document.get('model_sha256') != file_hash(config['paths']['model']):
+            raise ValueError('assignment checkpoint hash mismatch')
+    if version in ('B', 'BP'):
+        if plan or secure['assignment']:
+            raise ValueError('B/BP use the built-in all-Softmax plan')
+        plan = str(ROOT / 'ours_vit_b16/experiments/all_softmax_head_plan.txt')
+    elif not plan:
+        raise ValueError('heterogeneous versions require a frozen head plan/assignment')
+    plan = rooted(plan)
+    binding = plan_binding(plan)
+    if secure['assignment'] and document['runtime'].get('semantic_plan_sha256') != binding['semantic_plan_sha256']:
+        raise ValueError('assignment frozen semantic plan mismatch')
+    if version in ('HP', 'HAP'):
+        if not secure['paired_config']:
+            raise ValueError('HP/HAP require paired_config pointing to the source run config.secure.json')
+        parent = load_config(Path(secure['paired_config']))
+        frozen = json.loads(Path(secure['paired_config']).with_name('plan_binding.json').read_text())
+        if frozen.get('experiment_contract_sha256') != CONTRACT_SHA256 or frozen.get('experiment_contract') != CONTRACT:
+            raise ValueError('paired source experiment definitions missing or incompatible')
+        if frozen['semantic_plan_sha256'] != binding['semantic_plan_sha256']:
+            raise ValueError('paired source plan was changed after the source run')
+        for key, old_hash in frozen['files'].items():
+            section, field = key.split('.')
+            if file_hash(config[section][field]) != old_hash:
+                raise ValueError(f'paired frozen asset changed: {key}')
+        if parent['secure']['version'] != MATRIX[version]['paired_with']:
+            raise ValueError('wrong paired source version')
+        parent_command, _ = secure_command(parent)
+        if plan_binding(parent_command[3])['semantic_plan_sha256'] != binding['semantic_plan_sha256']:
+            raise ValueError('paired experiment changes head identity/protocol/alpha')
+        for key in ('model', 'model_manifest', 'preprocess_manifest'):
+            if file_hash(config['paths'][key]) != file_hash(parent['paths'][key]):
+                raise ValueError(f'paired experiment changes {key}')
+        for key in ('backend', 'gpu_id', 'gpu_pair', 'image', 'binary_override',
+                    'phantom_library_override', 'input', 'gpu_direct_plaintext',
+                    'gpu_linear_streams', 'omp_threads', 'network_mode'):
+            if secure[key] != parent['secure'][key]:
+                raise ValueError(f'paired experiment changes secure.{key}')
+    config['secure']['head_plan'] = None if version in ('B', 'BP') else plan
     extra = secure_environment(config)
-    if runtime["ablation"].lower() == "a0":
-        extra["OURS_VIT_FORMAL_A0_BASELINE"] = "1"
-        # A0 has no heterogeneous groups; ungrouped A3/A4 settings do not
-        # select a different attention kernel for the all-Softmax baseline.
-        extra["OURS_VIT_GROUP_PACKING"] = "1"
-    elif runtime["ablation"].lower() == "a2":
-        extra["OURS_VIT_FORMAL_A2_SELECTED"] = "1"
+    if version in ('HP', 'HAP'):
+        if not frozen.get('image_id', '').startswith('sha256:'):
+            raise ValueError('paired source lacks immutable image ID; finish the source run first')
+        extra['OURS_DOCKER_IMAGE'] = frozen['image_id']
     output = Path(rooted(secure['output_dir']))
     if not output.is_relative_to(ROOT / 'outputs'):
         raise ValueError('secure.output_dir must be below outputs/')
-    command = ["bash", str(ROOT / "scripts/run_ours_a3_a4_container.sh"),
-               runtime["ablation"].lower(), rooted(runtime["head_plan"]),
+    command = ["bash", str(ROOT / "scripts/run_ours_container.sh"),
+               version, plan,
                str(output.relative_to(ROOT)), "12", "full"]
     return command, extra
+
+
+def edge_cloud_metadata_agrees(metadata: list[dict]) -> bool:
+    if len(metadata) != 2:
+        return False
+    cloud, edge = metadata
+    digest = cloud.get('edge_cloud_contract_sha256', '')
+    return bool(re.fullmatch(r'[0-9a-f]{64}', digest) and
+                edge.get('edge_cloud_contract_sha256') == digest and
+                cloud.get('edge_cloud_role') == 'cloud' and
+                edge.get('edge_cloud_role') == 'edge' and
+                all(m.get('edge_cloud_plan_agreed') == '1' for m in metadata))
 
 
 def validate_secure_run(config: dict, command: list[str], environment: dict, log) -> int:
@@ -177,7 +231,7 @@ def validate_secure_run(config: dict, command: list[str], environment: dict, log
                  '--model', config['paths']['model'], '--input', config['secure']['input'],
                  '--secure-logits', str(native / 'secure_logits_party2.txt'),
                  '--output', str(reference_path)]
-    if command[2] != 'a0':
+    if command[2] != 'B':
         reference += ['--head-plan', command[3]]
     reference_code = subprocess.call(reference, env=environment, stdout=log, stderr=subprocess.STDOUT)
     report = json.loads(reference_path.read_text())
@@ -199,22 +253,31 @@ def validate_secure_run(config: dict, command: list[str], environment: dict, log
     numerical_pass = bool(reference_code == 0 and same_logits and report['secure']['top1_matches_fixed']
                           and report['secure']['top1'] == report['clear']['top1']
                           and relative_l2 <= .05 and maximum <= .5)
-    native_pass = all(m.get('execution_framework') == 'ours_native_edge_cloud_v1' and
+    expected_packing = ('not_applicable' if command[2] == 'B' else
+                        'packed' if MATRIX[command[2]]['packing'] else 'unpacked')
+    native_pass = all(m.get('version') == command[2] and
+                      m.get('attention_packing') == expected_packing and
+                      m.get('execution_framework') == 'ours_native_edge_cloud_v1' and
                       m.get('conversion_path') == 'wide_shared_rns_v1' and
                       m.get('attention_diagonal_kernel') == 'complete_v1' and
-                      m.get('softmax_product') == 'mpc_batched' and
+                      m.get('softmax_product') == 'ckks' and
+                      m.get('gelu_polynomial') == 'blb_F0_F1' and
+                      m.get('secure_exp_clamp') == '1' and
                       m.get('executed_transformer_blocks') == '12' and m.get('partial_run') == '0'
                       for m in metadata)
+    native_pass = native_pass and edge_cloud_metadata_agrees(metadata)
     communication = {
         name: {'party_bytes': [int(t[name]) for t in totals],
                'aggregate_bytes': sum(int(t[name]) for t in totals)}
         for name in ('online_communication_bytes', 'initialization_communication_bytes',
                      'total_communication_bytes')}
-    performance_pass = abs(online / 498.103927 - 1) <= .05
     result = dict(execution_pass=native_pass, numerical_pass=numerical_pass, online_s=online,
-                  acceptance_pass=native_pass and numerical_pass and performance_pass,
-                  delta_vs_498_pct=(online / 498.103927 - 1) * 100,
-                  performance_within_5_percent=performance_pass,
+                  acceptance_pass=native_pass and numerical_pass,
+                  version=command[2], new_heterogeneous_packing=MATRIX[command[2]]["packing"],
+                  packing_scope="new_matrix_P_only_not_BLB_ciphertext_packing",
+                  blb_ciphertext_packing="active_QKV_BSGS_head_pairs",
+                  attention_diagonal_kernel=metadata[0].get('attention_diagonal_kernel'),
+                  performance_status="MEASURED_REQUIRES_PAIRED_COMPARISON",
                   secure_top1=report['secure']['top1'], fixed_top1=report['fixed']['top1'],
                   clear_top1=report['clear']['top1'], fixed_relative_l2=relative_l2,
                   fixed_max_abs=maximum, same_public_logits=same_logits, totals=totals,
@@ -228,6 +291,7 @@ def validate_secure_run(config: dict, command: list[str], environment: dict, log
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--version", choices=tuple(MATRIX), help="唯一实验版本")
     parser.add_argument("--stage", choices=("offline", "costs", "secure"), default="offline")
     parser.add_argument("--show-config", action="store_true", help="print resolved config; do not run anything")
     parser.add_argument("--print-command", action="store_true", help="print command; do not run anything")
@@ -240,6 +304,8 @@ def main() -> None:
     if args.gpus and any(g < 0 for g in args.gpus):
         parser.error('GPU indices must be nonnegative')
     config = load_config(args.config)
+    if args.version:
+        config["secure"]["version"] = args.version
     if args.gpus:
         config['secure']['gpu_pair'] = args.gpus
     if args.output_dir:
@@ -258,7 +324,7 @@ def main() -> None:
         command = offline_command(config)
     elif args.stage == "costs":
         command = [sys.executable, "-B", str(Path(__file__).with_name("research2_costs.py")),
-                   "--config", str(args.config.resolve())]
+                   "--config", str(args.config.resolve()), "--version", config["secure"]["version"]]
         extra = secure_environment(config)
     else:
         command, extra = secure_command(config)
@@ -272,7 +338,19 @@ def main() -> None:
     output_dir = Path(config["paths"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     snapshot = output_dir / f"config.{args.stage}.json"
+    if args.stage == "secure" and snapshot.exists():
+        raise ValueError("secure output root already contains a frozen run; choose a new --output-dir")
     snapshot.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+    if args.stage == 'secure':
+        binding = plan_binding(command[3])
+        binding.update(version=config['secure']['version'], model_sha256=file_hash(config['paths']['model']))
+        binding['experiment_contract'] = CONTRACT
+        binding['experiment_contract_sha256'] = CONTRACT_SHA256
+        binding['files'] = {f'{section}.{key}': file_hash(config[section][key])
+                            for section, keys in (('paths', ('model', 'model_manifest', 'preprocess_manifest')),
+                                                  ('secure', ('input', 'binary_override', 'phantom_library_override')))
+                            for key in keys if config[section][key]}
+        (output_dir / 'plan_binding.json').write_text(json.dumps(binding, indent=2) + '\n')
     log_path = output_dir / "run.log"
     started = datetime.now(timezone.utc).isoformat()
     print(f"Research2 {args.stage}: started; log={log_path}", flush=True)
@@ -285,6 +363,13 @@ def main() -> None:
             code = subprocess.call(command, cwd=ROOT, env=environment,
                                    stdout=log, stderr=subprocess.STDOUT)
             if code == 0 and args.stage == 'secure':
+                selection = Path(rooted(config['secure']['output_dir'])) / 'gpu_selection.txt'
+                image_ids = [line.split('=', 1)[1] for line in selection.read_text().splitlines()
+                             if line.startswith('image_id=')]
+                if not image_ids:
+                    raise ValueError('run lacks immutable Docker image provenance')
+                binding['image_id'] = image_ids[-1]
+                (output_dir / 'plan_binding.json').write_text(json.dumps(binding, indent=2) + '\n')
                 code = validate_secure_run(config, command, environment, log)
         except KeyboardInterrupt:
             code = 130

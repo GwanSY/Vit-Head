@@ -45,17 +45,17 @@ struct Backend {
   bool grouped = false, native = false;
   std::vector<HeadProtocol> bound;
   void configure_heterogeneous_attention_layer(int, const std::vector<HeadProtocol> &p,
-                                               const std::vector<double> &, Ablation) {
+                                               const std::vector<double> &, Version) {
     ++configured; bound = p;
   }
   int softmax_he(int qk) { ++normalized; return qk + 1; }
-  int heterogeneous_attention_norm_a1(int qk, const std::vector<HeadProtocol> &p,
+  int heterogeneous_attention_norm(int qk, const std::vector<HeadProtocol> &p,
                                       const std::vector<double> &, int tokens, int,
-                                      bool group, bool he) {
+                                      bool group) {
     require(tokens == 197 && p.size() == 12, "shape/heads changed");
-    ++normalized; grouped = group; native = he; return qk + 2;
+    ++normalized; grouped = group; native = true; return qk + 2;
   }
-  int heterogeneous_attention_output_a3_a4(int qk, int) { ++output; return qk + 3; }
+  int heterogeneous_attention_output(int qk, int) { ++output; return qk + 3; }
   int Softmax_v_linear_layer_norm_part1(int qk, int) { ++output; return qk + 4; }
 };
 
@@ -108,7 +108,7 @@ static void two_process_agreement(bool mismatch) {
   SocketChannel channel{sockets[cloud ? 0 : 1]};
   auto model = EdgeCloudModelSpec{
       mismatch && !cloud ? "modified_vit" : "vit", 197, 256, 768, 64, 1000, 12};
-  EdgeCloudRuntime runtime(cloud ? 1 : 2, model, mixed_plan(), Ablation::A4);
+  EdgeCloudRuntime runtime(cloud ? 1 : 2, model, mixed_plan(), Version::HA);
   bool rejected = false;
   try { runtime.agree(channel); } catch (const std::runtime_error &error) {
     rejected = true;
@@ -128,11 +128,11 @@ static void two_process_agreement(bool mismatch) {
 int main() {
   try {
     auto model = EdgeCloudModelSpec{"test_vit_v1", 197, 256, 768, 64, 1000, 12};
-    for (Ablation ablation : {Ablation::A0, Ablation::A1, Ablation::A2, Ablation::A3, Ablation::A4}) {
-      auto plan = ablation == Ablation::A4 ? mixed_plan() : HeteroPlan::all_softmax_a0();
-      EdgeCloudRuntime cloud(1, model, plan, ablation), edge(2, model, plan, ablation);
+    for (Version version : {Version::B, Version::H, Version::HA, Version::HP, Version::HAP, Version::J, Version::BP}) {
+      auto plan = (version == Version::B || version == Version::BP) ? HeteroPlan::all_softmax() : mixed_plan();
+      EdgeCloudRuntime cloud(1, model, plan, version), edge(2, model, plan, version);
       require(cloud.contract_digest() == edge.contract_digest(), "role leaked into public contract");
-      require(cloud.public_contract().find("conversion=integer_lift_real_pairs_v3") != std::string::npos,
+      require(cloud.public_contract().find("conversion=algorithm2_coefficient_extension_v1") != std::string::npos,
               "conversion wire format is not bound into the contract");
       require(cloud.is_cloud() && edge.is_edge(), "role ownership changed");
       Backend cb, eb;
@@ -150,19 +150,18 @@ int main() {
           runtime.execute_node(layer, "ln1", [] { return 0; });
           runtime.execute_node(layer, "qkv", [] { return 0; });
           int qk = 10;
-          const bool packing = layer % 2 == 0;
-          qk = runtime.attention_norm(backend, qk, layer, packing);
-          if (ablation != Ablation::A0) {
-            require(backend.grouped == (ablation >= Ablation::A2 &&
-                    (ablation < Ablation::A3 || packing)), "packing dispatch changed");
-            require(backend.native == (ablation >= Ablation::A3), "native HE dispatch changed");
+
+          qk = runtime.attention_norm(backend, qk, layer);
+          if (version != Version::B) {
+            require(backend.grouped == uses_packing(version), "packing dispatch changed");
+            require(backend.native == (version != Version::B), "native HE dispatch changed");
           }
-          if (ablation == Ablation::A4)
+          if (version == Version::HA)
             require(runtime.layer_plan(layer).alphas.back() == 0.015625 &&
                     runtime.layer_plan(layer).protocols.back() == HeadProtocol::HeLinear,
                     "compiled heterogeneous plan/alpha changed");
           const int result = runtime.attention_output(backend, qk, layer);
-          require(result == (ablation == Ablation::A1 || ablation == Ablation::A2 ? 16 : 15),
+          require(result == 15,
                   "native attention operator selection changed");
           rejects([&] { runtime.release_layer(backend, layer); });
           for (const char *node : {"ln2", "ffn1", "gelu", "ffn2"})
@@ -174,29 +173,29 @@ int main() {
       require(eb.linear.prepared == 0 && eb.linear.released == 0, "edge accessed model weights");
       require(cc.sent == 33 && cc.received == 33 && ec.sent == 33 && ec.received == 33,
               "node dispatch added online transport");
-      require(cb.configured == (ablation >= Ablation::A3 ? 12 : 0), "head configuration changed");
+      require(cb.configured == (version != Version::B ? 12 : 0), "head configuration changed");
       require(cb.normalized == 12 && cb.output == 12, "operator count changed");
     }
     auto plan = mixed_plan();
-    EdgeCloudRuntime a(1, model, plan, Ablation::A4);
+    EdgeCloudRuntime a(1, model, plan, Version::HA);
     model.revision = "modified_model_v2";
-    EdgeCloudRuntime b(2, model, plan, Ablation::A4);
+    EdgeCloudRuntime b(2, model, plan, Version::HA);
     Channel mismatch{b.contract_digest()};
     rejects([&] { a.agree(mismatch); });
     Channel wrong_role{a.contract_digest(), 1};
     rejects([&] { a.agree(wrong_role); });
     model.block_nodes.insert(model.block_nodes.begin(), "future_model_operator");
-    EdgeCloudRuntime future(1, model, plan, Ablation::A4);
+    EdgeCloudRuntime future(1, model, plan, Version::HA);
     Channel same{future.contract_digest()};
     future.agree(same);
     Backend backend; int weights = 0;
     future.prepare_layer(backend, weights, 0);
     require(future.execute_node(0, "future_model_operator", [] { return 42; }) == 42,
             "model extension did not use native executor");
-    rejects([&] { EdgeCloudRuntime invalid(3, model, plan, Ablation::A4); });
+    rejects([&] { EdgeCloudRuntime invalid(3, model, plan, Version::HA); });
     two_process_agreement(false);
     two_process_agreement(true);
-    std::cout << "OURS_EDGE_CLOUD_TEST status=PASS ablations=A0-A4 roles=2 blocks=12 "
+    std::cout << "OURS_EDGE_CLOUD_TEST status=PASS versions=B,H,HA,HP,HAP,J,BP roles=2 blocks=12 "
                  "model_extension=PASS mismatch_rejection=PASS two_process_handshake=PASS online_messages=0\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

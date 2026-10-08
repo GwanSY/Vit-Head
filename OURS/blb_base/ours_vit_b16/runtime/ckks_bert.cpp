@@ -163,7 +163,7 @@ void import_target_scale(Bert_ckks &owner,
     }
     vector<Plaintext> host_plaintexts = owner.mpc_to_ckks(
         shares, slot, he->get_conversion_prime(), ell, input_scale,
-        target_scale, he, false, string(stage) == "softmax");
+        target_scale, he, false, false); // HE rounding does not prove MSB=0.
     owner.profile_set_conversion_bucket(previous_conversion_bucket);
     const auto first_data = he->context->first_context_data();
     if (host_plaintexts.empty() || !first_data) {
@@ -705,9 +705,9 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
     // the normal benchmark path never enables it.
     const bool debug_qkv = getenv("BLB_QKV_AGGREGATE") != nullptr &&
                            string(getenv("BLB_QKV_AGGREGATE")) == "1";
-    const bool a0_trace = getenv("OURS_VIT_A0_TRACE") != nullptr &&
-                          string(getenv("OURS_VIT_A0_TRACE")) == "1";
-    a0_qkv_ready = false;
+    const bool b_trace = getenv("OURS_VIT_B_TRACE") != nullptr &&
+                          string(getenv("OURS_VIT_B_TRACE")) == "1";
+    b_qkv_ready = false;
     if (raw_input) {
         attention_v_he_cts.clear();
         attention_v_he_ready = false;
@@ -824,7 +824,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
     vector<Plaintext> raw_v_pts(raw_v_cts.size());
     const bool selective_conversion =
         ordinary_full_slot_output && !raw_input &&
-        heterogeneous_ablation >= ours_vit::Ablation::A3;
+        heterogeneous_version != ours_vit::Version::B;
     struct SelectiveGroupConversion {
         ours_vit::HeadProtocol protocol;
         int head_begin = 0;
@@ -841,7 +841,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         if (heterogeneous_protocols.size() != PACKING_NUM ||
             heterogeneous_alphas.size() != PACKING_NUM) {
             throw runtime_error(
-                "A3/A4 selective QKV conversion has no public assignment");
+                "heterogeneous selective QKV conversion has no public assignment");
         }
         const size_t ciphertexts_per_pair =
             qk_ct_count / (PACKING_NUM / 2);
@@ -851,7 +851,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             v_ct_count % (PACKING_NUM / 2) != 0 ||
             ciphertexts_per_pair == 0 || v_ciphertexts_per_pair == 0) {
             throw runtime_error(
-                "A3/A4 QK/V head-pair ciphertext layout is invalid");
+                "heterogeneous QK/V head-pair ciphertext layout is invalid");
         }
         for (int begin = 0; begin < PACKING_NUM;) {
             int end = begin + 1;
@@ -900,20 +900,20 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             begin = end;
         }
         if (selective_groups.empty() &&
-            heterogeneous_ablation != ours_vit::Ablation::A4) {
-            throw runtime_error("A3 assignment has no MPC attention group");
+            !linear.native_linear_enabled) {
+            throw runtime_error("SELECTIVE assignment has no MPC attention group");
         }
     }
     const size_t projected_tensor_ct_count = v_ct_count;
-    vector<Ciphertext> a0_q_cts(a0_trace && !raw_input
+    vector<Ciphertext> b_q_cts(b_trace && !raw_input
                                     ? projected_tensor_ct_count : 0);
-    vector<Ciphertext> a0_k_cts(a0_trace && !raw_input
+    vector<Ciphertext> b_k_cts(b_trace && !raw_input
                                     ? projected_tensor_ct_count : 0);
-    vector<Ciphertext> a0_v_cts(a0_trace && !raw_input
+    vector<Ciphertext> b_v_cts(b_trace && !raw_input
                                     ? projected_tensor_ct_count : 0);
-    vector<Plaintext> a0_q_pts(a0_q_cts.size());
-    vector<Plaintext> a0_k_pts(a0_k_cts.size());
-    vector<Plaintext> a0_v_pts(a0_v_cts.size());
+    vector<Plaintext> b_q_pts(b_q_cts.size());
+    vector<Plaintext> b_k_pts(b_k_cts.size());
+    vector<Plaintext> b_v_pts(b_v_cts.size());
     // The first half of the ordinary CKKS input layout contains the real and
     // imaginary halves needed by Algorithm 1's half decode.  Exporting this
     // copy once gives the next Figure-10 block the real post-LN residual
@@ -1060,9 +1060,9 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                     }
                 }
             }
-            if (a0_trace && !raw_input) {
-                if (getenv("OURS_VIT_A0_NATIVE_OBSERVER_CHECK") != nullptr) {
-                    vector<Ciphertext> native_q(a0_q_cts.size());
+            if (b_trace && !raw_input) {
+                if (getenv("OURS_VIT_B_NATIVE_OBSERVER_CHECK") != nullptr) {
+                    vector<Ciphertext> native_q(b_q_cts.size());
                     recv_encrypted_vector(io == nullptr ? nullptr : he->context,
                                          io, native_q);
                     const size_t count = min<size_t>(2, native_q.size());
@@ -1076,7 +1076,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                         for (const auto &value : native_decoded) {
                             max_abs = max(max_abs, abs(value.real()));
                         }
-                        cout << "OURS_A0_NATIVE_Q_OBSERVER index=" << index
+                        cout << "OURS_B_NATIVE_Q_OBSERVER index=" << index
                              << " scale_bits="
                              << log2(native_plaintext.scale())
                              << " limbs="
@@ -1094,14 +1094,14 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                         cout << endl;
                     }
                 }
-                recv_encrypted_vector(he->context, io, a0_q_cts);
-                recv_encrypted_vector(he->context, io, a0_k_cts);
-                recv_encrypted_vector(he->context, io, a0_v_cts);
+                recv_encrypted_vector(he->context, io, b_q_cts);
+                recv_encrypted_vector(he->context, io, b_k_cts);
+                recv_encrypted_vector(he->context, io, b_v_cts);
                 #pragma omp parallel for
-                for (int i = 0; i < static_cast<int>(a0_q_cts.size()); ++i) {
-                    he->decryptor->decrypt(a0_q_cts[i], a0_q_pts[i]);
-                    he->decryptor->decrypt(a0_k_cts[i], a0_k_pts[i]);
-                    he->decryptor->decrypt(a0_v_cts[i], a0_v_pts[i]);
+                for (int i = 0; i < static_cast<int>(b_q_cts.size()); ++i) {
+                    he->decryptor->decrypt(b_q_cts[i], b_q_pts[i]);
+                    he->decryptor->decrypt(b_k_cts[i], b_k_pts[i]);
+                    he->decryptor->decrypt(b_v_cts[i], b_v_pts[i]);
                 }
             }
         } else {
@@ -1119,15 +1119,15 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             for(int i=0;i<output_cts_half.size();i++){
                 he->decryptor->decrypt(output_cts_half[i], output_pts_half[i]);
             }
-            if (a0_trace) {
-                recv_encrypted_vector(he->context, io, a0_q_cts);
-                recv_encrypted_vector(he->context, io, a0_k_cts);
-                recv_encrypted_vector(he->context, io, a0_v_cts);
+            if (b_trace) {
+                recv_encrypted_vector(he->context, io, b_q_cts);
+                recv_encrypted_vector(he->context, io, b_k_cts);
+                recv_encrypted_vector(he->context, io, b_v_cts);
                 #pragma omp parallel for
-                for (int i = 0; i < static_cast<int>(a0_q_cts.size()); ++i) {
-                    he->decryptor->decrypt(a0_q_cts[i], a0_q_pts[i]);
-                    he->decryptor->decrypt(a0_k_cts[i], a0_k_pts[i]);
-                    he->decryptor->decrypt(a0_v_cts[i], a0_v_pts[i]);
+                for (int i = 0; i < static_cast<int>(b_q_cts.size()); ++i) {
+                    he->decryptor->decrypt(b_q_cts[i], b_q_pts[i]);
+                    he->decryptor->decrypt(b_k_cts[i], b_k_pts[i]);
+                    he->decryptor->decrypt(b_v_cts[i], b_v_pts[i]);
                 }
             }
         }
@@ -1366,7 +1366,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             }
         }
         vector<UnifiedCiphertext> q_k_v;
-        vector<UnifiedCiphertext> a0_qkv_ciphertexts;
+        vector<UnifiedCiphertext> b_qkv_ciphertexts;
         if (debug_qkv) {
             q_k_v.resize(output_ct_count, UnifiedCiphertext(loc));
             linear.bert_cipher_plain_bsgs(
@@ -1385,7 +1385,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 linear.pp_1[layer_id],
                 data,
                 q_k_v,
-                a0_trace && !raw_input ? &a0_qkv_ciphertexts : nullptr
+                b_trace && !raw_input ? &b_qkv_ciphertexts : nullptr
             );
         }
         cout << "qkv_scale:" << log2(q_k_v[0].scale()) << endl;
@@ -1447,9 +1447,9 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 output_cts_half[i] = std::move(q_k_v[i].hcipher());
             }
         }
-        if (a0_trace && !raw_input) {
-            if (a0_qkv_ciphertexts.size() != 3 * projected_tensor_ct_count) {
-                throw runtime_error("A0 Q/K/V observer ciphertext partition mismatch");
+        if (b_trace && !raw_input) {
+            if (b_qkv_ciphertexts.size() != 3 * projected_tensor_ct_count) {
+                throw runtime_error("B Q/K/V observer ciphertext partition mismatch");
             }
             for (size_t i = 0; i < projected_tensor_ct_count; ++i) {
                 auto move_observer_ciphertext = [&](UnifiedCiphertext &source,
@@ -1459,13 +1459,13 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                     }
                     target = std::move(source.hcipher());
                 };
-                move_observer_ciphertext(a0_qkv_ciphertexts[i], a0_q_cts[i]);
+                move_observer_ciphertext(b_qkv_ciphertexts[i], b_q_cts[i]);
                 move_observer_ciphertext(
-                    a0_qkv_ciphertexts[projected_tensor_ct_count + i],
-                    a0_k_cts[i]);
+                    b_qkv_ciphertexts[projected_tensor_ct_count + i],
+                    b_k_cts[i]);
                 move_observer_ciphertext(
-                    a0_qkv_ciphertexts[2 * projected_tensor_ct_count + i],
-                    a0_v_cts[i]);
+                    b_qkv_ciphertexts[2 * projected_tensor_ct_count + i],
+                    b_v_cts[i]);
             }
         }
         if (selective_conversion) {
@@ -1522,10 +1522,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 ++linear.ct_pt_multiply_count;
             };
 
-            if (heterogeneous_ablation == ours_vit::Ablation::A4) {
-                a4_linear_qk_he1_cts.assign(
+            if (linear.native_linear_enabled) {
+                native_linear_qk_he1_cts.assign(
                     qk_ct_count, UnifiedCiphertext(LOCATION::HOST));
-                a4_linear_v_he1_cts.assign(
+                native_linear_v_he1_cts.assign(
                     v_ct_count, UnifiedCiphertext(LOCATION::HOST));
                 for (size_t index = 0; index < qk_ct_count; ++index) {
                     const int pair = static_cast<int>(
@@ -1536,15 +1536,15 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                         heterogeneous_protocols[2 * pair + 1] ==
                         ours_vit::HeadProtocol::HeLinear;
                     if (!first && !second) continue;
-                    a4_linear_qk_he1_cts[index].hcipher() =
+                    native_linear_qk_he1_cts[index].hcipher() =
                         raw_qk_cts[index];
                     mask_pair_halves(
-                        a4_linear_qk_he1_cts[index].hcipher(), index,
+                        native_linear_qk_he1_cts[index].hcipher(), index,
                         ciphertexts_per_pair, true, true,
                         [&](int head) {
                             return heterogeneous_protocols[head] ==
                                    ours_vit::HeadProtocol::HeLinear;
-                        }, "A4 QK half mask");
+                        }, "NATIVE QK half mask");
                 }
                 for (size_t index = 0; index < v_ct_count; ++index) {
                     const int pair = static_cast<int>(
@@ -1554,20 +1554,20 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                     const bool second = heterogeneous_protocols[2 * pair + 1] ==
                         ours_vit::HeadProtocol::HeLinear;
                     if (!first && !second) continue;
-                    a4_linear_v_he1_cts[index].hcipher() = raw_v_cts[index];
+                    native_linear_v_he1_cts[index].hcipher() = raw_v_cts[index];
                     mask_pair_halves(
-                        a4_linear_v_he1_cts[index].hcipher(), index,
+                        native_linear_v_he1_cts[index].hcipher(), index,
                         v_ciphertexts_per_pair, false, true,
                         [&](int head) {
                             return heterogeneous_protocols[head] ==
                                    ours_vit::HeadProtocol::HeLinear;
-                        }, "A4 V half mask");
+                        }, "NATIVE V half mask");
                 }
-                a4_linear_operands_ready = true;
+                native_linear_operands_ready = true;
             } else {
-                a4_linear_qk_he1_cts.clear();
-                a4_linear_v_he1_cts.clear();
-                a4_linear_operands_ready = false;
+                native_linear_qk_he1_cts.clear();
+                native_linear_v_he1_cts.clear();
+                native_linear_operands_ready = false;
             }
 
             for (auto &group : selective_groups) {
@@ -1581,7 +1581,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                         [&](int head) {
                             return head >= group.head_begin &&
                                    head < group.head_end;
-                        }, "A3 grouped QK half mask");
+                        }, "SELECTIVE grouped QK half mask");
                 }
                 for (size_t local = 0; local < group.v_indices.size();
                      ++local) {
@@ -1593,10 +1593,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                         [&](int head) {
                             return head >= group.head_begin &&
                                    head < group.head_end;
-                        }, "A3 grouped V half mask");
+                        }, "SELECTIVE grouped V half mask");
                 }
             }
-            cout << "OURS_A3_QKV_PARTITION status=PASS layer=" << layer_id
+            cout << "OURS_SELECTIVE_QKV_PARTITION status=PASS layer=" << layer_id
                  << " mpc_groups=" << selective_groups.size()
                  << " linear_heads="
                  << count(heterogeneous_protocols.begin(),
@@ -1606,7 +1606,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                  << " mpc_logical_padding_mask=normalization_output"
                  << " linear_logical_padding_mask=1"
                  << " retained_he1="
-                 << (heterogeneous_ablation == ours_vit::Ablation::A4 ? 1 : 0)
+                 << (linear.native_linear_enabled ? 1 : 0)
                  << endl;
         }
         if (he->is_gpu_enable()) {
@@ -1632,20 +1632,20 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                     prepare_host_conversion_from_actual_scale(
                         *this, group.qk_cts,
                         kFormalConversionScaleBits, he,
-                        "a3_group_qk");
+                        "selective_group_qk");
                     mask_ckks_to_mpc_inplace(
                         group.qk_cts, group.qk_pts, he);
                     send_encrypted_vector(io, group.qk_cts);
                     prepare_host_conversion_from_actual_scale(
                         *this, group.v_cts,
                         kFormalConversionScaleBits, he,
-                        "a3_group_v");
+                        "selective_group_v");
                     mask_ckks_to_mpc_inplace(
                         group.v_cts, group.v_pts, he);
                     send_encrypted_vector(io, group.v_cts);
                     qk_sent += group.qk_cts.size();
                     v_sent += group.v_cts.size();
-                    cout << "OURS_A3_SELECTIVE_CKKS_TO_MPC status=PASS"
+                    cout << "OURS_SELECTIVE_SELECTIVE_CKKS_TO_MPC status=PASS"
                          << " layer=" << layer_id
                          << " protocol="
                          << ours_vit::to_string(group.protocol)
@@ -1694,30 +1694,30 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                  << " raw_input=" << (raw_input ? 1 : 0)
                  << " diagnostic_qkv=" << (qkv_only_diagnostic ? 1 : 0)
                  << endl;
-            if (a0_trace && !raw_input) {
-                if (getenv("OURS_VIT_A0_NATIVE_OBSERVER_CHECK") != nullptr) {
+            if (b_trace && !raw_input) {
+                if (getenv("OURS_VIT_B_NATIVE_OBSERVER_CHECK") != nullptr) {
                     // Diagnostic only: expose one unmasked native Q ciphertext
                     // before Algorithm 1 so a bad QKV kernel cannot be
                     // confused with a CKKS->MPC conversion failure. The
-                    // normal A0 protocol never sends this extra copy.
-                    vector<Ciphertext> native_q = a0_q_cts;
+                    // normal B protocol never sends this extra copy.
+                    vector<Ciphertext> native_q = b_q_cts;
                     send_encrypted_vector(io, native_q);
                 }
                 prepare_host_conversion_from_actual_scale(
-                    *this, a0_q_cts, kFormalConversionScaleBits, he,
-                    "a0_q_observer");
+                    *this, b_q_cts, kFormalConversionScaleBits, he,
+                    "b_q_observer");
                 prepare_host_conversion_from_actual_scale(
-                    *this, a0_k_cts, kFormalConversionScaleBits, he,
-                    "a0_k_observer");
+                    *this, b_k_cts, kFormalConversionScaleBits, he,
+                    "b_k_observer");
                 prepare_host_conversion_from_actual_scale(
-                    *this, a0_v_cts, kFormalConversionScaleBits, he,
-                    "a0_v_observer");
-                mask_ckks_to_mpc_inplace(a0_q_cts, a0_q_pts, he);
-                mask_ckks_to_mpc_inplace(a0_k_cts, a0_k_pts, he);
-                mask_ckks_to_mpc_inplace(a0_v_cts, a0_v_pts, he);
-                send_encrypted_vector(io, a0_q_cts);
-                send_encrypted_vector(io, a0_k_cts);
-                send_encrypted_vector(io, a0_v_cts);
+                    *this, b_v_cts, kFormalConversionScaleBits, he,
+                    "b_v_observer");
+                mask_ckks_to_mpc_inplace(b_q_cts, b_q_pts, he);
+                mask_ckks_to_mpc_inplace(b_k_cts, b_k_pts, he);
+                mask_ckks_to_mpc_inplace(b_v_cts, b_v_pts, he);
+                send_encrypted_vector(io, b_q_cts);
+                send_encrypted_vector(io, b_k_cts);
+                send_encrypted_vector(io, b_v_cts);
             }
         } else {
             // The non-raw QKV output crosses the same CKKS->MPC Algorithm-1
@@ -1729,22 +1729,22 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 "layernorm2_attention_qkv");
             mask_ckks_to_mpc_inplace(output_cts_half, output_pts_half, he);
             send_encrypted_vector(io, output_cts_half);
-            if (a0_trace) {
+            if (b_trace) {
                 prepare_host_conversion_from_actual_scale(
-                    *this, a0_q_cts, kFormalConversionScaleBits, he,
-                    "a0_q_observer");
+                    *this, b_q_cts, kFormalConversionScaleBits, he,
+                    "b_q_observer");
                 prepare_host_conversion_from_actual_scale(
-                    *this, a0_k_cts, kFormalConversionScaleBits, he,
-                    "a0_k_observer");
+                    *this, b_k_cts, kFormalConversionScaleBits, he,
+                    "b_k_observer");
                 prepare_host_conversion_from_actual_scale(
-                    *this, a0_v_cts, kFormalConversionScaleBits, he,
-                    "a0_v_observer");
-                mask_ckks_to_mpc_inplace(a0_q_cts, a0_q_pts, he);
-                mask_ckks_to_mpc_inplace(a0_k_cts, a0_k_pts, he);
-                mask_ckks_to_mpc_inplace(a0_v_cts, a0_v_pts, he);
-                send_encrypted_vector(io, a0_q_cts);
-                send_encrypted_vector(io, a0_k_cts);
-                send_encrypted_vector(io, a0_v_cts);
+                    *this, b_v_cts, kFormalConversionScaleBits, he,
+                    "b_v_observer");
+                mask_ckks_to_mpc_inplace(b_q_cts, b_q_pts, he);
+                mask_ckks_to_mpc_inplace(b_k_cts, b_k_pts, he);
+                mask_ckks_to_mpc_inplace(b_v_cts, b_v_pts, he);
+                send_encrypted_vector(io, b_q_cts);
+                send_encrypted_vector(io, b_k_cts);
+                send_encrypted_vector(io, b_v_cts);
             }
         }
         this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
@@ -1817,7 +1817,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 if (qk_group.size() != group.qk_indices.size() ||
                     v_group.size() != group.v_indices.size()) {
                     throw runtime_error(
-                        "A3 grouped CKKS-to-MPC decode count mismatch");
+                        "SELECTIVE grouped CKKS-to-MPC decode count mismatch");
                 }
                 for (size_t local = 0; local < qk_group.size(); ++local) {
                     auto &target = output_vector[group.qk_indices[local]];
@@ -1840,7 +1840,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 }
             }
             profile_set_conversion_bucket(previous_conversion_bucket);
-            cout << "OURS_A3_GROUPED_CKKS_TO_MPC status=PASS layer="
+            cout << "OURS_SELECTIVE_GROUPED_CKKS_TO_MPC status=PASS layer="
                  << layer_id << " group_calls="
                  << selective_groups.size()
                  << " output_qk_slots=" << qk_ct_count * slot_count
@@ -1866,7 +1866,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                                     he->get_Q(output_pts_half[0]), bitwidth, s,
                                     he, true);
     }
-    if (a0_trace && !raw_input) {
+    if (b_trace && !raw_input) {
         auto observer_to_fix = [&](const vector<Plaintext> &points,
                                    int fixed_scale,
                                    const char *stage) -> FixArray {
@@ -1881,25 +1881,25 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             for (const auto &piece : pieces) {
                 if (piece.size() != static_cast<size_t>(slot_count) ||
                     offset + piece.size() > expected) {
-                    throw runtime_error(string("A0 observer decode mismatch: ") +
+                    throw runtime_error(string("B observer decode mismatch: ") +
                                         stage);
                 }
                 copy(piece.begin(), piece.end(), result.data + offset);
                 offset += piece.size();
             }
             if (offset != expected) {
-                throw runtime_error(string("A0 observer is incomplete: ") +
+                throw runtime_error(string("B observer is incomplete: ") +
                                     stage);
             }
             return result;
         };
-        a0_q_share = observer_to_fix(a0_q_pts, NL_SCALE, "q");
-        a0_k_share = observer_to_fix(a0_k_pts, NL_SCALE, "k");
-        a0_v_share = observer_to_fix(a0_v_pts, ATTENTION_V_SCALE, "v");
-        a0_qkv_ready = true;
-        cout << "OURS_A0_QKV_OBSERVER status=PASS q_elements="
-             << a0_q_share.size << " k_elements=" << a0_k_share.size
-             << " v_elements=" << a0_v_share.size
+        b_q_share = observer_to_fix(b_q_pts, NL_SCALE, "q");
+        b_k_share = observer_to_fix(b_k_pts, NL_SCALE, "k");
+        b_v_share = observer_to_fix(b_v_pts, ATTENTION_V_SCALE, "v");
+        b_qkv_ready = true;
+        cout << "OURS_B_QKV_OBSERVER status=PASS q_elements="
+             << b_q_share.size << " k_elements=" << b_k_share.size
+             << " v_elements=" << b_v_share.size
              << " production_path=0 intermediate_reconstruction=1" << endl;
     }
     this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
@@ -1920,11 +1920,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::attention_from_real_input(
     return layer_norm_part2_attention(raw, layer_id);
 }
 
-map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
+map<char*, FixArray> Bert_ckks::heterogeneous_attention_output(
     FixArray normalized_qk, int layer_id) {
-    if (heterogeneous_ablation != ours_vit::Ablation::A3 &&
-        heterogeneous_ablation != ours_vit::Ablation::A4) {
-        throw runtime_error("selective attention output requires A3 or A4");
+    if (heterogeneous_version == ours_vit::Version::B) {
+        throw runtime_error("selective attention output requires SELECTIVE or NATIVE");
     }
     if (!pre_norm_attention_output_only ||
         heterogeneous_protocols.size() != PACKING_NUM ||
@@ -1938,7 +1937,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         !attention_input_residual_ready ||
         attention_input_residual_share.size !=
             linear.data_lin1_0.image_size * COMMON_DIM) {
-        throw runtime_error("A3/A4 attention output state mismatch");
+        throw runtime_error("heterogeneous attention output state mismatch");
     }
 
     const FCMetadata av_data = linear.data_lin1_0;
@@ -1954,7 +1953,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
     if (qk_ct_count % (PACKING_NUM / 2) != 0 ||
         v_ct_count % (PACKING_NUM / 2) != 0 ||
         qk_cts_per_pair <= 0 || v_cts_per_pair <= 0)
-        throw runtime_error("A3/A4 packed conversion geometry is invalid");
+        throw runtime_error("heterogeneous packed conversion geometry is invalid");
 
     vector<bool> mpc_heads(PACKING_NUM, false);
     vector<bool> linear_heads(PACKING_NUM, false);
@@ -1992,9 +1991,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
     for (int pair = 0; pair < PACKING_NUM / 2; ++pair)
         linear_pair_count +=
             (linear_heads[2 * pair] || linear_heads[2 * pair + 1]) ? 1 : 0;
-    if (heterogeneous_ablation == ours_vit::Ablation::A3 &&
-        linear_head_count != 0)
-        throw runtime_error("A3 cannot execute a native Linear head");
+
     auto add_plain_share = [](HE_CKKS *he,
                               vector<UnifiedCiphertext> &ciphertexts,
                               const vector<UnifiedPlaintext> &shares) {
@@ -2037,7 +2034,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         linear.preprocess_softmax(normalized_qk.data, packed_qk.data(),
                                   av_data);
         // MPC-normalized groups stay on BLB's original he2 schedule.  The
-        // extended he1 chain is reserved exclusively for native A4 Linear
+        // extended he1 chain is reserved exclusively for native NATIVE Linear
         // heads, so Softmax/ReLU work never pays its extra modulus limbs.
         HE_CKKS *he = linear.he2;
         const int import_scale_bits = he->he_scale;
@@ -2104,10 +2101,10 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             const uint64_t conversion_round_start = current_round();
             import_target_scale(*this, qk_shares, slot, NL_ELL, NL_SCALE,
                                 import_scale_bits, he, qk_pts,
-                                "a3_grouped_qk");
+                                "selective_grouped_qk");
             import_target_scale(*this, v_shares, slot, NL_ELL,
                                 ATTENTION_V_SCALE, import_scale_bits, he, v_pts,
-                                "a3_grouped_v");
+                                "selective_grouped_v");
             vector<UnifiedCiphertext> group_qk(
                 qk_pts.size(), UnifiedCiphertext(LOCATION::HOST));
             vector<UnifiedCiphertext> group_v(
@@ -2135,7 +2132,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
                         mpc_v_ready[v_indices[local]],
                         std::move(group_v[local]));
             }
-            cout << "OURS_A3_SELECTIVE_MPC_TO_CKKS status=PASS layer="
+            cout << "OURS_SELECTIVE_SELECTIVE_MPC_TO_CKKS status=PASS layer="
                  << layer_id << " protocol="
                  << ours_vit::to_string(heterogeneous_protocols[begin])
                  << " physical_head_begin=" << begin
@@ -2161,7 +2158,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         }
     }
 
-    // Preserve BLB's add-before-final-rescale residual boundary.  A mixed A4
+    // Preserve BLB's add-before-final-rescale residual boundary.  A mixed NATIVE
     // layer anchors the residual to the he2 MPC-head contribution; an
     // all-Linear layer anchors it to the native he1 contribution.
     HE_CKKS *output_he = mpc_head_count > 0 ? linear.he2 : linear.he1;
@@ -2171,7 +2168,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
     {
         FixArray residual_packed = token_major_to_bsgs_output(
             attention_input_residual_share, linear.data_lin2,
-            "a3_a4_attention_residual_to_h3");
+            "hetero_attention_residual_to_h3");
         vector<vector<HE_CKKS::scalar_t>> residual_shares(output_ct_count);
         for (int i = 0; i < output_ct_count; ++i) {
             residual_shares[i].assign(
@@ -2187,7 +2184,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         import_target_scale(
             *this, residual_shares, slot, attention_input_residual_share.ell,
             attention_input_residual_share.s, output_he->he_scale, output_he,
-            residual_pts, "a3_a4_attention_residual");
+            residual_pts, "hetero_attention_residual");
         if (party == BOB) {
             for (int i = 0; i < output_ct_count; ++i)
                 output_he->encryptor->encrypt(residual_pts[i], residual_cts[i]);
@@ -2196,7 +2193,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             recv_encrypted_vector(output_he->context, io, residual_cts);
             add_plain_share(output_he, residual_cts, residual_pts);
         }
-        cout << "OURS_A3_A4_RESIDUAL_MPC_TO_CKKS status=PASS layer="
+        cout << "OURS_HETERO_RESIDUAL_MPC_TO_CKKS status=PASS layer="
              << layer_id << " context="
              << (output_he == linear.he1 ? "he1" : "he2")
              << " ciphertexts=" << output_ct_count
@@ -2222,7 +2219,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         for (int i = 0; i < v_ct_count; ++i)
             if (mpc_v_ready[i]) { reference_v = i; break; }
         if (reference_v < 0)
-            throw runtime_error("A3 grouped V import is empty");
+            throw runtime_error("SELECTIVE grouped V import is empty");
         for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
             if (!mpc_heads[2 * pair] && !mpc_heads[2 * pair + 1]) continue;
             for (int local = 0; local < v_cts_per_pair; ++local) {
@@ -2296,7 +2293,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             for (int pair = 0; pair < PACKING_NUM / 2; ++pair)
                 if (mpc_heads[2 * pair] || mpc_heads[2 * pair + 1])
                     return packed_qk[pair][0][0];
-            throw runtime_error("A3 packed QK reference is unavailable");
+            throw runtime_error("SELECTIVE packed QK reference is unavailable");
         }();
         const size_t target_limbs = level_reference.coeff_modulus_size();
         for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
@@ -2307,7 +2304,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
                 while (ciphertext.coeff_modulus_size() > target_limbs)
                     he->devaluator->mod_switch_to_next_inplace(ciphertext);
                 if (ciphertext.coeff_modulus_size() != target_limbs)
-                    throw runtime_error("A3 V crossed below packed QK level");
+                    throw runtime_error("SELECTIVE V crossed below packed QK level");
             }
         }
         vector<UnifiedCiphertext> av_result(
@@ -2330,7 +2327,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             high_resolution_clock::now();
         linear.linear_2(
             he, av_result,
-            heterogeneous_ablation == ours_vit::Ablation::A4
+            linear.native_linear_enabled
                 ? linear.pp_2_mpc[layer_id]
                 : linear.pp_2[layer_id],
             linear.data_lin2, non_linear_h3);
@@ -2344,7 +2341,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         const double he_path_seconds = chrono::duration<double>(
             high_resolution_clock::now() - he_path_start).count();
         he_compute_la += he_path_seconds;
-        cout << "OURS_A3_HE_PATH_PROFILE status=PASS layer=" << layer_id
+        cout << "OURS_SELECTIVE_HE_PATH_PROFILE status=PASS layer=" << layer_id
              << " latency_ms=" << he_path_seconds * 1000.0
              << " active_heads=" << mpc_head_count
              << " execution_domain=he2_grouped"
@@ -2362,10 +2359,10 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         const uint64_t he_path_ct_ct_start = linear.ct_ct_multiply_count;
         const uint64_t he_path_rotation_start = linear.rotation_count;
         const uint64_t he_path_rescale_start = linear.rescale_count;
-        if (!a4_linear_operands_ready ||
-            a4_linear_qk_he1_cts.size() != static_cast<size_t>(qk_ct_count) ||
-            a4_linear_v_he1_cts.size() != static_cast<size_t>(v_ct_count)) {
-            throw runtime_error("A4 native he1 operands are unavailable");
+        if (!native_linear_operands_ready ||
+            native_linear_qk_he1_cts.size() != static_cast<size_t>(qk_ct_count) ||
+            native_linear_v_he1_cts.size() != static_cast<size_t>(v_ct_count)) {
+            throw runtime_error("NATIVE native he1 operands are unavailable");
         }
         HE_CKKS *he = linear.he1;
         int reference_qk = -1;
@@ -2377,31 +2374,31 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             if (reference_v < 0) reference_v = pair * v_cts_per_pair;
         }
         if (reference_qk < 0 || reference_v < 0)
-            throw runtime_error("A4 active packed pair is empty");
+            throw runtime_error("NATIVE active packed pair is empty");
         for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
             if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
                 continue;
             for (int local = 0; local < v_cts_per_pair; ++local) {
                 const int index = pair * v_cts_per_pair + local;
-                if (a4_linear_v_he1_cts[index].hcipher().size() == 0)
-                    throw runtime_error("A4 active V pair was not retained");
+                if (native_linear_v_he1_cts[index].hcipher().size() == 0)
+                    throw runtime_error("NATIVE active V pair was not retained");
             }
         }
         if (profile_enabled_)
             profile_switch(BlbViTProfileStage::SOFTMAX_V);
         const auto softmax_v_profile_start = high_resolution_clock::now();
         // Lower native V from the QKV scale to native QK's exact scale using
-        // one public value-one multiply and the single added A4 level. This is
+        // one public value-one multiply and the single added NATIVE level. This is
         // real CKKS arithmetic; no metadata relabel or client bridge occurs.
         const double source_v_scale =
-            a4_linear_v_he1_cts[reference_v].scale();
+            native_linear_v_he1_cts[reference_v].scale();
         const double target_qk_scale =
-            a4_linear_qk_he1_cts[reference_qk].scale();
+            native_linear_qk_he1_cts[reference_qk].scale();
         auto context = he->context->get_context_data(
-            a4_linear_v_he1_cts[reference_v].hcipher().parms_id());
+            native_linear_v_he1_cts[reference_v].hcipher().parms_id());
         if (!context || !context->next_context_data() ||
             context->parms().coeff_modulus().empty())
-            throw runtime_error("A4 V scale alignment lacks one level");
+            throw runtime_error("NATIVE V scale alignment lacks one level");
         const double dropped_modulus =
             context->parms().coeff_modulus().back().value();
         const double unit_scale =
@@ -2411,7 +2408,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
                 continue;
             for (int local = 0; local < v_cts_per_pair; ++local) {
-                auto &ciphertext = a4_linear_v_he1_cts[
+                auto &ciphertext = native_linear_v_he1_cts[
                     pair * v_cts_per_pair + local];
                 Plaintext one;
                 he->encoder->encode(ones, ciphertext.hcipher().parms_id(),
@@ -2423,10 +2420,10 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             }
         }
         const size_t qk_raw_limbs =
-            a4_linear_qk_he1_cts[reference_qk].coeff_modulus_size();
+            native_linear_qk_he1_cts[reference_qk].coeff_modulus_size();
         if (qk_raw_limbs < 1)
-            throw runtime_error("A4 QK has no native CKKS data level");
-        // A3/A4 deliberately use the measured BLB diagonal-reuse kernel,
+            throw runtime_error("NATIVE QK has no native CKKS data level");
+        // heterogeneous deliberately use the measured BLB diagonal-reuse kernel,
         // which consumes no QK level.  V's one native alignment rescale lands
         // directly on the raw QK level.
         const size_t av_target_limbs = qk_raw_limbs;
@@ -2434,7 +2431,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
                 continue;
             for (int local = 0; local < v_cts_per_pair; ++local) {
-                auto &ciphertext = a4_linear_v_he1_cts[
+                auto &ciphertext = native_linear_v_he1_cts[
                     pair * v_cts_per_pair + local];
                 while (ciphertext.coeff_modulus_size() > av_target_limbs)
                     he->evaluator->mod_switch_to_next_inplace(ciphertext);
@@ -2443,7 +2440,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
                     target_qk_scale;
                 if (ciphertext.coeff_modulus_size() != av_target_limbs ||
                     !isfinite(error) || error > 1e-9)
-                    throw runtime_error("A4 V scale/level alignment failed");
+                    throw runtime_error("NATIVE V scale/level alignment failed");
             }
         }
         if (he->is_gpu_enable()) {
@@ -2451,10 +2448,10 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
                 if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
                     continue;
                 for (int local = 0; local < qk_cts_per_pair; ++local)
-                    a4_linear_qk_he1_cts[pair * qk_cts_per_pair + local]
+                    native_linear_qk_he1_cts[pair * qk_cts_per_pair + local]
                         .to_device(*he->context, *he->dcontext);
                 for (int local = 0; local < v_cts_per_pair; ++local)
-                    a4_linear_v_he1_cts[pair * v_cts_per_pair + local]
+                    native_linear_v_he1_cts[pair * v_cts_per_pair + local]
                         .to_device(*he->context, *he->dcontext);
             }
         }
@@ -2462,11 +2459,11 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         // after extraction so the final W_O level is not dropped twice.
         vector<vector<vector<UnifiedCiphertext>>> packed_qk;
         linear.preprocess_softmax_s1_ct_ct(
-            he, a4_linear_qk_he1_cts, av_data, packed_qk, &linear_heads);
+            he, native_linear_qk_he1_cts, av_data, packed_qk, &linear_heads);
         // Align against the actual packed operands, after the selector has
         // consumed its level. Modulus switching preserves values and scales.
         size_t common_limbs =
-            a4_linear_v_he1_cts[reference_v].coeff_modulus_size();
+            native_linear_v_he1_cts[reference_v].coeff_modulus_size();
         for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
             if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
                 continue;
@@ -2476,11 +2473,11 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
                                        ciphertext.coeff_modulus_size());
             for (int local = 0; local < v_cts_per_pair; ++local)
                 common_limbs = min(common_limbs,
-                    a4_linear_v_he1_cts[pair * v_cts_per_pair + local]
+                    native_linear_v_he1_cts[pair * v_cts_per_pair + local]
                         .coeff_modulus_size());
         }
         if (common_limbs < 2)
-            throw runtime_error("A4 packed AV lacks the final W_O level");
+            throw runtime_error("NATIVE packed AV lacks the final W_O level");
         auto align_av_level = [&](UnifiedCiphertext &ciphertext) {
             while (ciphertext.coeff_modulus_size() > common_limbs) {
                 if (ciphertext.location() == LOCATION::HOST)
@@ -2496,10 +2493,10 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
                 for (auto &ciphertext : diagonals)
                     align_av_level(ciphertext);
             for (int local = 0; local < v_cts_per_pair; ++local)
-                align_av_level(a4_linear_v_he1_cts[
+                align_av_level(native_linear_v_he1_cts[
                     pair * v_cts_per_pair + local]);
         }
-        cout << "OURS_A4_AV_LEVEL status=PASS layer=" << layer_id
+        cout << "OURS_NATIVE_AV_LEVEL status=PASS layer=" << layer_id
              << " coeff_modulus_size=" << common_limbs
              << " packing=complete_diagonal"
              << " heterogeneous_head_grouping="
@@ -2507,7 +2504,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
              << endl;
         vector<UnifiedCiphertext> av_result(
             v_ct_count, UnifiedCiphertext(he->backend()));
-        linear.softmax_v(he, packed_qk, a4_linear_v_he1_cts, av_data,
+        linear.softmax_v(he, packed_qk, native_linear_v_he1_cts, av_data,
                          av_result, 1.0, &linear_heads, false);
         if (heterogeneous_trace)
             snapshot_observer_ciphertexts(
@@ -2523,7 +2520,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             profile_switch(BlbViTProfileStage::OUTPUT_PROJECTION);
         const auto output_projection_profile_start =
             high_resolution_clock::now();
-        linear.linear_2(he, av_result, linear.pp_2_a4[layer_id],
+        linear.linear_2(he, av_result, linear.pp_2_native[layer_id],
                         linear.data_lin2, linear_h3);
         if (profile_enabled_)
             profile_record_he(
@@ -2532,12 +2529,12 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
                     high_resolution_clock::now() -
                     output_projection_profile_start)
                     .count());
-        cout << "OURS_A4_NATIVE_CKKS status=PASS layer=" << layer_id
+        cout << "OURS_NATIVE_NATIVE_CKKS status=PASS layer=" << layer_id
              << " linear_heads=" << linear_head_count
              << " active_pairs=" << linear_pair_count
              << " qk_scale_bits=" << log2(target_qk_scale)
              << " v_scale_bits="
-             << log2(a4_linear_v_he1_cts[reference_v].scale())
+             << log2(native_linear_v_he1_cts[reference_v].scale())
              << " alpha_fused_into=WO"
              << " v_alignment_rescales=1"
              << " client_decrypt_reencrypt=0 mpc_reference=0" << endl;
@@ -2549,7 +2546,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         const uint64_t he_path_he_muls =
             linear.ct_pt_multiply_count - he_path_ct_pt_start +
             linear.ct_ct_multiply_count - he_path_ct_ct_start;
-        cout << "OURS_A4_HE_PATH_PROFILE status=PASS layer=" << layer_id
+        cout << "OURS_NATIVE_HE_PATH_PROFILE status=PASS layer=" << layer_id
              << " latency_ms=" << he_path_seconds * 1000.0
              << " he_ms=" << he_path_seconds * 1000.0
              << " mpc_ms=0 conversion_ms="
@@ -2636,7 +2633,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             mpc_head_count > 0 ? &non_linear_h3 : &linear_h3;
         if (residual_anchor->size() != residual_cts.size() ||
             residual_anchor->empty())
-            throw runtime_error("A3/A4 residual merge size mismatch");
+            throw runtime_error("heterogeneous residual merge size mismatch");
         const auto residual_he_start = high_resolution_clock::now();
         if (output_he->is_gpu_enable()) {
             for (auto &ciphertext : residual_cts)
@@ -2645,7 +2642,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         }
         align_unified_to_cipher_metadata(
             linear, output_he, residual_cts, *residual_anchor,
-            "a3_a4_attention_residual");
+            "hetero_attention_residual");
         for (size_t i = 0; i < residual_anchor->size(); ++i) {
             if (output_he->is_gpu_enable()) {
                 output_he->devaluator->add_inplace((*residual_anchor)[i],
@@ -2661,14 +2658,14 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             ++linear.rescale_count;
         }
         size_t final_rescales = residual_anchor->size();
-        // Mixed A4 contributions live in distinct CKKS parameter contexts.
+        // Mixed NATIVE contributions live in distinct CKKS parameter contexts.
         // The he2 contribution receives the residual above.  Finish the he1
         // Linear contribution independently, then combine their two genuine
         // Algorithm-1 exports as additive MPC shares below.
-        if (heterogeneous_ablation == ours_vit::Ablation::A4 &&
+        if (linear.native_linear_enabled &&
             mpc_head_count > 0 && linear_head_count > 0) {
             if (linear_h3.size() != static_cast<size_t>(output_ct_count))
-                throw runtime_error("A4 Linear WO contribution is incomplete");
+                throw runtime_error("NATIVE Linear WO contribution is incomplete");
             for (auto &ciphertext : linear_h3) {
                 if (ciphertext.location() == LOCATION::DEVICE)
                     linear.he1->devaluator->rescale_to_next_inplace(ciphertext);
@@ -2681,7 +2678,7 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
         const double residual_he_seconds = chrono::duration<double>(
             high_resolution_clock::now() - residual_he_start).count();
         he_compute_la += residual_he_seconds;
-        cout << "OURS_A3_A4_CKKS_RESIDUAL_MERGE status=PASS layer="
+        cout << "OURS_HETERO_CKKS_RESIDUAL_MERGE status=PASS layer="
              << layer_id << " ciphertexts=" << residual_anchor->size()
              << " add_before_rescale=1 final_rescales="
              << final_rescales
@@ -2755,9 +2752,9 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
     };
 
     FixArray result(party, tokens * COMMON_DIM, true, NL_ELL, NL_SCALE);
-    if (heterogeneous_ablation == ours_vit::Ablation::A3) {
+    if (!linear.native_linear_enabled) {
         result = export_contribution(
-            linear.he2, non_linear_h3, true, "a3_mpc_heads_wo");
+            linear.he2, non_linear_h3, true, "mpc_heads_wo");
     } else {
         FixArray mpc_contribution(
             party, tokens * COMMON_DIM, true, NL_ELL, NL_SCALE);
@@ -2765,10 +2762,10 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
             party, tokens * COMMON_DIM, true, NL_ELL, NL_SCALE);
         if (mpc_head_count > 0)
             mpc_contribution = export_contribution(
-                linear.he2, non_linear_h3, true, "a4_mpc_heads_wo");
+                linear.he2, non_linear_h3, true, "mpc_heads_wo");
         if (linear_head_count > 0)
             linear_contribution = export_contribution(
-                linear.he1, linear_h3, true, "a4_linear_heads_wo");
+                linear.he1, linear_h3, true, "linear_heads_wo");
         if (mpc_head_count > 0 && linear_head_count > 0) {
             result = nonlinear.fpmath[0]->fix->add(
                 mpc_contribution, linear_contribution);
@@ -2796,16 +2793,16 @@ map<char*, FixArray> Bert_ckks::heterogeneous_attention_output_a3_a4(
     }
     attention_v_ready = false;
     attention_input_residual_ready = false;
-    a4_linear_operands_ready = false;
-    a4_linear_qk_he1_cts.clear();
-    a4_linear_v_he1_cts.clear();
-    cout << "OURS_A3_A4_ATTENTION_OUTPUT status=PASS layer=" << layer_id
-         << " ablation=" << ours_vit::to_string(heterogeneous_ablation)
+    native_linear_operands_ready = false;
+    native_linear_qk_he1_cts.clear();
+    native_linear_v_he1_cts.clear();
+    cout << "OURS_HETERO_ATTENTION_OUTPUT status=PASS layer=" << layer_id
+         << " version=" << ours_vit::to_string(heterogeneous_version)
          << " mpc_heads=" << mpc_head_count
          << " linear_heads=" << linear_head_count
          << " residual_merge=CKKS_before_rescale"
-         << " a4_cross_context_merge="
-         << (heterogeneous_ablation == ours_vit::Ablation::A4 &&
+         << " native_cross_context_merge="
+         << (linear.native_linear_enabled &&
                      mpc_head_count > 0 && linear_head_count > 0
                  ? "MPC_additive_after_two_real_conversions"
                  : "single_context_one_real_conversion")
@@ -2821,7 +2818,7 @@ FixArray Bert_ckks::linear2_from_mpc(const FixArray &input,
                                      int layer_id) {
     const bool final_he_logits_diagnostic =
         layer_id == ATTENTION_LAYERS &&
-        getenv("OURS_VIT_A0_FINAL_HE_LOGITS_PATH") != nullptr;
+        getenv("OURS_VIT_B_FINAL_HE_LOGITS_PATH") != nullptr;
     if (input.size <= 0 || input.size != data.image_size * data.filter_h ||
         input.size % data.slot_count != 0 ||
         (data.image_size * data.filter_w) % data.slot_count != 0 ||
@@ -2898,7 +2895,7 @@ FixArray Bert_ckks::linear2_from_mpc(const FixArray &input,
                 }
             }
             ofstream diagnostic_out(
-                getenv("OURS_VIT_A0_FINAL_HE_LOGITS_PATH"));
+                getenv("OURS_VIT_B_FINAL_HE_LOGITS_PATH"));
             if (!diagnostic_out) {
                 throw runtime_error(
                     "cannot write final HE logits diagnostic");
@@ -2911,7 +2908,7 @@ FixArray Bert_ckks::linear2_from_mpc(const FixArray &input,
                 diagnostic_out << token_major[feature] << '\n';
             }
             diagnostic_out << "end\n";
-            cout << "OURS_A0_FINAL_HE_LOGITS status=CAPTURED"
+            cout << "OURS_B_FINAL_HE_LOGITS status=CAPTURED"
                  << " final_output_only=1 intermediate_reconstruction=0"
                  << " elements=" << min(1000, data.filter_w) << endl;
         }
@@ -3245,10 +3242,155 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
     return output;
 }
 
+// The first ViT pre-norm has no preceding Transformer FFN to fuse with.
+// Instantiate the same BLB sum/center/square/sum graph on the embedding.
+std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
+    const FixArray &input, const FixArray &w, const FixArray &b) {
+    if (input.size != w.size || input.size != b.size || input.size % COMMON_DIM)
+        throw invalid_argument("LayerNorm shape mismatch");
+    HE_CKKS *he = linear.he2;
+    const FCMetadata &data = linear.data_lin2;
+    const int tokens = data.image_size, slots = he->num_slots;
+    const int count = input.size / slots;
+    auto packed = token_major_to_bsgs_output(input, data, "initial_ln_input");
+    vector<vector<uint64_t>> local(count, vector<uint64_t>(slots));
+    for (int i=0; i<count; ++i) copy_n(packed.data+i*slots, slots, local[i].data());
+    vector<UnifiedPlaintext> plain;
+    import_target_scale(*this, local, slots, input.ell, input.s, he->he_scale,
+                        he, plain, "initial_ln_input");
+    vector<UnifiedCiphertext> ct(count, UnifiedCiphertext(LOCATION::HOST));
+    vector<Ciphertext> centered_wire(count), variance_wire(1);
+    vector<Plaintext> centered_pts(count), variance_pts(1);
+    if (party == BOB) {
+        he->encrypt_send(plain, ct);
+        recv_encrypted_vector(he->context, io, centered_wire);
+        recv_encrypted_vector(he->context, io, variance_wire);
+        for (int i=0; i<count; ++i) he->decryptor->decrypt(centered_wire[i], centered_pts[i]);
+        he->decryptor->decrypt(variance_wire[0], variance_pts[0]);
+    } else {
+        recv_encrypted_vector(he->context, io, ct);
+        auto loc = he->backend();
+        if (loc == LOCATION::DEVICE) {
+            for (auto &v : ct) v.to_device(*he->context, *he->dcontext);
+            for (auto &v : plain) v.to_device(*he->context, *he->dcontext);
+        }
+        auto drop_prime = [&](const UnifiedCiphertext &v) -> double {
+            return loc == LOCATION::HOST
+                ? he->context->get_context_data(v.hcipher().parms_id())->parms().coeff_modulus().back().value()
+                : he->dcontext->get_context_data(v.dcipher().chain_index()).parms().coeff_modulus().back().value();
+        };
+        auto encode_scalar = [&](const UnifiedCiphertext &v, double value, double scale) {
+            UnifiedPlaintext p(loc);
+            if (loc == LOCATION::HOST) he->encoder->encode(value, v.hcipher().parms_id(), scale, p);
+            else he->dencoder->encode(*he->dcontext, vector<double>(slots, value), scale, p, v.dcipher().chain_index());
+            return p;
+        };
+        UnifiedCiphertext variance(loc);
+        auto evaluate = [&](auto *ev, auto &galois, auto &relin) {
+            for (int i=0; i<count; ++i) ev->add_plain_inplace(ct[i], plain[i]);
+            auto reduce_features = [&](vector<UnifiedCiphertext> values) {
+                for (auto &v : values) {
+                    for (int stride=tokens; stride<slots; stride*=2) {
+                        UnifiedCiphertext rotated(loc);
+                        ev->rotate_vector(v, stride, galois, rotated);
+                        ev->add_inplace(v, rotated);
+                    }
+                }
+                auto sum = values[0];
+                for (int i=1; i<count; ++i) ev->add_inplace(sum, values[i]);
+                return sum;
+            };
+            auto mean = reduce_features(ct);
+            auto inverse_width = encode_scalar(mean, 1.0/COMMON_DIM, drop_prime(mean));
+            ev->multiply_plain_inplace(mean, inverse_width);
+            ev->rescale_to_next_inplace(mean);
+            he_rescale_count++;
+            vector<UnifiedCiphertext> squares(count, UnifiedCiphertext(loc));
+            for (int i=0; i<count; ++i) {
+                ev->mod_switch_to_next_inplace(ct[i]);
+                mean.scale() = ct[i].scale();
+                ev->sub_inplace(ct[i], mean);
+                ev->square(ct[i], squares[i]);
+                ev->relinearize_inplace(squares[i], relin);
+                // Keep the square at scale 2^86 through the feature sum.
+                // Rescaling here by a 60-bit prime leaves only 26 scale bits
+                // and amplifies rounding/key-switch error in the 768-way sum.
+                // The variance is rescaled after averaging instead; the
+                // existing output preparation then reaches the same s49 C2M
+                // boundary with the unchanged modulus chain and protocol.
+            }
+            variance = reduce_features(squares);
+            auto inverse_width2 = encode_scalar(variance, 1.0/COMMON_DIM,
+                drop_prime(variance));
+            ev->multiply_plain_inplace(variance, inverse_width2);
+            ev->rescale_to_next_inplace(variance);
+            he_rescale_count++;
+        };
+        if (loc == LOCATION::HOST) evaluate(he->evaluator, *he->gal_keys, *he->relin_keys);
+        else evaluate(he->devaluator, *he->dgal_keys, *he->drelin_keys);
+        for (int i=0; i<count; ++i) {
+            if (loc == LOCATION::DEVICE) ct[i].to_host(*he->context, *he->dcontext);
+            centered_wire[i] = ct[i].hcipher();
+        }
+        if (loc == LOCATION::DEVICE) variance.to_host(*he->context, *he->dcontext);
+        variance_wire[0] = variance.hcipher();
+        prepare_host_conversion_from_actual_scale(*this, centered_wire, kFormalConversionScaleBits, he, "initial_ln_centered");
+        prepare_host_conversion_from_actual_scale(*this, variance_wire, kFormalConversionScaleBits, he, "initial_ln_variance");
+        mask_ckks_to_mpc_inplace(centered_wire, centered_pts, he);
+        send_encrypted_vector(io, centered_wire);
+        mask_ckks_to_mpc_inplace(variance_wire, variance_pts, he);
+        send_encrypted_vector(io, variance_wire);
+    }
+    auto centers = ckks_to_mpc(centered_pts, he->poly_modulus_degree, he->get_Q(centered_pts[0]), input.ell, input.s, he, false);
+    auto variances = ckks_to_mpc(variance_pts, he->poly_modulus_degree, he->get_Q(variance_pts[0]), input.ell, input.s, he, false);
+    for (int i=0; i<count; ++i) copy_n(centers[i].data(), slots, packed.data+i*slots);
+    FixArray sigma(party, tokens, true, input.ell, input.s);
+    copy_n(variances[0].data(), tokens, sigma.data);
+    map<char*,FixArray> parts;
+    parts["x_flat_avg"] = bsgs_output_to_token_major(packed, data, "initial_ln_centered");
+    parts["sigma_flat"] = sigma;
+    parts["w"] = w;
+    parts["b"] = b;
+    return layer_norm_nonlinear(parts);
+}
+
+// Export the pre-norm skip branch without interrupting the HE statistics
+// branch. The retained ciphertexts continue into BLB's sum/center/square.
+static FixArray export_prenorm_skip(Bert_ckks &bert,
+                                    const vector<UnifiedCiphertext> &source,
+                                    HE_CKKS *he, const FCMetadata &data) {
+    const size_t count = data.image_size * data.filter_w / he->num_slots;
+    vector<Ciphertext> wire(count);
+    vector<Plaintext> pts(count);
+    if (bert.party == sci::ALICE) {
+        if (source.size() != count) throw runtime_error("pre-norm skip shape mismatch");
+        for (size_t i=0; i<count; ++i) {
+            auto copy = source[i];
+            if (copy.location() == LOCATION::DEVICE) copy.to_host(*he->context, *he->dcontext);
+            wire[i] = copy.hcipher();
+        }
+        prepare_host_conversion_from_actual_scale(bert, wire,
+            kFormalConversionScaleBits, he, "prenorm_skip_branch");
+        bert.mask_ckks_to_mpc_inplace(wire, pts, he);
+        send_encrypted_vector(bert.io, wire);
+    } else {
+        recv_encrypted_vector(he->context, bert.io, wire);
+        for (size_t i=0; i<count; ++i) he->decryptor->decrypt(wire[i], pts[i]);
+    }
+    auto values = bert.ckks_to_mpc(pts, he->poly_modulus_degree,
+        he->get_Q(pts[0]), NL_ELL, NL_SCALE, he, false);
+    FixArray packed(bert.party, data.image_size * data.filter_w, true, NL_ELL, NL_SCALE);
+    for (size_t i=0; i<count; ++i)
+        copy_n(values[i].data(), he->num_slots, packed.data+i*he->num_slots);
+    return bsgs_output_to_token_major(packed, data, "prenorm_skip_branch");
+}
+
 /*
     scale已经搞定了，差一个matmul_cc到matmul_cp的packing
 */
 std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray input, int layer_id){
+    const bool pre_norm_attention_output_only = false; // Restore the donor HE statistics branch.
+    FixArray strict_skip;
     FCMetadata data = linear.data_lin1_0;
     int bitwidth,s;
     bitwidth = input.ell;
@@ -3261,7 +3403,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
             "formal Softmax*V requires a paper ell/s Softmax share");
     }
     int softmax_dim = data.image_size;
-    const bool use_bert_half_packing = !pre_norm_attention_output_only;
+    const bool use_bert_half_packing = bert_post_norm;
     int softmax_output_size = PACKING_NUM*softmax_dim*softmax_dim;
     uint64_t* softmax_output_pack = new uint64_t[softmax_output_size];
     linear.preprocess_softmax(
@@ -3356,10 +3498,10 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     vector<Plaintext> x_avg_pts(num_cts_ln);
-    vector<Plaintext> x_avg_pts_half(num_cts_ln % 2 == 0 ? num_cts_ln / 2 : 0);
+    vector<Plaintext> x_avg_pts_half;
     vector<Plaintext> sigma_pts(1);
     vector<Ciphertext> enc_x_avg(num_cts_ln);
-    vector<Ciphertext> enc_x_avg_half(num_cts_ln % 2 == 0 ? num_cts_ln / 2 : 0);
+    vector<Ciphertext> enc_x_avg_half;
     vector<Ciphertext> enc_sigma(1);
     
     vector<UnifiedCiphertext> enc_softmax(
@@ -3372,16 +3514,16 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
     vector<UnifiedCiphertext> enc_attention_residual(
         pre_norm_attention_output_only ? 0 : num_cts_ln,
         UnifiedCiphertext(LOCATION::HOST));
-    const bool a0_trace =
-        getenv("OURS_VIT_A0_TRACE") != nullptr &&
-        string(getenv("OURS_VIT_A0_TRACE")) == "1";
-    auto capture_a0_encrypted_stage = [&] (
+    const bool b_trace =
+        getenv("OURS_VIT_B_TRACE") != nullptr &&
+        string(getenv("OURS_VIT_B_TRACE")) == "1";
+    auto capture_b_encrypted_stage = [&] (
         vector<UnifiedCiphertext> *alice_ciphertexts,
         int expected_ciphertexts, const char *stage) -> FixArray {
-        if (!a0_trace)
-            throw runtime_error("A0 encrypted observer called while disabled");
+        if (!b_trace)
+            throw runtime_error("B encrypted observer called while disabled");
         if (expected_ciphertexts <= 0)
-            throw runtime_error(string("A0 observer ciphertext count is invalid: ") +
+            throw runtime_error(string("B observer ciphertext count is invalid: ") +
                                 stage);
         vector<Ciphertext> transport(expected_ciphertexts);
         vector<Plaintext> points(expected_ciphertexts);
@@ -3393,7 +3535,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
             if (alice_ciphertexts == nullptr ||
                 alice_ciphertexts->size() !=
                     static_cast<size_t>(expected_ciphertexts)) {
-                throw runtime_error(string("A0 observer source mismatch: ") +
+                throw runtime_error(string("B observer source mismatch: ") +
                                     stage);
             }
             for (int i = 0; i < expected_ciphertexts; ++i) {
@@ -3407,7 +3549,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                 } else if (source.location() == LOCATION::HOST) {
                     transport[i] = source.hcipher();
                 } else {
-                    throw runtime_error(string("A0 observer location is invalid: ") +
+                    throw runtime_error(string("B observer location is invalid: ") +
                                         stage);
                 }
             }
@@ -3425,15 +3567,15 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         for (const auto &piece : pieces) {
             if (piece.size() != static_cast<size_t>(slot) ||
                 offset + piece.size() > static_cast<size_t>(packed.size)) {
-                throw runtime_error(string("A0 observer decode mismatch: ") +
+                throw runtime_error(string("B observer decode mismatch: ") +
                                     stage);
             }
             copy(piece.begin(), piece.end(), packed.data + offset);
             offset += piece.size();
         }
         if (offset != static_cast<size_t>(packed.size))
-            throw runtime_error(string("A0 observer is incomplete: ") + stage);
-        cout << "OURS_A0_ENCRYPTED_OBSERVER status=PASS stage=" << stage
+            throw runtime_error(string("B observer is incomplete: ") + stage);
+        cout << "OURS_B_ENCRYPTED_OBSERVER status=PASS stage=" << stage
              << " ciphertexts=" << expected_ciphertexts
              << " elements=" << packed.size
              << " production_path=0 intermediate_reconstruction=1"
@@ -3473,17 +3615,18 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
              << " v_transport=" << (use_he_v ? "HE_at_Alice" : "MPC_to_CKKS")
              << " imag_repack=0" << endl;
         cout << "send_encrypted_vector done" << endl;
-        if (a0_trace) {
-            a0_av_share = capture_a0_encrypted_stage(
+        if (b_trace) {
+            b_av_share = capture_b_encrypted_stage(
                 nullptr, num_cts_ln, "block_0_av");
-            a0_wo_share = bsgs_output_to_token_major(
-                capture_a0_encrypted_stage(
+            b_wo_share = bsgs_output_to_token_major(
+                capture_b_encrypted_stage(
                     nullptr, num_cts_ln, "block_0_wo"),
-                linear.data_lin2, "a0_wo_observer_to_token");
-            a0_av_wo_ready = true;
+                linear.data_lin2, "b_wo_observer_to_token");
+            b_av_wo_ready = true;
         }
         if (profile_enabled_)
             profile_switch(BlbViTProfileStage::OUTPUT_PROJECTION);
+        if (!bert_post_norm) strict_skip = export_prenorm_skip(*this, {}, he, linear.data_lin2);
         if (use_bert_half_packing && !enc_x_avg_half.empty()) {
             recv_encrypted_vector(he->context, io, enc_x_avg_half);
         } else {
@@ -3918,8 +4061,8 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                 chrono::duration<double, milli>(high_resolution_clock::now() -
                                                 softmax_v_profile_start)
                     .count());
-        if (a0_trace)
-            a0_av_share = capture_a0_encrypted_stage(
+        if (b_trace)
+            b_av_share = capture_b_encrypted_stage(
                 &softmax_V_result, num_cts_ln, "block_0_av");
         // softmax_V_result's pack may be changed
         data = linear.data_lin2;
@@ -3943,12 +4086,12 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                 chrono::duration<double, milli>(
                     high_resolution_clock::now() - output_projection_profile_start)
                     .count());
-        if (a0_trace) {
-            a0_wo_share = bsgs_output_to_token_major(
-                capture_a0_encrypted_stage(
+        if (b_trace) {
+            b_wo_share = bsgs_output_to_token_major(
+                capture_b_encrypted_stage(
                     &h3, num_cts_ln, "block_0_wo"),
-                linear.data_lin2, "a0_wo_observer_to_token");
-            a0_av_wo_ready = true;
+                linear.data_lin2, "b_wo_observer_to_token");
+            b_av_wo_ready = true;
         }
         // encode weight once
         int L = data.image_size;
@@ -3962,15 +4105,26 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         for(int i=0;i<L;i++){
             mask[i] = 1;
         }
+        // Plan the public multipliers from the live chain. The residual
+        // add below consumes one rescale; centering consumes the next one.
+        double first_drop, centered_drop;
         if (!he->is_gpu_enable()) {
-            auto util_context_data = he->context->get_context_data(h3[0].hcipher().parms_id());
-            util_context_data = util_context_data->next_context_data();
-            he->encoder->encode(inv_D, util_context_data->parms_id(), pow(2,he->he_scale), inv_D_p);
-            he->encoder->encode(all_1, util_context_data->parms_id(), pow(2,he->he_scale), scale_up);
+            auto ctx = he->context->get_context_data(h3[0].hcipher().parms_id());
+            first_drop = ctx->parms().coeff_modulus().back().value();
+            ctx = ctx->next_context_data();
+            centered_drop = ctx->parms().coeff_modulus().back().value();
+            const double plain_scale = ldexp(1.0, kFormalConversionScaleBits) *
+                centered_drop / (h3[0].scale()/first_drop);
+            he->encoder->encode(inv_D, ctx->parms_id(), plain_scale, inv_D_p);
+            he->encoder->encode(all_1, ctx->parms_id(), plain_scale, scale_up);
         } else {
-            auto util_chain_index = h3[0].dcipher().chain_index() + 1;
-            he->dencoder->encode(*he->dcontext, inv_D, pow(2,he->he_scale), inv_D_p, util_chain_index);
-            he->dencoder->encode(*he->dcontext, all_1, pow(2,he->he_scale), scale_up, util_chain_index);
+            auto chain = h3[0].dcipher().chain_index();
+            first_drop = he->dcontext->get_context_data(chain).parms().coeff_modulus().back().value();
+            centered_drop = he->dcontext->get_context_data(chain+1).parms().coeff_modulus().back().value();
+            const double plain_scale = ldexp(1.0, kFormalConversionScaleBits) *
+                centered_drop / (h3[0].scale()/first_drop);
+            he->dencoder->encode(*he->dcontext, inv_D, plain_scale, inv_D_p, chain+1);
+            he->dencoder->encode(*he->dcontext, all_1, plain_scale, scale_up, chain+1);
         }
 
         // begin computation
@@ -4049,6 +4203,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         attention_v_he_ready = false;
         attention_v_he_cts.clear();
         cout << "OK1" << endl;
+        if (!bert_post_norm) strict_skip = export_prenorm_skip(*this, h3, he, linear.data_lin2);
         if (pre_norm_attention_output_only) {
             // ViT's residual already has the destination MPC scale. Add
             // those shares after conversion instead of importing them to HE.
@@ -4362,22 +4517,11 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         prepare_host_conversion_from_actual_scale(
             *this, enc_sigma, kFormalConversionScaleBits, he,
             "ln1_variance");
-        if (num_cts_ln % 2 != 0) {
-            throw runtime_error("formal LayerNorm output half-packing requires an even ciphertext count");
-        }
-        vector<Ciphertext> h3_half(num_cts_ln / 2);
-        for (size_t i = 0; i < h3_half.size(); ++i) {
-            h3_half[i] = std::move(h3_full[i]);
-        }
-        vector<Plaintext> x_avg_pts_half_send;
-        mask_ckks_to_mpc_inplace(h3_half, x_avg_pts_half_send, he);
-        send_encrypted_vector(io, h3_half);
-        x_avg_pts_half = std::move(x_avg_pts_half_send);
+        mask_ckks_to_mpc_inplace(h3_full, x_avg_pts, he);
+        send_encrypted_vector(io, h3_full);
         mask_ckks_to_mpc_inplace(enc_sigma, sigma_pts, he);
         send_encrypted_vector(io, enc_sigma);
-        cout << "FORMAL_TRANSFER_LAYOUT stage=softmax_v_ln_output status=PASS"
-             << " layout=xyj_half_slot h3_cts=" << h3_half.size()
-             << " sigma_cts=1 half_decode=1 source=Figure10_Block4" << endl;
+        cout << "STRICT_BLB_FUSION stage=Softmax_v_linear_layer_norm_part1 statistics=HE skip_branch=masked" << endl;
         this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
         }
     }
@@ -4459,6 +4603,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
     map<char*,FixArray> result;
     result["x_flat_avg"] = x_flat_avg;
     result["sigma_flat"] = sigma_flat;
+    result["residual"] = strict_skip;
     return result;
 }
 
@@ -4558,12 +4703,12 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
     int gelu_input_size = data.image_size*INTER_DIM;
     int gelu_cts_size = gelu_input_size / slot_count;
     vector<Ciphertext> output_cts(
-        gelu_cts_size
+        2 * gelu_cts_size
     );
     vector<Ciphertext> output_cts_half(
         gelu_cts_size % 2 == 0 ? gelu_cts_size / 2 : 0);
     vector<Plaintext> output_pts(
-        gelu_cts_size
+        2 * gelu_cts_size
     );
     vector<Plaintext> output_pts_half(
         gelu_cts_size % 2 == 0 ? gelu_cts_size / 2 : 0);
@@ -4674,7 +4819,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
             }
         } else {
             pre_gelu_cts.resize((gelu_cts_size + 1) / 2);
-            output_cts.resize((gelu_cts_size + 1) / 2);
+            output_cts.resize(gelu_cts_size);
             recv_encrypted_vector(he->context, io, pre_gelu_cts);
             pre_gelu_pts.resize(pre_gelu_cts.size());
             #pragma omp parallel for
@@ -4991,7 +5136,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
         if (gelu_output.size() != output_cts.size()) {
             throw runtime_error("formal GeLU full-slot ciphertext count mismatch");
         }
-        if (pre_gelu_cts.size() != output_cts.size()) {
+        if (2 * pre_gelu_cts.size() != output_cts.size()) {
             throw runtime_error(
                 "formal pre-GeLU full-slot ciphertext count mismatch");
         }
@@ -5099,7 +5244,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
         vec_pre_gelu = ckks_pairs_to_mpc(
             pre_gelu_pts, gelu_cts_size, bitwidth, s, he);
         vec_output = ckks_pairs_to_mpc(
-            output_pts, gelu_cts_size, bitwidth, s, he);
+            output_pts, 2 * gelu_cts_size, bitwidth, s, he);
     }
     
     this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
@@ -5111,7 +5256,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
     FixArray pre_gelu_packed(
         party, gelu_input_size, true, bitwidth, s);
     FixArray gelu_poly_packed(
-        party, gelu_input_size, true, bitwidth, s);
+        party, 2 * gelu_input_size, true, bitwidth, s);
     cout << "gelu_input_size:" << gelu_input_size << endl;
     cout << "vec_pre_gelu.size()*vec_pre_gelu[0].size():"
          << vec_pre_gelu.size()*vec_pre_gelu[0].size() << endl;
@@ -5131,7 +5276,10 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
     x_array = bsgs_output_to_token_major(
         pre_gelu_packed, linear.data_lin3, "ffn1_pre_gelu_to_mpc");
     gelu_poly_flat = bsgs_output_to_token_major(
-        gelu_poly_packed, linear.data_lin3, "ffn1_gelu_to_mpc");
+        gelu_poly_packed.subset(0, gelu_input_size), linear.data_lin3, "ffn1_gelu_to_mpc");
+    result["gelu_positive"] = bsgs_output_to_token_major(
+        gelu_poly_packed.subset(gelu_input_size, 2 * gelu_input_size),
+        linear.data_lin3, "ffn1_gelu_positive_to_mpc");
     cout << "FORMAL_LAYOUT_ADAPTER stage=ffn1_pre_gelu_to_mpc"
          << " status=PASS source=bsgs2_split_feature_halves"
          << " target=token_feature_row_major elements=" << x_array.size
@@ -5165,12 +5313,14 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
     input 维度是 (L,4096)，linear4后降维至 (L,1024)
 */
 std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, int layer_id){
+    const bool pre_norm_ffn_output_only = false; // Restore the donor HE statistics branch.
+    FixArray strict_skip;
     cout << "in linear4_add_layernorm_part1" << endl;
     FCMetadata data = linear.data_lin4;
     // The shared routine has a pre-norm ViT mode.  Figure 10's half-slot
     // boundary belongs only to post-norm BERT; preserve ViT's full-slot
     // transfer path here.
-    const bool use_bert_half_packing = !pre_norm_ffn_output_only;
+    const bool use_bert_half_packing = bert_post_norm;
     HE_CKKS* he = linear.he4;
     int bitwidth,s;
     bitwidth = input.ell;
@@ -5233,10 +5383,10 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
     this->conversion_round += this->get_round();
     
     vector<Plaintext> x_avg_pts(num_cts_ln);
-    vector<Plaintext> x_avg_pts_half(num_cts_ln % 2 == 0 ? num_cts_ln / 2 : 0);
+    vector<Plaintext> x_avg_pts_half;
     vector<Plaintext> sigma_pts(1);
     vector<Ciphertext> enc_x_avg(num_cts_ln);
-    vector<Ciphertext> enc_x_avg_half(num_cts_ln % 2 == 0 ? num_cts_ln / 2 : 0);
+    vector<Ciphertext> enc_x_avg_half;
     vector<Ciphertext> enc_sigma(1);
     vector<UnifiedCiphertext> enc_h6(num_cts_gelu,
                                      UnifiedCiphertext(LOCATION::HOST));
@@ -5272,6 +5422,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         }
         if (!enc_residual.empty()) send_encrypted_vector(io, enc_residual);
         cout << "send_encrypted_vector done" << endl;
+        if (!bert_post_norm) strict_skip = export_prenorm_skip(*this, {}, he, data);
         if (!pre_norm_ffn_output_only && !enc_x_avg_half.empty()) {
             recv_encrypted_vector(he->context, io, enc_x_avg_half);
         } else {
@@ -5466,6 +5617,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         }
         ffn_residual_ready = false;
         cout << "OK1" << endl;
+        if (!bert_post_norm) strict_skip = export_prenorm_skip(*this, h7, he, data);
         if (pre_norm_ffn_output_only) {
             // Export FFN2 first; its same-scale MPC residual is added below.
             vector<Ciphertext> h7_full(h7.size());
@@ -5801,22 +5953,11 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         prepare_host_conversion_from_actual_scale(
             *this, enc_sigma, kFormalConversionScaleBits, he,
             "ln2_variance");
-        if (num_cts_ln % 2 != 0) {
-            throw runtime_error("formal FFN2 LayerNorm output half-packing requires an even ciphertext count");
-        }
-        vector<Ciphertext> h7_half(num_cts_ln / 2);
-        for (size_t i = 0; i < h7_half.size(); ++i) {
-            h7_half[i] = std::move(h7_full[i]);
-        }
-        vector<Plaintext> x_avg_pts_half_send;
-        mask_ckks_to_mpc_inplace(h7_half, x_avg_pts_half_send, he);
+        mask_ckks_to_mpc_inplace(h7_full, x_avg_pts, he);
+        send_encrypted_vector(io, h7_full);
         mask_ckks_to_mpc_inplace(enc_sigma, sigma_pts, he);
-        send_encrypted_vector(io, h7_half);
-        x_avg_pts_half = std::move(x_avg_pts_half_send);
         send_encrypted_vector(io, enc_sigma);
-        cout << "FORMAL_TRANSFER_LAYOUT stage=ffn2_ln_output status=PASS"
-             << " layout=xyj_half_slot h7_cts=" << h7_half.size()
-             << " sigma_cts=1 half_decode=1 source=Figure10_Block1" << endl;
+        cout << "STRICT_BLB_FUSION stage=linear4_add_layernorm_part1 statistics=HE skip_branch=masked" << endl;
         this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
         }
     }
@@ -5903,5 +6044,6 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
     map<char*,FixArray> result;
     result["x_flat_avg"] = x_flat_avg;
     result["sigma_flat"] = sigma_flat;
+    result["residual"] = strict_skip;
     return result;
 }

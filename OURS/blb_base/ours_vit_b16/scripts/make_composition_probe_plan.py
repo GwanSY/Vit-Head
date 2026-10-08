@@ -2,7 +2,7 @@
 """Create one fixed contiguous-group plan for a composition probe.
 
 This helper only materializes a public, fixed ``OURS_VIT_HEAD_PLAN_V1`` file.
-The caller is expected to run the existing one-block A3/A4 attention
+The caller is expected to run the existing one-block heterogeneous attention
 benchmark and collect its complete assignment profile.  It never changes the
 secure protocol implementation and never selects heads online.
 """
@@ -84,9 +84,9 @@ def main() -> None:
     alphas = read_alphas(args.candidate_errors)
     write_plan(args.output, make_plan(args.composition, alphas))
     softmax, relu, linear = args.composition
-    ablation = "A4" if linear else "A3"
+    version = "H"
     print(f"OURS_COMPOSITION_PROBE_PLAN status=PASS composition={softmax}S{relu}R{linear}L "
-          f"ablation={ablation} output={args.output}")
+          f"version={version} output={args.output}")
 
 
 if __name__ == "__main__":

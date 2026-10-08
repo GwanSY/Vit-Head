@@ -8,7 +8,7 @@ needed to validate the allocator itself:
 
 * fixed public calibration and held-out manifests;
 * a small, explicitly split composition-cost regression experiment;
-* Accuracy-only, Cost-only, Balanced and Performance-first ablations;
+* Accuracy-only, Cost-only, Balanced and Performance-first versions;
 * matched random-head baselines; and
 * a 4--6-head exhaustive oracle that is local to one layer only.
 
@@ -47,7 +47,7 @@ POLICY_ORDER = (
     "All-Softmax", "Accuracy-only", "Cost-only", "Balanced",
     "Performance-first",
 )
-ABLATION_POLICY_ORDER = (
+VERSION_POLICY_ORDER = (
     "Accuracy-only", "Cost-only", "Balanced", "Performance-first",
 )
 PROTOCOLS = base.PROTOCOLS
@@ -227,11 +227,13 @@ OVERHEAD_FIELDS = (
     "rounds", "protocol_groups", "mpc_group_calls", "native_linear_groups",
     "ckks_to_mpc", "mpc_to_ckks", "he_instrumented_ms",
     "conversion_instrumented_ms", "he_ct_pt_multiply", "he_ct_ct_multiply",
-    "he_rotations", "he_rescales",
+    "he_rotations", "he_rescales", "conversion_ciphertexts",
+    "normalization_hybrid_ms", "cloud_latency_ms", "edge_latency_ms",
+    "run_head_reorder_ms",
 )
 OVERHEAD_INTEGER_FIELDS = {
     field_name for field_name in OVERHEAD_FIELDS
-    if field_name not in {"he_instrumented_ms", "conversion_instrumented_ms"}
+    if not field_name.endswith("_ms")
 }
 
 
@@ -256,8 +258,8 @@ def parse_overhead(row: dict[str, str]) -> dict[str, Any]:
     return result
 
 
-def require_unpacked_probe_provenance(rows: list[dict[str, str]], path: Path) -> None:
-    """Reject packed or legacy cost rows from this head-only experiment.
+def require_unpacked_probe_provenance(rows: list[dict[str, str]], path: Path, packing: str = "unpacked") -> None:
+    """Reject mismatched or legacy cost rows from this head-only experiment.
 
     The older complete-assignment benchmark predates the explicit grouping
     provenance columns.  It remains a real benchmark artifact, but it is not
@@ -272,13 +274,13 @@ def require_unpacked_probe_provenance(rows: list[dict[str, str]], path: Path) ->
             f"cost CSV lacks current no-group provenance {missing}: {path}")
     invalid = [
         row.get("plan_sha256", "") for row in rows
-        if row.get("attention_packing") != "unpacked" or
-        row.get("heterogeneous_head_grouping") != "0"
+        if row.get("attention_packing") != packing or
+        row.get("heterogeneous_head_grouping") != ("1" if packing == "packed" else "0")
     ]
     if invalid:
         raise ValueError(
             "cost CSV contains packed/grouped rows; strict head-only validation "
-            f"requires attention_packing=unpacked and heterogeneous_head_grouping=0: {path}")
+            f"requires attention_packing={packing}: {path}")
 
 
 def overhead_for_points(points: list[ProbeCostPoint]) -> dict[str, Any]:
@@ -310,7 +312,7 @@ def parse_composition(value: str) -> tuple[int, int, int]:
 
 
 def load_probe_points(source_costs: Path, supplemental_costs: Path,
-                      probe_manifest: Path, allow_missing: bool = False
+                      probe_manifest: Path, allow_missing: bool = False, packing: str = "unpacked"
                       ) -> tuple[list[ProbeCostPoint], list[ProbeCostPoint],
                                  list[ProbeCostPoint], set[tuple[int, int, int]],
                                  set[tuple[int, int, int]]]:
@@ -344,7 +346,7 @@ def load_probe_points(source_costs: Path, supplemental_costs: Path,
         source_costs, base.MODEL_LAYERS, base.MODEL_HEADS)
     with source_costs.open(newline="", encoding="utf-8") as handle:
         source_rows = list(csv.DictReader(handle))
-    require_unpacked_probe_provenance(source_rows, source_costs)
+    require_unpacked_probe_provenance(source_rows, source_costs, packing)
     source_overhead = {
         (int(row["layer"]), row["plan_sha256"]): parse_overhead(row)
         for row in source_rows
@@ -375,7 +377,7 @@ def load_probe_points(source_costs: Path, supplemental_costs: Path,
             supplemental_costs, base.MODEL_LAYERS, base.MODEL_HEADS)
         with supplemental_costs.open(newline="", encoding="utf-8") as handle:
             supplemental_rows = list(csv.DictReader(handle))
-        require_unpacked_probe_provenance(supplemental_rows, supplemental_costs)
+        require_unpacked_probe_provenance(supplemental_rows, supplemental_costs, packing)
         supplemental_overhead = {
             (int(row["layer"]), row["plan_sha256"]): parse_overhead(row)
             for row in supplemental_rows
@@ -1562,7 +1564,7 @@ def write_blocked_result_tables(output_dir: Path, status: str,
             "comparison_scope",
         ],
         "secure_candidates.csv": [
-            "candidate", "source_policy", "matched_random_reference", "ablation",
+            "candidate", "source_policy", "matched_random_reference", "version",
             "head_plan", "config_json", "plan_sha256", "S_heads", "R_heads",
             "L_heads", "clear_accuracy_percent", "accuracy_drop_pp",
             "calibration_accuracy_percent", "calibration_accuracy_drop_pp",
@@ -1624,6 +1626,7 @@ def main() -> None:
                         help="budget for legacy comparison tables; defaults to max(budgets-pp)")
     parser.add_argument("--budgets-pp", type=float, nargs="+",
                         default=[0.1, 0.5, 1.0])
+    parser.add_argument("--version", choices=("HA", "J"), default="HA")
     args = parser.parse_args()
 
     if args.workers <= 0 or args.batch_size <= 0 or args.max_frontier <= 0 or args.max_candidates <= 0:
@@ -1664,7 +1667,7 @@ def main() -> None:
     (existing_points, train_probe_points, heldout_points, missing_train,
      missing_heldout) = load_probe_points(
         args.allocator_costs, args.supplemental_costs, args.probe_manifest,
-        args.allow_missing_probes)
+        args.allow_missing_probes, "packed" if args.version == "J" else "unpacked")
     expected_heldout = {
         parse_composition(row["composition"])
         for row in read_csv(args.probe_manifest)
@@ -2059,7 +2062,7 @@ def main() -> None:
             heldout_by_name[reference_name])
 
         # Materialize only the five requested secure candidates.  Cost-only is
-        # intentionally an ablation row only; it receives no secure plan.
+        # intentionally an version row only; it receives no secure plan.
         final_selected = selected_by_budget[args.final_budget_pp]
         final_states: dict[str, base.ModelState] = {
             "All-Softmax": all_softmax,
@@ -2104,7 +2107,7 @@ def main() -> None:
             "search_cost_mode": (
                 "direct_measured_anchor_else_layer_aware_composition_model"),
             "relu_forced": False,
-            "head_grouping_enabled": False,
+            "head_grouping_enabled": args.version == "J",
             "cost_model_training": latency_cost_model.metadata(),
             "cost_model_gate": holdout_cost_meta,
             "composition_probe_manifest": str(args.probe_manifest.resolve()),
@@ -2128,7 +2131,7 @@ def main() -> None:
             "pareto_policies": str((output_dir / "pareto_policies.csv").resolve()),
         }
         # Export one minimum-cost eligible plan for every requested budget.
-        # The legacy comparison budget only selects the optional ablation
+        # The legacy comparison budget only selects the optional version
         # tables below; it must not discard the other deployment plans.
         budget_rows = []
         first_budget_by_hash = {}
@@ -2146,7 +2149,7 @@ def main() -> None:
                 args.model, args.model_manifest, calibration_manifest,
                 heldout_manifest, args.allocator_costs, plan_path,
                 search_cost_model.missing_compositions(),
-                {**search_meta, "selected_candidate": name})
+                {**search_meta, "runtime_version": args.version, "selected_candidate": name})
             plan_hash = document["search"]["selected_plan_sha256"]
             canonical_budget = first_budget_by_hash.setdefault(plan_hash, budget)
             budget_rows.append({
@@ -2175,7 +2178,7 @@ def main() -> None:
                 cost, alphas, args.model, args.model_manifest,
                 calibration_manifest, heldout_manifest, args.allocator_costs,
                 plan_path, search_cost_model.missing_compositions(),
-                {**search_meta, "selected_candidate": policy,
+                {**search_meta, "runtime_version": args.version, "selected_candidate": policy,
                  "matched_random_reference": random_reference if policy == "Random" else ""})
             document["selection_dataset"] = "fixed_calibration"
             document["final_accuracy_dataset"] = "fixed_heldout"
@@ -2200,7 +2203,7 @@ def main() -> None:
                 "candidate": policy,
                 "source_policy": (random_reference if policy == "Random" else policy),
                 "matched_random_reference": (random_reference if policy == "Random" else ""),
-                "ablation": document["runtime"]["ablation"],
+                "version": document["runtime"]["version"],
                 "head_plan": document["runtime"]["head_plan"],
                 "config_json": str((output_dir / f"{assignment_name(policy)}.json").resolve()),
                 "plan_sha256": document["search"]["selected_plan_sha256"],
@@ -2308,7 +2311,7 @@ def main() -> None:
             "calibration_samples": len(calibration_samples),
             "heldout_samples": len(heldout_samples),
             "fixed_split_disjoint": True,
-            "head_grouping_enabled": False,
+            "head_grouping_enabled": args.version == "J",
             "relu_forced": False,
             "allocator_cost_source": str(args.allocator_costs.resolve()),
             "supplemental_cost_source": str(args.supplemental_costs.resolve()),
@@ -2343,7 +2346,7 @@ def main() -> None:
             "random_study": random_stats_summary,
             "selected_by_budget": {
                 str(budget): selected_by_budget[budget] for budget in args.budgets_pp},
-            "ablations": {
+            "versions": {
                 "accuracy_only": "calibration risk only; no cost objective",
                 "cost_only": "cost-model predicted latency only; ignores accuracy budget",
                 "balanced": "equal normalized calibration risk and measured latency",

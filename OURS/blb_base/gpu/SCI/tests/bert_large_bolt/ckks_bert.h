@@ -54,11 +54,17 @@ public:
     ~Bert_ckks();
     Bert_ckks();
 
-    inline uint64_t get_comm(){
+    // Read-only send counter: diagnostics must not consume the bucket cursor.
+    inline uint64_t current_comm() const {
         uint64_t total_comm = io->counter;
         for(int i = 0; i < MAX_THREADS; i++){
             total_comm += nonlinear.iopackArr[i]->get_comm();
         }
+        return total_comm;
+    }
+
+    inline uint64_t get_comm(){
+        uint64_t total_comm = current_comm();
         uint64_t ret_comm = total_comm - n_comm;
         n_comm = total_comm;
         return ret_comm;

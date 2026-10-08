@@ -6,7 +6,6 @@ from __future__ import annotations
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
-_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "legacy"))
 
 
 import csv
@@ -22,7 +21,7 @@ import offline_cost_aware_head_allocator as allocator
 class OfflineAllocatorTest(unittest.TestCase):
     def write_costs(self, path: Path) -> None:
         fields = sorted(allocator.MeasuredCompositionCostModel.REQUIRED | {
-            "a4_data_level_extension"})
+            "native_data_level_extension"})
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
@@ -34,7 +33,7 @@ class OfflineAllocatorTest(unittest.TestCase):
                 for counts, values in protocols.items():
                     writer.writerow({
                         "layer": layer,
-                        "ablation": "A4" if counts != (12, 0, 0) else "A3",
+                        "version": "native" if counts != (12, 0, 0) else "selective",
                         "softmax_heads": counts[0],
                         "relu_heads": counts[1],
                         "linear_heads": counts[2],
@@ -55,7 +54,7 @@ class OfflineAllocatorTest(unittest.TestCase):
                         "surrogate": 0,
                         "dynamic_selection": 0,
                         "source_run": f"/measured/{layer}/{counts}",
-                        "a4_data_level_extension": 1 if counts != (12, 0, 0) else 0,
+                        "native_data_level_extension": 1 if counts != (12, 0, 0) else 0,
                     })
 
     def test_sparse_cost_model_does_not_invent_points(self) -> None:

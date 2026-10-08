@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
-_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "legacy"))
 
 
 import sys
@@ -23,13 +22,13 @@ class AssignmentCostCollectorTest(unittest.TestCase):
         run.mkdir()
         (run / "status.txt").write_text("alice_rc=0\nbob_rc=0\n")
         (run / "environment.txt").write_text(
-            "backend=gpu\nnetwork=1Gbps/0.3ms_RTT\nablation=A4\n"
+            "backend=gpu\nnetwork=1Gbps/0.3ms_RTT\nversion=HA\n"
             f"binary_sha256={'a' * 64}\n")
         (run / "gpu_selection.txt").write_text(
             "physical_gpus=2,3\nparty_topology=separate_physical_gpus\n"
             "attention_packing=unpacked\n"
             f"image_id=sha256:{'b' * 64}\nplan_sha256={'c' * 64}\n")
-        header = ("ablation,layer,physical_head,original_head,protocol,alpha,"
+        header = ("version,layer,physical_head,original_head,protocol,alpha,"
                   "contiguous_group,group_size,qk_ciphertexts,"
                   "physical_slot_utilization,logical_slot_utilization,"
                   "execution_status\n")
@@ -37,14 +36,14 @@ class AssignmentCostCollectorTest(unittest.TestCase):
         for head in range(12):
             protocol = "softmax_mpc" if head < 10 else "he_linear"
             plan_rows.append(
-                f"A4,0,{head},{head},{protocol},0.125,0,12,4,1,1,wired\n")
+                f"native,0,{head},{head},{protocol},0.125,0,12,4,1,1,wired\n")
         for party in (1, 2):
             (run / f"head_plan_party{party}.csv").write_text(
                 header + "".join(plan_rows))
         for party, latency, communication in (
                 ("alice.log", 100.0, 1000), ("bob.log", 101.0, 1200)):
             (run / party).write_text(
-                "OURS_A4_HE1_CHAIN status=PASS enabled=1 "
+                "OURS_NATIVE_HE1_CHAIN status=PASS enabled=1 "
                 "data_level_extension=1 modulus_entries=9 "
                 "baseline_entries=8\n"
                 "OURS_VIT_RUNTIME boundary=padding logical_rows=197 "
@@ -53,7 +52,7 @@ class AssignmentCostCollectorTest(unittest.TestCase):
                 + ("OURS_BLB_QK_PACKING status=PASS mode=baseline_fast "
                    "rotation_cap=122 mpc_surrogate=0 "
                    "client_decrypt_reencrypt=0 "
-                   "a0_numerical_validation=PENDING\n"
+                   "b_numerical_validation=PENDING\n"
                    "OURS_BLB_FAST_AV_LEVEL status=PASS layer=0 context=he2 "
                    "mod_switch_only=50 extra_rescales=0 extra_multiplies=0\n"
                    "OURS_BLB_FAST_AV_LEVEL status=PASS layer=0 context=he1 "
@@ -63,34 +62,35 @@ class AssignmentCostCollectorTest(unittest.TestCase):
                    "active_pairs=5 softmax_cts=48 extra_mask_multiplies=0 "
                    "extra_rescales=0 mpc_surrogate=0 "
                    "client_decrypt_reencrypt=0 "
-                   "a0_numerical_validation=PENDING\n"
+                   "b_numerical_validation=PENDING\n"
                    "OURS_BLB_AV_PACKING status=PASS mode=baseline_fast "
                    "active_pairs=1 softmax_cts=48 extra_mask_multiplies=0 "
                    "extra_rescales=0 mpc_surrogate=0 "
                    "client_decrypt_reencrypt=0 "
-                   "a0_numerical_validation=PENDING\n"
+                   "b_numerical_validation=PENDING\n"
                    if party == "alice.log" else "")
-                + ("OURS_A4_NATIVE_CKKS status=PASS layer=0 linear_heads=2 "
+                + ("OURS_NATIVE_NATIVE_CKKS status=PASS layer=0 linear_heads=2 "
                    "v_alignment_rescales=1 client_decrypt_reencrypt=0 "
                    "mpc_reference=0\n" if party == "alice.log" else "") +
                 "OURS_SELECTIVE_OUTPUT_CONVERSION status=PASS layer=0 "
-                "stage=a4_mpc_heads_wo ciphertexts=12 "
+                "stage=mpc_heads_wo ciphertexts=12 "
                 "algorithm=BLB_Algorithm_1 client_reencrypt=0\n"
                 "OURS_SELECTIVE_OUTPUT_CONVERSION status=PASS layer=0 "
-                "stage=a4_linear_heads_wo ciphertexts=12 "
+                "stage=linear_heads_wo ciphertexts=12 "
                 "algorithm=BLB_Algorithm_1 client_reencrypt=0\n"
                 + "".join(
-                    "OURS_A3_SELECTIVE_MPC_TO_CKKS status=PASS layer=0 "
+                    "OURS_SELECTIVE_SELECTIVE_MPC_TO_CKKS status=PASS layer=0 "
                     "protocol=softmax_mpc grouped_call=0\n"
                     for _ in range(10))
-                + "OURS_A3_A4_ATTENTION_OUTPUT status=PASS layer=0 "
-                "ablation=A4 mpc_heads=10 linear_heads=2 "
+                + "OURS_HETERO_ATTENTION_OUTPUT status=PASS layer=0 "
+                "version=HA mpc_heads=10 linear_heads=2 "
                 "dynamic_selection=0 "
                 f"surrogate={'1' if shortcut else '0'}\n"
-                "OURS_A3_A4_ASSIGNMENT_PROFILE status=PASS ablation=A4 "
+                "OURS_HETERO_ASSIGNMENT_PROFILE status=PASS version=HA "
                 f"layer=0 latency_ms={latency} "
                 f"communication_bytes={communication} rounds=20 "
                 "he_instrumented_ms=60 conversion_instrumented_ms=4 "
+                "conversion_ciphertexts=96 normalization_hybrid_ms=15 "
                 "softmax_heads=10 relu_heads=0 linear_heads=2 "
                 "protocol_groups=2 mpc_group_calls=1 native_linear_groups=1 "
                 "ckks_to_mpc=100 mpc_to_ckks=80 he_ct_pt_multiply=200 "
@@ -107,18 +107,35 @@ class AssignmentCostCollectorTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["latency_ms"], 101.0)
             self.assertEqual(rows[0]["communication_bytes"], 2200)
+            self.assertEqual(rows[0]["cloud_latency_ms"], 100.0)
+            self.assertEqual(rows[0]["edge_latency_ms"], 101.0)
+            self.assertEqual(rows[0]["conversion_ciphertexts"], 96)
+            self.assertEqual(rows[0]["normalization_hybrid_ms"], 15.0)
+            self.assertEqual(rows[0]["run_head_reorder_ms"], "")
+            self.assertEqual(set(rows[0]), set(collector.OUTPUT_COLUMNS))
             self.assertEqual(rows[0]["linear_heads"], 2)
             self.assertEqual(rows[0]["cost_unit"],
                              "direct_assignment_not_per_head")
             self.assertEqual(
                 rows[0]["protocols_original"].split(";").count("he_linear"),
                 2)
-            self.assertEqual(rows[0]["a4_data_level_extension"], 1)
+            self.assertEqual(rows[0]["native_data_level_extension"], 1)
             self.assertEqual(rows[0]["blb_fast_attention_packing"], 1)
+
+    def test_missing_instrumentation_is_not_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.make_run(Path(directory))
+            for name in ('alice.log', 'bob.log'):
+                path = run / name
+                path.write_text(path.read_text().replace(
+                    'conversion_ciphertexts=96 normalization_hybrid_ms=15 ', ''))
+            row = collector.measured_rows(run)[0]
+            self.assertEqual(row['conversion_ciphertexts'], '')
+            self.assertEqual(row['normalization_hybrid_ms'], '')
 
     def test_rejects_surrogate_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "forbidden A4 shortcut"):
+            with self.assertRaisesRegex(ValueError, "forbidden native shortcut"):
                 collector.measured_rows(
                     self.make_run(Path(directory), shortcut=True))
 

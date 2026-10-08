@@ -1,4 +1,5 @@
 #include "linear_ckks.h"
+#include "packed_block_rotation.h"
 
 #include <chrono>
 #include <cmath>
@@ -1101,28 +1102,28 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
     // the one-prime Algorithm-1 conversion boundary.  Its QK scale is solved
     // below from that final dropped prime, so a second padding level is not
     // necessary.
-    const size_t a4_chain_offset = a4_native_linear_enabled ? 1 : 0;
+    const size_t native_chain_offset = native_linear_enabled ? 1 : 0;
     const double ln_attention_output_scale = scale_after_rescale(
-        *he1, 6 + a4_chain_offset,
+        *he1, 6 + native_chain_offset,
         std::ldexp(1.0, 3 * he1->he_scale), "QKV input scale");
     auto qk_output_scale = [&](double qkv_input) {
         const double qkv_output = scale_after_rescale(
-            *he1, 5 + a4_chain_offset,
+            *he1, 5 + native_chain_offset,
             qkv_input * std::ldexp(1.0, he1->he_scale),
             "QKV output scale");
         const double q_after_mask = scale_after_rescale(
-            *he1, 4 + a4_chain_offset, qkv_output * 8.0 *
+            *he1, 4 + native_chain_offset, qkv_output * 8.0 *
                          std::ldexp(1.0, he1->he_scale),
             "Q mask-1 scale");
         const double k_after_mask = scale_after_rescale(
-            *he1, 4 + a4_chain_offset,
+            *he1, 4 + native_chain_offset,
             qkv_output * std::ldexp(1.0, he1->he_scale),
             "K mask-1 scale");
         const double qk_product = scale_after_rescale(
-            *he1, 3 + a4_chain_offset, q_after_mask * k_after_mask,
+            *he1, 3 + native_chain_offset, q_after_mask * k_after_mask,
             "QK product scale");
         return scale_after_rescale(
-            *he1, 2 + a4_chain_offset,
+            *he1, 2 + native_chain_offset,
             qk_product * std::ldexp(1.0, he1->he_scale),
             "QK mask-2 scale");
     };
@@ -1130,19 +1131,19 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
     // value in the BERT QK depth schedule leaves the final QK ciphertext at
     // only roughly 2^7; multiplying by an encoded public one later cannot
     // recover the precision already lost.  Solve the public scale schedule
-    // backwards from either A3's 2^49 conversion target or A4's final-W_O
+    // backwards from either SELECTIVE's 2^49 conversion target or NATIVE's final-W_O
     // target, and lift the affine output before QKV. QK is quadratic in the
     // QKV input scale, hence the square-root correction.
     double qkv_input_scale = ln_attention_output_scale;
     const double qk_scale_before_lift = qk_output_scale(qkv_input_scale);
     double native_qk_target_scale = std::ldexp(1.0, 49);
-    if (a4_native_linear_enabled) {
+    if (native_linear_enabled) {
         const auto wo_input_context = context_at_chain(
-            *he1, 1, "A4 native W_O input");
+            *he1, 1, "NATIVE native W_O input");
         const auto &wo_input_moduli =
             wo_input_context->parms().coeff_modulus();
         if (wo_input_moduli.size() < 2)
-            throw runtime_error("A4 native W_O lacks its final rescale level");
+            throw runtime_error("NATIVE native W_O lacks its final rescale level");
         const double wo_dropped_modulus =
             static_cast<double>(wo_input_moduli.back().value());
         const double wo_weight_scale = std::ldexp(1.0, he1->he_scale);
@@ -1184,6 +1185,23 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
         *he3, 6, std::ldexp(1.0, 3 * he3->he_scale), "FFN1 input scale");
     const double ffn2_input_scale = std::ldexp(1.0, 38);
 
+    // BERT layer 0 has no preceding LN affine. Match the existing raw-input
+    // four-rescale scale planner, rather than caching ViT's LN output level.
+    size_t qkv_input_chain = 5 + native_chain_offset;
+    if (bert_post_norm && layer_id == 0) {
+        auto level = he1->context->first_context_data();
+        qkv_input_chain = level->chain_index();
+        int drops[4];
+        for (int i=0; i<4; ++i) {
+            if (!level || level->parms().coeff_modulus().size()<2)
+                throw runtime_error("BERT raw QKV requires four rescale levels");
+            drops[i] = level->parms().coeff_modulus().back().bit_count();
+            level = level->next_context_data();
+        }
+        const int bits = (49 - 5*he1->he_scale + 2*drops[0] +
+                          2*drops[1] + drops[2] + drops[3] + 1) / 2;
+        qkv_input_scale = std::ldexp(1.0, bits);
+    }
     cout << "Preprocessing layer " << layer_id << endl;
     FCMetadata data = layer_id == 0 ? data_lin1_0 : data_lin1_1;
     pp_1[layer_id] = params_preprocessing_ct_ct(
@@ -1195,13 +1213,13 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
         bm.b_k[layer_id],
         bm.b_v[layer_id],
         data,
-        5 + a4_chain_offset,
+        qkv_input_chain,
         qkv_input_scale
     );
     if (he1->is_gpu_enable()) {
         // ViT's pre-norm affine re-enters every QKV stage at the same
         // published level/scale; use that exact metadata offline.
-        const std::size_t qkv_chain = 5 + a4_chain_offset;
+        const std::size_t qkv_chain = qkv_input_chain;
         const double qkv_scale = qkv_input_scale;
         auto metadata = make_offline_metadata_ciphertext(
             *he1, qkv_chain, qkv_scale, "QKV");
@@ -1214,7 +1232,7 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
     cout << "pp_1 done" << endl;
     const auto output_projection_weights =
         attention_output_projection_weights_for_bsgs(bm.w_o[layer_id]);
-    if (!a4_native_linear_enabled) {
+    if (!native_linear_enabled) {
       pp_2[layer_id] = params_preprocessing_ct_pt(
           he2,
           sequence_length,
@@ -1229,7 +1247,7 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
           output_projection_input_scale
       );
     }
-    if (!a4_native_linear_enabled && he2->is_gpu_enable()) {
+    if (!native_linear_enabled && he2->is_gpu_enable()) {
         auto metadata = make_offline_metadata_ciphertext(
             *he2, 3, output_projection_input_scale, "OutputProjection");
         materialize_linear_plaintexts(he2[0], {metadata}, pp_2[layer_id]);
@@ -1239,16 +1257,16 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
              << defaultfloat << endl;
     }
     cout << "pp_2 done mode="
-         << (a4_native_linear_enabled ? "assignment_partitioned"
+         << (native_linear_enabled ? "assignment_partitioned"
                                       : "original_full") << endl;
-    if (a4_native_linear_enabled) {
+    if (native_linear_enabled) {
         if (heterogeneous_protocols[layer_id].size() != PACKING_NUM ||
             heterogeneous_alphas[layer_id].size() != PACKING_NUM) {
             throw runtime_error(
-                "A4 weights require a public layer assignment before preprocessing");
+                "NATIVE weights require a public layer assignment before preprocessing");
         }
         vector<vector<uint64_t>> mpc_weights = bm.w_o[layer_id];
-        vector<vector<uint64_t>> a4_weights = bm.w_o[layer_id];
+        vector<vector<uint64_t>> native_weights = bm.w_o[layer_id];
         vector<uint64_t> zero_bias(COMMON_DIM, 0);
         bool has_mpc = false;
         bool has_linear = false;
@@ -1256,10 +1274,10 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
         // checkpoint integer directly would quantize most W_O entries to zero.
         // Retain twenty extra public fractional bits in the offline fused
         // weight and tell the existing semantic packer its true denominator.
-        constexpr int kA4AlphaFractionalBits = 20;
-        constexpr long double kA4AlphaScale =
+        constexpr int kNATIVEAlphaFractionalBits = 20;
+        constexpr long double kNATIVEAlphaScale =
             static_cast<long double>(uint64_t{1} <<
-                                     kA4AlphaFractionalBits);
+                                     kNATIVEAlphaFractionalBits);
         for (int head = 0; head < PACKING_NUM; ++head) {
             const bool linear_head = heterogeneous_protocols[layer_id][head] == 2;
             has_linear = has_linear || linear_head;
@@ -1269,7 +1287,7 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
                 if (linear_head) {
                     fill(mpc_weights[row].begin(), mpc_weights[row].end(), 0);
                     const long double alpha = heterogeneous_alphas[layer_id][head];
-                    for (uint64_t &raw : a4_weights[row]) {
+                    for (uint64_t &raw : native_weights[row]) {
                         constexpr uint64_t kCheckpointRing = uint64_t{1} << 37;
                         constexpr uint64_t kCheckpointMask = kCheckpointRing - 1;
                         constexpr uint64_t kCheckpointSign = uint64_t{1} << 36;
@@ -1281,19 +1299,19 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
                                 : static_cast<int64_t>(centered_word);
                         const long double scaled =
                             static_cast<long double>(centered) * alpha *
-                            kA4AlphaScale;
+                            kNATIVEAlphaScale;
                         const long double ring_min =
                             -static_cast<long double>(uint64_t{1} << 36);
                         const long double ring_max =
                             static_cast<long double>((uint64_t{1} << 36) - 1);
                         if (scaled < ring_min || scaled > ring_max) {
-                            throw runtime_error("A4 alpha-fused W_O overflow");
+                            throw runtime_error("NATIVE alpha-fused W_O overflow");
                         }
                         raw = static_cast<uint64_t>(llround(scaled)) &
                               kCheckpointMask;
                     }
                 } else {
-                    fill(a4_weights[row].begin(), a4_weights[row].end(), 0);
+                    fill(native_weights[row].begin(), native_weights[row].end(), 0);
                 }
             }
         }
@@ -1303,7 +1321,7 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
         // Native Linear heads use the one extra he1 level for QK->AV->WO,
         // but making Softmax/ReLU heads pay for that extended chain is slower
         // than one additional real output conversion in a mixed layer.
-        const double a4_av_input_scale =
+        const double native_av_input_scale =
             planned_qk_output_scale * planned_qk_output_scale;
         if (has_mpc) {
             pp_2_mpc[layer_id] = params_preprocessing_ct_pt(
@@ -1312,31 +1330,31 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
                 6, 12, 3, output_projection_input_scale);
         }
         if (has_linear) {
-            const auto a4_projection_weights =
-                attention_output_projection_weights_for_bsgs(a4_weights);
+            const auto native_projection_weights =
+                attention_output_projection_weights_for_bsgs(native_weights);
             // Native QK exits at chain 2 and the diagonal selector consumes
             // one level. V is value-preservingly aligned to the same planned
             // scale; native AV therefore enters W_O at chain 1 and QK^2.
-            pp_2_a4[layer_id] = params_preprocessing_ct_pt(
+            pp_2_native[layer_id] = params_preprocessing_ct_pt(
                 he1, sequence_length, COMMON_DIM, COMMON_DIM,
-                a4_projection_weights, has_mpc ? zero_bias : bm.b_o[layer_id],
-                data_lin2, 6 + kA4AlphaFractionalBits, 12, 1,
-                a4_av_input_scale);
+                native_projection_weights, has_mpc ? zero_bias : bm.b_o[layer_id],
+                data_lin2, 6 + kNATIVEAlphaFractionalBits, 12, 1,
+                native_av_input_scale);
             if (he1->is_gpu_enable()) {
                 auto metadata = make_offline_metadata_ciphertext(
-                    *he1, 1, a4_av_input_scale, "A4OutputProjection");
+                    *he1, 1, native_av_input_scale, "NATIVEOutputProjection");
                 materialize_linear_plaintexts(
-                    he1[0], {metadata}, pp_2_a4[layer_id]);
+                    he1[0], {metadata}, pp_2_native[layer_id]);
             }
         }
         if (has_mpc && he2->is_gpu_enable()) {
             auto metadata = make_offline_metadata_ciphertext(
                 *he2, 3, output_projection_input_scale,
-                "A3GroupedOutputProjection");
+                "SELECTIVEGroupedOutputProjection");
             materialize_linear_plaintexts(
                 he2[0], {metadata}, pp_2_mpc[layer_id]);
         }
-        cout << "OURS_A4_WO_PREPROCESS status=PASS layer=" << layer_id
+        cout << "OURS_NATIVE_WO_PREPROCESS status=PASS layer=" << layer_id
              << " mpc_heads="
              << count_if(heterogeneous_protocols[layer_id].begin(),
                          heterogeneous_protocols[layer_id].end(),
@@ -1347,12 +1365,12 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
              << " alpha_fusion=WO_rows linear_bias="
              << (has_mpc ? "zero" : "original")
              << " mpc_bias=" << (has_mpc ? "original" : "none")
-             << " alpha_fractional_bits=" << kA4AlphaFractionalBits
+             << " alpha_fractional_bits=" << kNATIVEAlphaFractionalBits
              << " mpc_context=he2 linear_context=he1"
-             << " a4_cache_materialized=" << (has_linear ? 1 : 0);
+             << " native_cache_materialized=" << (has_linear ? 1 : 0);
         if (has_linear)
-            cout << " a4_input_chain=1 a4_input_scale_bits="
-                 << log2(a4_av_input_scale);
+            cout << " native_input_chain=1 native_input_scale_bits="
+                 << log2(native_av_input_scale);
         cout << endl;
     }
     pp_3[layer_id] = params_preprocessing_ct_pt(
@@ -1431,7 +1449,7 @@ void Linear_ckks::release_preprocessed_layer(int layer_id) {
     pp_1[layer_id] = PreprocessParams_1{};
     pp_2[layer_id] = PreprocessParams_2{};
     pp_2_mpc[layer_id] = PreprocessParams_2{};
-    pp_2_a4[layer_id] = PreprocessParams_2{};
+    pp_2_native[layer_id] = PreprocessParams_2{};
     pp_3[layer_id] = PreprocessParams_2{};
     pp_4[layer_id] = PreprocessParams_2{};
     cout << "BLB_OFFLINE_CACHE_RELEASE layer=" << layer_id
@@ -1444,7 +1462,7 @@ void Linear_ckks::linear_1(
 		PreprocessParams_1 &pp,
 		const FCMetadata &data,
         vector<UnifiedCiphertext> &output,
-        vector<UnifiedCiphertext> *a0_qkv_observer) {
+        vector<UnifiedCiphertext> *b_qkv_observer) {
 
     cout << "input_cts.size: " << input_cts.size() << endl;
     const auto loc = input_cts[0].location();
@@ -1494,11 +1512,11 @@ void Linear_ckks::linear_1(
 	cout << "VIT_ATTENTION_PUBLIC_SCALE status=PASS target=Q divisor=8"
 		 << " mechanism=CKKS_scale_metadata q_cts=" << q_ciphertexts
 		 << " extra_multiply=0 extra_rescale=0" << endl;
-	// A0 correctness tracing needs the actual Q/K/V values before the fused
+	// B correctness tracing needs the actual Q/K/V values before the fused
 	// QK^T kernel consumes them.  Copying ciphertexts is deliberately gated by
 	// the caller and is never part of the benchmark graph.
-	if (a0_qkv_observer != nullptr) {
-		*a0_qkv_observer = Cipher_plain_results;
+	if (b_qkv_observer != nullptr) {
+		*b_qkv_observer = Cipher_plain_results;
 	}
 	output.resize(
         data.image_size * data.image_size * PACKING_NUM / data.slot_count 
@@ -2547,6 +2565,13 @@ void Linear_ckks::bert_cipher_plain_bsgs(
 #ifdef BLB_HAS_HE_GPU
     if (loc == LOCATION::DEVICE && pp.device_semantic_packed) {
         plaintext_device_encode_time += qkv_encode_seconds;
+        cout << "CKKS_DEVICE_PLAINTEXTS op=QKV weight_encodes="
+             << static_cast<uint64_t>(PACKING_NUM / 2) * cts.size() *
+                    n2 * temp_result_size * n1 * 6
+             << " bias_encodes=" << static_cast<uint64_t>(PACKING_NUM / 2) *
+                    temp_result_size * 3
+             << " cache_policy=once_per_operator_use_bounded_lifetime"
+             << " weight_source=real_checkpoint" << endl;
         cout << "CKKS_DEVICE_STREAMS op=QKV streams="
              << direct_device_plaintext_streams()
              << " critical_encode_ms=" << qkv_encode_seconds * 1000.0
@@ -2571,7 +2596,7 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
     const FCMetadata &data, 
     vector<UnifiedCiphertext> &result){
     const bool diagnostic_skip_flood =
-        std::getenv("OURS_VIT_A0_SKIP_BSGS2_FLOOD") != nullptr;
+        std::getenv("OURS_VIT_B_SKIP_BSGS2_FLOOD") != nullptr;
     int n1;
     int n2;
     if (data.filter_h == 3072 && data.filter_w == 768) {
@@ -2958,6 +2983,12 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
 #ifdef BLB_HAS_HE_GPU
     if (loc == LOCATION::DEVICE && use_device_semantics) {
         plaintext_device_encode_time += linear_encode_seconds;
+        cout << "CKKS_DEVICE_PLAINTEXTS op=BSGS2 weight_encodes="
+             << static_cast<uint64_t>(cts.size()) * n2 *
+                    (data.image_size * data.filter_w / data.slot_count) * n1 * 2
+             << " bias_encodes=" << data.image_size * data.filter_w / data.slot_count
+             << " cache_policy=once_per_operator_use_bounded_lifetime"
+             << " weight_source=real_checkpoint" << endl;
     }
     if (loc == LOCATION::DEVICE && device_pp != nullptr) {
         device_pp = nullptr;
@@ -3016,6 +3047,9 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
         throw std::invalid_argument(
             "unsupported BLB physical token count for packed QK");
     }
+    const int feature_blocks = data.slot_count / 2 / data.image_size;
+    if (feature_blocks <= 0 || (feature_blocks & (feature_blocks - 1)) != 0)
+        throw runtime_error("packed QK requires power-of-two feature blocks");
     const auto loc = Cipher_plain_result[0].location();
     uint32_t num_rot=0;
     int packing_gap = data.image_size * data.filter_w / data.slot_count * 3;
@@ -3148,25 +3182,16 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
         #pragma omp parallel for num_threads(16)
         for (int i = 0; i < data.image_size * 2; i++) {
             {
-                const int local_rotation = std::ceil(std::log2(
-                    data.slot_count / data.image_size / 2));
-                for (int k = 0; k < local_rotation; ++k) {
+                const int blocks = data.slot_count / data.image_size / 2;
+                const int target_block = (i % data.image_size) % blocks;
+                for (int stride = 1; stride < blocks; stride <<= 1) {
                     Ciphertext rotated;
                     he->evaluator->rotate_vector(
                         rotation_results[i],
-                        static_cast<int32_t>(std::pow(2, k)) * data.image_size,
+                        ours_vit::packed_block_rotation(
+                            target_block, stride, data.image_size, false),
                         *(he->gal_keys), rotated);
                     he->evaluator->add_inplace(rotation_results[i], rotated);
-                }
-                const int target_block =
-                    (i % data.image_size) %
-                    (data.slot_count / 2 / data.image_size);
-                if (target_block != 0) {
-                    Ciphertext aligned;
-                    he->evaluator->rotate_vector(
-                        rotation_results[i], -target_block * data.image_size,
-                        *(he->gal_keys), aligned);
-                    rotation_results[i] = std::move(aligned);
                 }
                 he->evaluator->multiply_plain_inplace(
                     rotation_results[i], cross_masks[i]);
@@ -3246,25 +3271,16 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
 
         for (int i = 0; i < data.image_size * 2; i++) {
             {
-                const int local_rotation = std::ceil(std::log2(
-                    data.slot_count / data.image_size / 2));
-                for (int k = 0; k < local_rotation; ++k) {
+                const int blocks = data.slot_count / data.image_size / 2;
+                const int target_block = (i % data.image_size) % blocks;
+                for (int stride = 1; stride < blocks; stride <<= 1) {
                     UnifiedCiphertext rotated(loc);
                     he->devaluator->rotate_vector(
                         rotation_results[i],
-                        static_cast<int32_t>(std::pow(2, k)) * data.image_size,
+                        ours_vit::packed_block_rotation(
+                            target_block, stride, data.image_size, false),
                         *(he->dgal_keys), rotated);
                     he->devaluator->add_inplace(rotation_results[i], rotated);
-                }
-                const int target_block =
-                    (i % data.image_size) %
-                    (data.slot_count / 2 / data.image_size);
-                if (target_block != 0) {
-                    UnifiedCiphertext aligned(loc);
-                    he->devaluator->rotate_vector(
-                        rotation_results[i], -target_block * data.image_size,
-                        *(he->dgal_keys), aligned);
-                    rotation_results[i] = std::move(aligned);
                 }
                 he->devaluator->multiply_plain_inplace(
                     rotation_results[i], cross_masks[i]);
@@ -3306,10 +3322,7 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
             data.image_size * 2 *
             static_cast<uint64_t>(std::ceil(std::log2(
                 data.slot_count / data.image_size / 2)));
-        rotation_count += static_cast<uint64_t>(PACKING_NUM / 2) *
-            data.image_size * 2 *
-            (data.slot_count / 2 / data.image_size - 1) /
-            (data.slot_count / 2 / data.image_size);
+
     }
     if (COMMON_DIM == 1024) {
         qk_rotation_count += static_cast<uint64_t>(PACKING_NUM) *
@@ -3317,9 +3330,10 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
     }
     cout << "num rotations: " << num_rot << endl;
     cout << "OURS_BLB_QK_PACKING status=EXECUTED mode=complete_diagonal"
+         << " alignment_rotations=0 block_rotation=direct_target_v1"
          << " rotation_cap=" << rot_ours
          << " mpc_surrogate=0 client_decrypt_reencrypt=0"
-         << " a0_numerical_validation=PENDING"
+         << " b_numerical_validation=PENDING"
          << endl;
     cout << "bert_cipher_cipher_cross_packing done" << endl;
 }
@@ -4023,7 +4037,7 @@ void Linear_ckks::softmax_v(
     else{
         // Preserve the measured BLB ViT schedule exactly: the rotation budget
         // is shared by all V feature ciphertexts in one packed head pair.
-        // A3/A4 may skip inactive pairs, but must not expand the baseline HE
+        // heterogeneous may skip inactive pairs, but must not expand the baseline HE
         // graph by resetting this budget for every feature ciphertext.
         rot_ours = data.image_size;
     }
@@ -4314,7 +4328,8 @@ void Linear_ckks::preprocess_softmax_s1_ct_ct(
     int num_diag = data.image_size;
     int num_diag_per_ct = data.slot_count / data.image_size / 2;
     if (matrix.empty() || num_diag <= 0 || num_diag_per_ct <= 0 ||
-        data.slot_count % (2 * data.image_size) != 0) {
+        data.slot_count % (2 * data.image_size) != 0 ||
+        (num_diag_per_ct & (num_diag_per_ct - 1)) != 0) {
         throw std::runtime_error(
             "Softmax*V diagonal preprocessing received invalid metadata");
     }
@@ -4425,22 +4440,16 @@ void Linear_ckks::preprocess_softmax_s1_ct_ct(
             he->evaluator->rescale_to_next_inplace(cur_ct_l);
             he->evaluator->rescale_to_next_inplace(cur_ct_r);
             const int block = diag_ind % num_diag_per_ct;
-            if (block != 0) {
-                Ciphertext aligned;
-                he->evaluator->rotate_vector(
-                    cur_ct_l, block * num_diag, *(he->gal_keys), aligned);
-                cur_ct_l = std::move(aligned);
-                he->evaluator->rotate_vector(
-                    cur_ct_r, block * num_diag, *(he->gal_keys), aligned);
-                cur_ct_r = std::move(aligned);
-            }
+
             for (int stride = 1; stride < num_diag_per_ct; stride <<= 1) {
                 Ciphertext replicated;
                 he->evaluator->rotate_vector(
-                    cur_ct_l, -stride * num_diag, *(he->gal_keys), replicated);
+                    cur_ct_l, ours_vit::packed_block_rotation(
+                        block, stride, num_diag, true), *(he->gal_keys), replicated);
                 he->evaluator->add_inplace(cur_ct_l, replicated);
                 he->evaluator->rotate_vector(
-                    cur_ct_r, -stride * num_diag, *(he->gal_keys), replicated);
+                    cur_ct_r, ours_vit::packed_block_rotation(
+                        block, stride, num_diag, true), *(he->gal_keys), replicated);
                 he->evaluator->add_inplace(cur_ct_r, replicated);
             }
             weightMatrix1[0][diag_ind] = std::move(cur_ct_l);
@@ -4462,22 +4471,16 @@ void Linear_ckks::preprocess_softmax_s1_ct_ct(
             he->devaluator->rescale_to_next_inplace(cur_ct_l);
             he->devaluator->rescale_to_next_inplace(cur_ct_r);
             const int block = diag_ind % num_diag_per_ct;
-            if (block != 0) {
-                UnifiedCiphertext aligned(loc);
-                he->devaluator->rotate_vector(
-                    cur_ct_l, block * num_diag, *(he->dgal_keys), aligned);
-                cur_ct_l = std::move(aligned);
-                he->devaluator->rotate_vector(
-                    cur_ct_r, block * num_diag, *(he->dgal_keys), aligned);
-                cur_ct_r = std::move(aligned);
-            }
+
             for (int stride = 1; stride < num_diag_per_ct; stride <<= 1) {
                 UnifiedCiphertext replicated(loc);
                 he->devaluator->rotate_vector(
-                    cur_ct_l, -stride * num_diag, *(he->dgal_keys), replicated);
+                    cur_ct_l, ours_vit::packed_block_rotation(
+                        block, stride, num_diag, true), *(he->dgal_keys), replicated);
                 he->devaluator->add_inplace(cur_ct_l, replicated);
                 he->devaluator->rotate_vector(
-                    cur_ct_r, -stride * num_diag, *(he->dgal_keys), replicated);
+                    cur_ct_r, ours_vit::packed_block_rotation(
+                        block, stride, num_diag, true), *(he->dgal_keys), replicated);
                 he->devaluator->add_inplace(cur_ct_r, replicated);
             }
             weightMatrix1[0][diag_ind] = std::move(cur_ct_l);
@@ -4491,14 +4494,11 @@ void Linear_ckks::preprocess_softmax_s1_ct_ct(
     const uint64_t selected_diagonals = active_pairs * num_diag;
     const uint64_t replication_depth = static_cast<uint64_t>(
         std::ceil(std::log2(num_diag_per_ct)));
-    const uint64_t nonzero_block_fraction =
-        static_cast<uint64_t>(num_diag - num_diag / num_diag_per_ct);
     ct_pt_multiply_count += 2 * selected_diagonals;
     rescale_count += 2 * selected_diagonals;
-    rotation_count += 2 * active_pairs *
-                      nonzero_block_fraction;
     rotation_count += 2 * selected_diagonals * replication_depth;
     cout << "FORMAL_AV_DIAGONAL_PACK status=PASS"
+         << " alignment_rotations=0 block_rotation=direct_target_v1"
          << " softmax_cts=" << matrix.size()
          << " active_pairs=" << active_pairs
          << " packed_diagonals=" << selected_diagonals
@@ -4516,20 +4516,20 @@ Linear_ckks::Linear_ckks(){
 }
 
 Linear_ckks::Linear_ckks(int party, sci::NetIO *io, LOCATION backend,
-                         bool enable_a4_native_linear) {
+                         bool enable_native_linear) {
 	this->party = party;
 	this->io = io;
-	this->a4_native_linear_enabled = enable_a4_native_linear;
+	this->native_linear_enabled = enable_native_linear;
 
     if (backend != LOCATION::HOST && backend != LOCATION::DEVICE) {
         throw std::invalid_argument("Bert_ckks: backend must be HOST or DEVICE");
     }
 
-    set_HE(backend, enable_a4_native_linear);
+    set_HE(backend, enable_native_linear);
     pp_1.resize(ATTENTION_LAYERS);
     pp_2.resize(ATTENTION_LAYERS);
     pp_2_mpc.resize(ATTENTION_LAYERS);
-    pp_2_a4.resize(ATTENTION_LAYERS);
+    pp_2_native.resize(ATTENTION_LAYERS);
     pp_3.resize(ATTENTION_LAYERS);
     pp_4.resize(ATTENTION_LAYERS);
     heterogeneous_protocols.resize(ATTENTION_LAYERS);
@@ -4598,12 +4598,12 @@ void Linear_ckks::configure_sequence_length(int tokens) {
     data_lin4.image_size = tokens;
 }
 
-void Linear_ckks::set_HE(LOCATION backend, bool enable_a4_native_linear){
+void Linear_ckks::set_HE(LOCATION backend, bool enable_native_linear){
     cout << "he0 ok" << endl;
 	// Table 6, Block 2: the 35-bit middle RNS prime is part of the
 	// published depth-7 chain.  The old public source used 34 bits and one
 	// fewer level, which is a different CKKS circuit.
-	const vector<int> he1_modulus = enable_a4_native_linear
+	const vector<int> he1_modulus = enable_native_linear
 	    ? vector<int>{60, 35, 60, 60, 60, 60, 60, 60, 60}
 	    : vector<int>{60, 35, 60, 60, 60, 60, 60, 60};
 	this->he1 = new HE_CKKS(
@@ -4615,18 +4615,20 @@ void Linear_ckks::set_HE(LOCATION backend, bool enable_a4_native_linear){
         44, /* he_scale */
         backend /* Evaluator backend */
     );
-    cout << "OURS_A4_HE1_CHAIN status=PASS enabled="
-         << (enable_a4_native_linear ? 1 : 0)
+    cout << "OURS_NATIVE_HE1_CHAIN status=PASS enabled="
+         << (enable_native_linear ? 1 : 0)
          << " data_level_extension="
-         << (enable_a4_native_linear ? 1 : 0)
+         << (enable_native_linear ? 1 : 0)
          << " modulus_entries=" << he1_modulus.size()
          << " baseline_entries=8 reason=native_QK_AV_WO" << endl;
     cout << "he1 ok" << endl;
+    // One additional data level is required by restored WO -> LN statistics.
+    // N=32768, total modulus=480 bits; SEAL tc128 remains mandatory.
     this->he2 = new HE_CKKS(
         party, /* Bob or Alice (Client or Server) */
         io, /* Network */
         32768, /* N */
-        std::vector<int>{60, 60, 60, 60, 60, 60, 60}, /* modulus chain */
+        std::vector<int>{60, 60, 60, 60, 60, 60, 60, 60}, /* modulus chain */
         40, /* fft_scale */
         43, /* he_scale */
         backend /* Evaluator backend */

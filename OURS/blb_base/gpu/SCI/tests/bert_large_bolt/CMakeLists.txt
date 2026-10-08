@@ -87,8 +87,8 @@ add_executable(ckks_vit_b16_main
 target_link_libraries(ckks_vit_b16_main LIB_VIT_BLB_CKKS)
 
 # OURS is a clean fork of the audited ViT-B/16 BLB runtime.  Keep it in a
-# separate library/executable so A0 remains buildable from the byte-identical
-# donor sources while A1-A4 evolve independently on the same SCI/Phantom
+# separate library/executable so the donor remains buildable from the byte-identical
+# donor sources while the matrix runtime evolves on the same SCI/Phantom
 # backend.
 set(OURS_VIT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../ours_vit_b16")
 set(OURS_VIT_RUNTIME "${OURS_VIT_ROOT}/runtime")
@@ -130,10 +130,10 @@ add_executable(ours_vit_edge_cloud_test
 )
 target_link_libraries(ours_vit_edge_cloud_test LIB_VIT_OURS_CKKS)
 
-add_executable(ours_vit_a0_conversion_selftest
-    "${OURS_VIT_RUNTIME}/a0_conversion_selftest.cpp"
+add_executable(ours_vit_b_conversion_selftest
+    "${OURS_VIT_RUNTIME}/b_conversion_selftest.cpp"
 )
-target_link_libraries(ours_vit_a0_conversion_selftest LIB_VIT_OURS_CKKS)
+target_link_libraries(ours_vit_b_conversion_selftest LIB_VIT_OURS_CKKS)
 
 add_executable(ours_vit_conversion_test
     "${OURS_VIT_RUNTIME}/conversion_test.cpp"

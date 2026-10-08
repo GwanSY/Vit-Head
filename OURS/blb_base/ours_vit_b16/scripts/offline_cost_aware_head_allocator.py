@@ -145,7 +145,7 @@ class MeasuredCompositionCostModel:
     """
 
     REQUIRED = {
-        "layer", "ablation", "softmax_heads", "relu_heads", "linear_heads",
+        "layer", "version", "softmax_heads", "relu_heads", "linear_heads",
         "latency_ms", "communication_bytes", "measurement_scope", "cost_unit",
         "network_gbps", "rtt_ms", "backend", "gpu_topology", "image_id",
         "binary_sha256", "plan_sha256", "protocols_original",
@@ -1137,12 +1137,16 @@ def output_assignment(path: Path, policy: str, budget_pp: float,
             "secure_inference_run": False,
         },
         "runtime": {
-            "ablation": ("A4" if counts and any(row[2] for row in counts)
-                         else "A3"),
+            "version": search_meta.get("runtime_version", "HA"),
             "head_plan": str(runtime_plan.resolve()),
             "head_plan_format": "OURS_VIT_HEAD_PLAN_V1",
         },
     }
+    from version_matrix import plan_binding
+    from experiment_contract import CONTRACT, CONTRACT_SHA256
+    document["experiment_contract"] = CONTRACT
+    document["experiment_contract_sha256"] = CONTRACT_SHA256
+    document["runtime"].update(plan_binding(runtime_plan))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8")
@@ -1451,7 +1455,7 @@ def main() -> None:
             "policy": policy,
             "config": str((output_dir / f"{policy}.json").resolve()),
             "runtime_plan": document["runtime"]["head_plan"],
-            "ablation": document["runtime"]["ablation"],
+            "version": document["runtime"]["version"],
             "plan_sha256": plan_hash,
         })
 

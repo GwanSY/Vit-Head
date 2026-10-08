@@ -41,11 +41,12 @@ def digest(path: Path) -> str:
 
 def require_gpu_available(config: dict) -> None:
     secure = config["secure"]
-    gpu = secure["gpu_id"]
+    gpu = ",".join(map(str, secure["gpu_pair"] or [secure["gpu_id"]]))
     result = subprocess.run(
         ["nvidia-smi", "-i", str(gpu), "--query-gpu=utilization.gpu,memory.free",
          "--format=csv,noheader,nounits"], text=True, capture_output=True, check=True)
-    utilization, free_mib = map(int, result.stdout.strip().split(","))
+    devices = [list(map(int, line.split(","))) for line in result.stdout.strip().splitlines()]
+    utilization, free_mib = max(x[0] for x in devices), min(x[1] for x in devices)
     if utilization > secure["max_gpu_utilization_percent"] or free_mib < secure["min_free_memory_mib"]:
         print(f"GPU {gpu} busy: utilization={utilization}%, free_memory={free_mib} MiB; "
               f"requires utilization<={secure['max_gpu_utilization_percent']}% and "
@@ -78,7 +79,7 @@ def prepare(config: dict) -> list[dict]:
     jobs = []
     for probe in probes:
         jobs.append(dict(name=probe["split"] + "_" + probe["composition"],
-                         plan=probe["plan"], ablation=probe["ablation"].lower(),
+                         plan=probe["plan"], version="J" if config["secure"]["version"] == "J" else "H",
                          blocks=1, scope="attention", output=str(supplemental)))
     plan_dir = Path(paths["output_dir"]) / "costs/plans"
     for composition in ANCHORS:
@@ -86,7 +87,7 @@ def prepare(config: dict) -> list[dict]:
         plan = plan_dir / (composition + ".txt")
         write_plan(plan, make_plan(counts, alphas))
         jobs.append(dict(name="anchor_" + composition, plan=str(plan),
-                         ablation="a4" if counts[2] else "a3",
+                         version="J" if config["secure"]["version"] == "J" else "H",
                          blocks=12, scope="full", output=str(allocator)))
     binary_hash = digest(Path(config["secure"]["binary_override"]))
     for job in jobs:
@@ -95,11 +96,11 @@ def prepare(config: dict) -> list[dict]:
         matching = [row for row in rows if row["plan_sha256"] == job["plan_sha256"]]
         for row in rows:
             selection = key_values((Path(row["source_run"]) / "gpu_selection.txt").read_text())
-            gpu = config["secure"]["gpu_id"]
-            if selection.get("physical_gpus") != f"{gpu},{gpu}":
+            pair = config["secure"]["gpu_pair"] or [config["secure"]["gpu_id"]] * 2
+            if selection.get("physical_gpus") != ",".join(map(str, pair)):
                 raise ValueError("existing costs were measured on a different GPU; use separate cost CSV paths for a new device")
-            if (row["binary_sha256"] != binary_hash or
-                    row["gpu_topology"] != "shared_physical_gpu" or
+            if (row["version"] != job["version"] or row["binary_sha256"] != binary_hash or
+                    row["gpu_topology"] != ("shared_physical_gpu" if pair[0] == pair[1] else "separate_physical_gpus") or
                     str(row["blb_fast_attention_packing"]) != "0"):
                 raise ValueError(f"cost provenance differs from current secure configuration: {job['output']}")
         job["complete"] = {int(row["layer"]) for row in matching} == set(range(job["blocks"]))
@@ -113,12 +114,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--version", choices=("B", "H", "HA", "HP", "HAP", "J", "BP"))
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.version:
+        config["secure"]["version"] = args.version
+    if config["secure"]["version"] not in ("HA", "J"):
+        raise ValueError("cost collection is only for HA (unpacked) or J (packed)")
     if config["secure"]["backend"] != "gpu" or config["secure"]["network_mode"] != "netem":
         raise ValueError("the current cost collector requires backend=gpu and network_mode=netem; CPU is supported by --stage secure")
-    if config["secure"]["group_packing"] != 0:
-        raise ValueError("current cost model requires secure.group_packing=0")
     jobs = prepare(config)
     pending = [job for job in jobs if not job["complete"]]
     print(f"Cost measurements: {len(jobs) - len(pending)} reusable, {len(pending)} missing", flush=True)
@@ -137,11 +141,12 @@ def main() -> None:
             try:
                 candidate = measured_rows(previous)
                 selection = key_values((previous / "gpu_selection.txt").read_text())
-                gpu = config["secure"]["gpu_id"]
-                if (candidate and selection.get("physical_gpus") == f"{gpu},{gpu}" and
+                pair = config["secure"]["gpu_pair"] or [config["secure"]["gpu_id"]] * 2
+                if (candidate and selection.get("physical_gpus") == ",".join(map(str, pair)) and
                         {int(row["layer"]) for row in candidate} == set(range(job["blocks"])) and
                         all(row["plan_sha256"] == job["plan_sha256"] and
                         row["binary_sha256"] == digest(Path(config["secure"]["binary_override"]))
+                        and row["version"] == job["version"]
                         and str(row["blb_fast_attention_packing"]) == "0"
                         for row in candidate)):
                     rows = candidate
@@ -156,8 +161,8 @@ def main() -> None:
             while (parent / f"attempt_{index:03d}").exists():
                 index += 1
             run = parent / f"attempt_{index:03d}"
-            command = ["bash", str(ROOT / "scripts/run_ours_a3_a4_container.sh"),
-                       job["ablation"], job["plan"], os.path.relpath(run, ROOT),
+            command = ["bash", str(ROOT / "scripts/run_ours_container.sh"),
+                       job["version"], job["plan"], os.path.relpath(run, ROOT),
                        str(job["blocks"]), job["scope"]]
             print(f"Cost measurement: {job['name']} -> {run}", flush=True)
             result = subprocess.run(command, cwd=ROOT, env=environment)

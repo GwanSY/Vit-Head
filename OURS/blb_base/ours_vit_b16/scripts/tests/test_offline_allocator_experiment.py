@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
-_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "legacy"))
 
 
 import sys
@@ -35,6 +34,15 @@ class FakeCostModel:
 
 
 class OfflineExperimentTest(unittest.TestCase):
+    def test_packed_and_unpacked_costs_cannot_mix(self):
+        unpacked = [{'attention_packing': 'unpacked', 'heterogeneous_head_grouping': '0', 'plan_sha256': 'x'}]
+        packed = [{'attention_packing': 'packed', 'heterogeneous_head_grouping': '1', 'plan_sha256': 'y'}]
+        experiment.require_unpacked_probe_provenance(unpacked, Path('HA.csv'))
+        experiment.require_unpacked_probe_provenance(packed, Path('J.csv'), 'packed')
+        for rows, layout in ((packed, 'unpacked'), (unpacked, 'packed'), (packed+unpacked, 'packed')):
+            with self.assertRaises(ValueError):
+                experiment.require_unpacked_probe_provenance(rows, Path('mixed.csv'), layout)
+
     def test_layer_aware_cost_model_uses_only_train_points(self) -> None:
         points = []
         compositions = ((12, 0, 0), (10, 2, 0), (10, 0, 2), (6, 6, 0))

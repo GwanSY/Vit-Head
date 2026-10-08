@@ -26,7 +26,7 @@ if [[ -f "$build_dir/CMakeCache.txt" ]]; then
     "$cached_cmake" -S "$root/gpu/SCI" -B "$build_dir"
     "$cached_cmake" --build "$build_dir" \
       --target ours_vit_b16_main ours_vit_hetero_plan_test ours_vit_edge_cloud_test \
-               ours_vit_a0_conversion_selftest ours_vit_conversion_test ours_vit_row_max_test \
+               ours_vit_b_conversion_selftest ours_vit_conversion_test ours_vit_row_max_test \
       --parallel "$jobs"
     echo "OURS_VIT_BUILD status=PASS build_dir=$build_dir"
     exit 0
@@ -91,12 +91,12 @@ fi
 
 "$cmake_bin" --build "$build_dir" \
   --target ours_vit_b16_main ours_vit_hetero_plan_test \
-           ours_vit_edge_cloud_test ours_vit_a0_conversion_selftest ours_vit_conversion_test ours_vit_row_max_test \
+           ours_vit_edge_cloud_test ours_vit_b_conversion_selftest ours_vit_conversion_test ours_vit_row_max_test \
   --parallel "$jobs"
 
 test -x "$build_dir/bin/ours_vit_b16_main"
 test -x "$build_dir/bin/ours_vit_hetero_plan_test"
 test -x "$build_dir/bin/ours_vit_edge_cloud_test"
-test -x "$build_dir/bin/ours_vit_a0_conversion_selftest"
+test -x "$build_dir/bin/ours_vit_b_conversion_selftest"
 test -x "$build_dir/bin/ours_vit_conversion_test"
-echo "OURS_VIT_BUILD status=PASS targets=A0+OURS+PLAN_TEST+CONVERSION_TEST backend=SEAL_HOST+Phantom_DEVICE ot=VOLE threads=$jobs cmake=$cmake_bin build_dir=$build_dir"
+echo "OURS_VIT_BUILD status=PASS targets=B+OURS+PLAN_TEST+CONVERSION_TEST backend=SEAL_HOST+Phantom_DEVICE ot=VOLE threads=$jobs cmake=$cmake_bin build_dir=$build_dir"

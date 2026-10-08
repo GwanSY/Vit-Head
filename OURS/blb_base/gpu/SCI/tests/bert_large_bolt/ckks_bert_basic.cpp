@@ -854,8 +854,9 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_nonlinear(map<char*,FixArray> inp
     cout << "in layer_norm_nonlinear, bitwidth,s,num_ops,dim:" << bitwidth << "," << s << "," << num_ops << "," << dim << endl;
     cout << "sigma.size, should be L:" << sigma.size << endl;
     // 计算平方根倒数
+    const uint64_t sqrt_sent_before = current_comm();
     FixArray sigma_sqrt = fpmath->sqrt(sigma, true);
-    cout << "sqrt comm:" << this->get_comm() << endl;
+    cout << "sqrt comm:" << current_comm() - sqrt_sent_before << endl;
     cout << "sqrt round:" << this->get_round() << endl;
     //point8
     FixArray sigma_flat(party, x_flat_avg.size, sigma_sqrt.signed_, bitwidth, s);

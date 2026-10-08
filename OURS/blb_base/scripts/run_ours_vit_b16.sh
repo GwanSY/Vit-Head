@@ -21,7 +21,7 @@ omp_threads=${BLB_VIT_OMP_THREADS:-64}
 gpu_direct_plaintext=${BLB_VIT_GPU_DIRECT_PLAINTEXT:-1}
 gpu_linear_streams=${BLB_VIT_GPU_LINEAR_STREAMS:-8}
 network_mode=${OURS_VIT_NETWORK_MODE:-netem}
-ablation=${OURS_VIT_ABLATION:-a0}
+version=${OURS_VIT_VERSION:-B}
 head_plan=${OURS_VIT_HEAD_PLAN:-}
 prevalidated_reorder_binding=${OURS_VIT_PREVALIDATED_REORDER_BINDING:-}
 cuda_gdb_command_file=${BLB_VIT_CUDA_GDB_COMMAND_FILE:-}
@@ -97,12 +97,12 @@ if [[ -n "$cuda_gdb_command_file" && ! -x "$debugger_binary" ]]; then
   echo "missing debugger binary: $debugger_binary" >&2
   exit 2
 fi
-if [[ ! "$ablation" =~ ^[aA][0-4]$ ]]; then
-  echo "OURS_VIT_ABLATION must be a0, a1, a2, a3, or a4" >&2
+if [[ ! "$version" =~ ^(B|H|HA|HP|HAP|J|BP)$ ]]; then
+  echo "OURS_VIT_VERSION must be B,H,HA,HP,HAP,J,BP" >&2
   exit 2
 fi
-if [[ "${ablation,,}" != a0 && -z "$head_plan" ]]; then
-  echo "OURS_VIT_HEAD_PLAN is required for A1-A4" >&2
+if [[ "${version}" != B && -z "$head_plan" ]]; then
+  echo "OURS_VIT_HEAD_PLAN is required for H/HA/HP/HAP/J/BP" >&2
   exit 2
 fi
 if [[ -n "$head_plan" && ! -f "$head_plan" ]]; then
@@ -132,10 +132,10 @@ if [[ "$backend" == gpu ]]; then
   } > "$output_dir/gpu_selection.txt"
 fi
 
-# A2 and later physically reorder checkpoint head blocks. Refuse to open the
+# grouped and later physically reorder checkpoint head blocks. Refuse to open the
 # secure sockets unless the exact model/input/plan permutation first passes
 # the FP32 and fixed-clear WQ/WK/WV/QK/norm/AV/WO/logit oracle.
-if [[ "${ablation,,}" =~ ^a[2-4]$ ]]; then
+if [[ "$version" != B ]]; then
   if [[ -n "$prevalidated_reorder_binding" ]]; then
     if [[ ! -f "$prevalidated_reorder_binding" ]]; then
       echo "missing prevalidated reorder binding: $prevalidated_reorder_binding" >&2
@@ -230,14 +230,9 @@ fi
   echo "logical_tokens=197"
   echo "physical_tokens=256"
   echo "transformer_blocks=$stop_after_block"
-  echo "ablation=${ablation^^}"
+  echo "version=${version^^}"
   echo "head_plan=${head_plan:-built_in_all_softmax_original_order}"
   echo "conversion_path=see_edge_cloud_contract_and_run_metadata"
-  if [[ -n "${OURS_VIT_STOP_AFTER_NORMALIZATION:-}" ]]; then
-    echo "cost_scope=a2_normalization_only"
-    echo "conversion_cost_included=0"
-    echo "conversion_cost_deferred_to=A3"
-  fi
   if [[ "$network_mode" == netem ]]; then
     echo "network=1Gbps/0.3ms_RTT"
   else
@@ -276,7 +271,7 @@ if [[ "$backend" == gpu ]]; then
     BLB_VIT_GPU_LINEAR_STREAMS="$gpu_linear_streams")
 fi
 
-ours_args=(--ablation "$ablation")
+ours_args=(--version "$version")
 if [[ -n "$head_plan" ]]; then ours_args+=(--head-plan "$head_plan"); fi
 
 binary_command=(
@@ -339,10 +334,9 @@ if [[ $alice_rc -ne 0 || $bob_rc -ne 0 ]]; then exit 1; fi
 # successfully, so do not misreport the expected absence of those CSV files as
 # a failed secure run.
 if [[ -n "${BLB_QKV_AGGREGATE:-}" ||
-      -n "${OURS_VIT_A0_TRACE:-}" ||
+      -n "${OURS_VIT_B_TRACE:-}" ||
       -n "${OURS_VIT_PARTIAL_FINAL_LOGITS:-}" ||
-      -n "${OURS_VIT_A0_PARTIAL_FINAL_LOGITS:-}" ||
-      -n "${OURS_VIT_STOP_AFTER_NORMALIZATION:-}" ||
+      -n "${OURS_VIT_B_PARTIAL_FINAL_LOGITS:-}" ||
       -n "${OURS_VIT_STOP_AFTER_ATTENTION:-}" ||
       -n "${BLB_VIT_DIAGNOSTIC_STOP_AFTER_QK:-}" ||
       -n "${BLB_VIT_DIAGNOSTIC_STOP_AFTER_SOFTMAX:-}" ||
@@ -351,14 +345,4 @@ if [[ -n "${BLB_QKV_AGGREGATE:-}" ||
   exit 0
 fi
 
-python_bin=${PYTHON_BIN:-python3}
-summarizer="$root/vit_b16/scripts/summarize_blb_vit_baseline.py"
-if [[ -f "$summarizer" ]]; then
-  "$python_bin" "$summarizer" --run-dir "$output_dir"
-  echo "OURS_VIT_RUN status=PASS backend=$backend output=$output_dir"
-else
-  # The minimal `ours` image intentionally does not copy the BLB source-tree
-  # symlink target.  A host wrapper runs the same read-only summarizer against
-  # the mounted results after both secure parties have exited successfully.
-  echo "OURS_VIT_RUN status=PASS_SUMMARY_DEFERRED backend=$backend output=$output_dir"
-fi
+echo "OURS_VIT_RUN status=PASS backend=$backend output=$output_dir"

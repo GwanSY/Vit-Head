@@ -427,28 +427,21 @@ def fixed_layer_norm(
     del epsilon  # checkpoint 1e-12 quantizes to zero at scale 12
     x = round_int(value, ACT_SCALE)
     width = x.shape[-1]
-    reciprocal_width = int((1.0 / width) * (1 << (2 * ACT_SCALE)))
-    total = np.sum(x, axis=-1, keepdims=True, dtype=np.int64)
-    average = _floor_shift(total * reciprocal_width, 2 * ACT_SCALE)
-    centered = x - average
-    squares = _floor_shift(centered * centered, ACT_SCALE)
-    variance = _floor_shift(
-        np.sum(squares, axis=-1, dtype=np.int64) * reciprocal_width,
-        2 * ACT_SCALE)
+    # BLB HE statistics keep fractional precision through mean/centering/
+    # square; quantize only when centered values and variance enter MPC.
+    centered_real_raw = x.astype(np.float64) - np.mean(x, axis=-1, keepdims=True)
+    centered = np.floor(centered_real_raw).astype(np.int64)
+    variance = np.floor(np.mean(np.square(centered_real_raw), axis=-1) /
+                        float(1 << ACT_SCALE)).astype(np.int64)
     sigma = np.asarray([_lookup_inverse_sqrt(int(item))
                         for item in variance], dtype=np.int64)[:, None]
-    normalized = _floor_shift(centered * sigma, ACT_SCALE)
-    # Match the secure adapter exactly: LayerNorm's private affine consumes
-    # 37/12 weight and bias shares. Bias is
-    # encoded at the raw product scale, then the combined value is truncated.
-    affine_weight_scale = 12
-    gamma = round_int(weight, affine_weight_scale)
-    beta_raw = round_int(bias, ACT_SCALE + affine_weight_scale)
-    affine_raw = normalized * gamma + beta_raw
+    gamma = round_int(weight, ACT_SCALE)
+    beta = round_int(bias, ACT_SCALE)
+    # The HE affine has no MPC truncation between its two products.
+    affine_raw = centered * sigma * gamma + beta * (1 << (2*ACT_SCALE))
     if raw_callback is not None:
-        raw_callback(signed_raw_accumulator(affine_raw, operation_name),
-                     ACT_SCALE + affine_weight_scale)
-    affine = _floor_shift(affine_raw, affine_weight_scale)
+        raw_callback(signed_raw_accumulator(affine_raw, operation_name), 3*ACT_SCALE)
+    affine = _floor_shift(affine_raw, 2*ACT_SCALE)
     return affine.astype(np.float64) / float(1 << ACT_SCALE)
 
 
@@ -547,17 +540,11 @@ def _lookup_table_exp_iron_raw(value_raw: np.ndarray) -> np.ndarray:
 
 
 def _paper_softmax_exp_raw(value_raw: np.ndarray) -> np.ndarray:
-    """Clear form of the fast, comparison-free HE exponentiation.
-
-    The original ``(1+x/64)**64`` schedule becomes unstable for real ViT
-    attention gaps below -128.  The fast-correct binary folds division by 128
-    into MPC-to-CKKS conversion and evaluates ``(1+x/128)**128`` with the same
-    seven rescale levels as the old divide-then-six-square implementation.
-    """
+    """BLB Algorithm 5: t=6, Texp=-13; evaluate only the safe domain."""
     shifted = (_ring_signed(_ring_reduce(value_raw, ELL), ELL)
                .astype(np.float64) / float(1 << ACT_SCALE))
-    approximate = np.power(
-        1.0 + shifted / float(1 << 7), 1 << 7)
+    approximate = np.where(shifted < -13.0, 0.0,
+                           np.power(1.0 + np.maximum(shifted, -13.0) / 64.0, 64))
     return _ring_reduce(
         np.floor(approximate * float(1 << ACT_SCALE)).astype(np.int64), ELL)
 
@@ -638,22 +625,26 @@ def fixed_softmax(value: np.ndarray) -> np.ndarray:
     row_max = input_signed.max(axis=-1, keepdims=True)
     shifted = _ring_reduce(input_signed - row_max, ELL)
     exponent_37 = _paper_softmax_exp_raw(shifted)
-    # The secure path performs a real unsigned ring extension before its
-    # three guard bits are used for the 256-term row sum.
-    exponent_40 = _ring_reduce(exponent_37, 40)
-    denominator_40 = _ring_reduce(
-        np.sum(exponent_40, axis=-1, dtype=np.int64), 40)
-    # Guard bits end at the summation boundary; BLB's reciprocal/division
-    # remains in the original 37-bit nonlinear ring.
-    numerator = _ring_reduce(exponent_40, ELL)
-    denominator = _ring_reduce(denominator_40, ELL)
-    output = _div_exp_raw(numerator, denominator, ELL)
+    # Same graph as div_batch_he_V2: full-ring SCI inverse square root,
+    # MPC square/truncate to 1/dn, then the final HE product. Do not use
+    # FixOp::div's different lookup table as the oracle for this graph.
+    denominator = _ring_reduce(
+        np.sum(exponent_37, axis=-1, dtype=np.int64), ELL)
+    roots = np.asarray([
+        _lookup_inverse_sqrt(int(dn)) for dn in denominator.flat
+    ], dtype=np.int64).reshape(denominator.shape)
+    reciprocal = _ring_truncate_reduce(
+        _ring_mul(roots, ELL, roots, ELL, ELL + ACT_SCALE,
+                  rhs_signed=False),
+        ELL + ACT_SCALE, ACT_SCALE)
+    output = _ring_reduce(np.floor_divide(
+        exponent_37 * reciprocal[..., None], 1 << ACT_SCALE), ELL)
     return (_ring_signed(output, ELL).astype(np.float64) /
             float(1 << ACT_SCALE))
 
 
 def fixed_relu_normalization(value: np.ndarray) -> np.ndarray:
-    """Clear reconstruction of the A1/A2 ReLU + SCI division path."""
+    """Clear reconstruction of the heterogeneous ReLU + SCI division path."""
     input_raw = _ring_reduce(round_int(value, ACT_SCALE), ELL)
     positive = np.where(_ring_signed(input_raw, ELL) < 0, 0, input_raw)
     denominator = _ring_reduce(
@@ -666,7 +657,7 @@ def fixed_relu_normalization(value: np.ndarray) -> np.ndarray:
 
 
 def fixed_linear_scaling(value: np.ndarray, alpha: float) -> np.ndarray:
-    """Clear reconstruction of the A1/A2 public fixed-alpha multiply."""
+    """Clear reconstruction of the heterogeneous public fixed-alpha multiply."""
     input_raw = _ring_reduce(round_int(value, ACT_SCALE), ELL)
     alpha_raw = _ring_reduce(round_int(float(alpha), ACT_SCALE), ELL)
     product = _ring_mul(input_raw, ELL, alpha_raw, ELL,
@@ -677,32 +668,19 @@ def fixed_linear_scaling(value: np.ndarray, alpha: float) -> np.ndarray:
 
 
 def fixed_gelu(value: np.ndarray) -> np.ndarray:
-    """Bit-exact clear emulation of the secure ViT GELU adapter.
-
-    CKKS evaluates a symmetric quartic approximation of GELU's even term.
-    MPC adds x/2 and selects the exact ReLU tail.  Both values cross the
-    reproduced boundary at ell=37, scale=12.
-    """
-    input_raw = _ring_reduce(round_int(value, ACT_SCALE), ELL)
-    x_signed = _ring_signed(input_raw, ELL)
-    x_real = x_signed.astype(np.float64) / float(1 << GELU_INPUT_SCALE)
-    polynomial_real = (
-        -0.018154344446004743 * np.square(np.square(x_real))
-        + 0.30869355275897581 * np.square(x_real)
-        + 0.027529737185454588)
-    polynomial = _ring_reduce(
-        round_int(polynomial_real, GELU_OUTPUT_SCALE), ELL)
-    half_x = _ring_right_shift(input_raw, ELL, 1)
-    gelu_inner = _ring_add(half_x, polynomial, ELL)
-
-    y = np.abs(x_signed)
-    within_polynomial = y < math.trunc(2.7 * (1 << GELU_INPUT_SCALE))
-    abs_raw = _ring_reduce(y, ELL)
-    nonnegative_half = _ring_right_shift(
-        _ring_add(input_raw, abs_raw, ELL), ELL, 1)
-    selected = np.where(within_polynomial, gelu_inner, nonnegative_half)
-    return (_ring_signed(selected, ELL).astype(np.float64) /
-            float(1 << GELU_OUTPUT_SCALE))
+    """BLB Algorithm 4 fixed reference, independent of CKKS noise."""
+    raw = _ring_reduce(round_int(value, ACT_SCALE), ELL)
+    signed = _ring_signed(raw, ELL)
+    x = signed.astype(np.float64) / float(1 << ACT_SCALE)
+    a, b, c = 0.020848611754127593, -0.18352506127082727, 0.5410550166368381
+    d, e = -0.03798164612714154, 0.001620808531841547
+    x2 = x * x
+    f0 = a*x2*x2 - b*x2*x + c*x2 + (0.5-d)*x + e
+    f1 = a*x2*x2 + b*x2*x + c*x2 + (0.5+d)*x + e
+    inner = _ring_reduce(round_int(np.where(signed < 0, f0, f1), ACT_SCALE), ELL)
+    boundary = math.trunc(2.7 * (1 << ACT_SCALE))
+    selected = np.where(signed < -boundary, 0, np.where(signed > boundary, raw, inner))
+    return _ring_signed(selected, ELL).astype(np.float64) / float(1 << ACT_SCALE)
 
 
 def patchify(chw: np.ndarray, patch_size: int) -> np.ndarray:
@@ -1155,7 +1133,7 @@ class Graph:
             activated = self.mask_tokens(activated)
             self.record(f"block_{layer}.gelu", activated,
                         GELU_OUTPUT_SCALE if self.fixed else "float64",
-                        "physical_symmetric_quartic_ell37" if self.fixed else "logical_gelu")
+                        "physical_blb_F0_F1_ell37" if self.fixed else "logical_gelu")
             second = self.linear(activated, block["ff2_weight"], block["ff2_bias"],
                                  GELU_OUTPUT_SCALE if self.fixed else 0,
                                  ACT_SCALE, 5 if self.fixed else WEIGHT_SCALE,
@@ -1508,7 +1486,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--head-plan", type=Path,
-        help=("fixed public A1/A2 plan; entries are restored to original-head "
+        help=("fixed public heterogeneous plan; entries are restored to original-head "
               "order before evaluating the clear reference"))
     parser.add_argument(
         "--trace-dir", type=Path,
@@ -1717,7 +1695,10 @@ def main() -> None:
                         "attention_scale_fold": "public CKKS Q scale metadata divided by sqrt(head_dim) after Q projection",
                         "gelu_input_scale": GELU_INPUT_SCALE,
                         "gelu_output_scale": GELU_OUTPUT_SCALE,
-                        "layer_norm_epsilon_note": "BLB FPMath layer_norm_fix has no explicit epsilon; checkpoint epsilon is retained as an audit field"},
+                        "gelu_polynomial": "blb_F0_F1",
+                        "softmax_exponent": "clipped_(1+x/64)^64",
+                        "layer_norm_statistics": "HE_mean_center_square_sum",
+                        "layer_norm_epsilon_note": "checkpoint epsilon 1e-12 is below the fixed scale; retained as an audit field"},
         "clear": {"top1": clear_top1, "logits": clear_logits.tolist()},
         "fixed": {"top1": fixed_top1, "logits": fixed_logits.tolist(),
                   "top1_matches_clear": fixed_top1 == clear_top1},

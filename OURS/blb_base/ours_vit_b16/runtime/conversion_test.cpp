@@ -1141,17 +1141,8 @@ int main(int argc, char **argv) {
       const double input_value =
           ldexp(static_cast<double>(signed_ring(exp_expected[index])),
                 -kScale);
-      const bool secure_clamp =
-          getenv("OURS_VIT_SECURE_EXP_CLAMP") != nullptr &&
-          strcmp(getenv("OURS_VIT_SECURE_EXP_CLAMP"), "0") != 0;
-      const double divisor = secure_clamp ? 64.0 : 128.0;
-      const double exponent = secure_clamp ? 64.0 : 128.0;
-      const int64_t reference = secure_clamp && input_value <= -13.0
-                                    ? 0
-                                    : static_cast<int64_t>(llround(
-                                          pow(1.0 + input_value / divisor,
-                                              exponent) *
-                                          ldexp(1.0, kScale)));
+      const int64_t reference = input_value < -13.0 ? 0 :
+          static_cast<int64_t>(llround(pow(1.0 + input_value/64.0, 64) * ldexp(1.0, kScale)));
       const int64_t error = decoded_value - reference;
       const uint64_t absolute =
           static_cast<uint64_t>(error < 0 ? -error : error);
@@ -1186,7 +1177,7 @@ int main(int argc, char **argv) {
     const vector<double> denominator_values = {
         1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0,
         256.0, 512.0, 1024.0, 2048.0, 4096.0,
-        // These are representative 256-way exp sums observed in A0.  Keep
+        // These are representative 256-way exp sums observed in B.  Keep
         // non-powers here so the reciprocal gate exercises the same
         // normalization interval as production Softmax, not only exact
         // binary boundaries.
@@ -1329,7 +1320,7 @@ int main(int argc, char **argv) {
     adapter.linear.he_onetime = &division_he;
     const FixArray division_output = adapter.div_batch_he_V2(
         division_nm_local, division_dn_local, kDivisionBatch, kBits, kScale,
-        false, true);
+        false, false, false);
     vector<uint64_t> division_remote;
     exchange_vector(io, party,
                     vector<uint64_t>(
@@ -1378,7 +1369,7 @@ int main(int argc, char **argv) {
          << " bad_values=" << division_mismatches << endl;
   }
 
-  // Optional signed-comparison smoke.  A0's row maximum and GELU selector
+  // Optional signed-comparison smoke.  B's row maximum and GELU selector
   // depend on the fork's actual signed comparator orientation; keep this
   // small gate separate from C0-C4 so the conversion contract remains the
   // first mandatory stop point while comparator regressions are observable.

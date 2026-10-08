@@ -16,16 +16,15 @@ def main():
     root = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    plans = {'a0': None,
-             'a2': root / 'ours_vit_b16/experiments/all_softmax_head_plan.txt',
-             'a3': root / 'ours_vit_b16/experiments/all_softmax_head_plan.txt',
-             'a4': root / 'outputs/research2/inputs/plans/train_6S0R6L.txt'}
+    all_softmax = root / 'ours_vit_b16/experiments/all_softmax_head_plan.txt'
+    plans = {version: None if version == 'B' else all_softmax
+             for version in ('B', 'H', 'HA', 'HP', 'HAP', 'J', 'BP')}
     checks = []
-    for ablation, plan in plans.items():
+    for version, plan in plans.items():
         contracts = []
         for role in ('cloud', 'edge'):
-            destination = output / (ablation + '_' + role)
-            command = [str(args.binary.resolve()), '--role', role, '--ablation', ablation,
+            destination = output / (version + '_' + role)
+            command = [str(args.binary.resolve()), '--role', role, '--version', version,
                        '--output', str(destination), '--validate-plan-only']
             if plan is not None:
                 command.extend(['--head-plan', str(plan)])
@@ -35,10 +34,10 @@ def main():
                 raise RuntimeError(result.stdout)
             party = '1' if role == 'cloud' else '2'
             contracts.append((destination / ('edge_cloud_contract_party' + party + '.txt')).read_bytes())
-            (output / (ablation + '_' + role + '.log')).write_text(result.stdout)
+            (output / (version + '_' + role + '.log')).write_text(result.stdout)
         if contracts[0] != contracts[1]:
             raise RuntimeError('role-specific paths changed the public contract')
-        checks.append(dict(ablation=ablation, status='PASS', roles=2))
+        checks.append(dict(version=version, status='PASS', roles=2))
     result = subprocess.run([str(args.binary.resolve()), '--role', 'edge', '--party', '1',
                              '--validate-plan-only', '--output', str(output / 'invalid')],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
