@@ -1,0 +1,26 @@
+{
+  "upstream": "../../OpenBumbleBee",
+  "model": "../../BOLT/checkpoints/vit_b16_hf",
+  "image": "../../datasets/imagenet2012/val/images/ILSVRC2012_val_00039905.JPEG",
+  "source_container": "openbumblebee",
+  "backend": "cpu",
+  "spu_package": "build",
+  "gpu_library": "build/gpu.so",
+  "phantom": "build/phantom",
+  "gpus": ["0", "1"],
+  "image_base": "openbumblebee-audit-deps:latest",
+  "dependency_path": "/tmp/openbumblebee-pydeps-py310",
+  "cpus": ["0-24", "48-72"],
+  "threads": 25,
+  "repeats": 3,
+  "timeout_s": 900,
+  "gate": {
+    "paper_seconds": 239.4,
+    "paper_sent_gib": 6.30,
+    "paper_recv_gib": 5.26,
+    "latency_ratio": [0.75, 1.25],
+    "communication_ratio": [0.90, 1.10],
+    "relative_l2_max": 0.05,
+    "max_abs_max": 0.5
+  }
+}

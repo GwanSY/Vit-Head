@@ -12,3 +12,5 @@ COPY scripts/run_ours_vit_b16.sh scripts/run_ours_vit_b16.sh
 COPY ours_vit_b16/scripts/ ours_vit_b16/scripts/
 
 ENV LD_LIBRARY_PATH=/opt/ours/lib:/usr/local/cuda-12.3/targets/x86_64-linux/lib
+
+ENV OURS_VIT_BINARY_OVERRIDE=/workspace/OURS/build/gpu/bin/ours_vit_b16_main

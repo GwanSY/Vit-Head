@@ -1,6 +1,0 @@
-[submodule "CrypTFlow2/extern/eigen"]
-	path = SCI/extern/eigen
-	url = https://gitlab.com/libeigen/eigen
-[submodule "SCI/extern/phantom"]
-	path = SCI/extern/phantom
-	url = https://github.com/encryptorion-lab/phantom-fhe.git

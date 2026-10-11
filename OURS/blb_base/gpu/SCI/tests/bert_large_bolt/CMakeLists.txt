@@ -98,7 +98,7 @@ add_library(LIB_VIT_OURS_CKKS
     "${OURS_VIT_RUNTIME}/nonlinear.cpp"
     "${OURS_VIT_RUNTIME}/linear_ckks.cpp"
     "${OURS_VIT_RUNTIME}/ckks_bert.cpp"
-    "${OURS_VIT_RUNTIME}/ckks_bert_basic.cpp"
+    # ckks_bert.cpp includes ckks_bert_basic.cpp under the conversion observer.
     "${OURS_VIT_RUNTIME}/bert_utils.cpp"
 )
 target_include_directories(LIB_VIT_OURS_CKKS PUBLIC

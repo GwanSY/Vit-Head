@@ -1,1 +1,0 @@
-/usr/bin/c++    -rdynamic CMakeFiles/aux_protocols-OT.dir/test_ring_aux_protocols.o  -o aux_protocols-OT -lSCI-OT 

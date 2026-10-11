@@ -12,7 +12,7 @@ port=$3
 alice_gpu_id=${4:-}
 bob_gpu_id=${5:-$alice_gpu_id}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-binary="$root/build/gpu/bin/ours_vit_b16_main"
+binary=${OURS_VIT_BINARY_OVERRIDE:-$root/build/container-gpu/bin/ours_vit_b16_main}
 model=${BLB_VIT_MODEL:-$root/checkpoints/vit_b16/bolt_model.txt}
 input=${BLB_VIT_INPUT:-$root/inputs/vit_b16/bob_image.txt}
 stop_after_block=${BLB_VIT_STOP_AFTER_BLOCK:-12}
@@ -213,6 +213,38 @@ if [[ "$network_mode" == netem ]]; then
   tc qdisc replace dev lo root netem limit 100000 delay 0.15ms rate 1gbit
   qdisc_owned=1
   tc qdisc show dev lo > "$output_dir/qdisc_active.txt"
+  python3 - "$output_dir/network_probe.json" <<'NETWORK_PROBE'
+import json, socket, statistics, sys, threading, time
+listener = socket.socket()
+listener.bind(('127.0.0.1', 0)); listener.listen(1)
+payload_bytes = 32 * 1024 * 1024
+def server():
+    peer, _ = listener.accept()
+    peer.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    for _ in range(12):
+        data = peer.recv(1)
+        peer.sendall(data)
+    remaining = payload_bytes
+    while remaining:
+        chunk = peer.recv(min(1 << 20, remaining))
+        if not chunk: raise RuntimeError('network probe disconnected')
+        remaining -= len(chunk)
+    peer.sendall(b'd'); peer.close()
+worker = threading.Thread(target=server); worker.start()
+client = socket.create_connection(listener.getsockname())
+client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+rtts = []
+for i in range(12):
+    begin = time.monotonic(); client.sendall(b'p'); assert client.recv(1) == b'p'
+    if i >= 2: rtts.append((time.monotonic() - begin) * 1000)
+begin = time.monotonic(); client.sendall(bytes(payload_bytes)); assert client.recv(1) == b'd'
+elapsed = time.monotonic() - begin
+client.close(); worker.join(); listener.close()
+with open(sys.argv[1], 'w') as f:
+    json.dump(dict(method='TCP echo and acknowledged one-way payload, before secure initialization',
+        rtt_ms=rtts, rtt_mean_ms=statistics.mean(rtts), rtt_stdev_ms=statistics.stdev(rtts),
+        payload_bytes=payload_bytes, payload_seconds=elapsed, effective_payload_Gbps=payload_bytes*8/elapsed/1e9), f, indent=2)
+NETWORK_PROBE
 else
   printf '%s\n' 'network shaping disabled; diagnostic/smoke only' \
     > "$output_dir/qdisc_active.txt"

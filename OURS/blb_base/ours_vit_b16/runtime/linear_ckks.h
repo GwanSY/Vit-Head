@@ -410,38 +410,10 @@ public:
 
 	// Softmax * V
 
-	// Pack the sharing of softmax result on the client and encrypt
-	vector<Ciphertext> preprocess_softmax_s1(
-		HE_CKKS* he,
-		uint64_t* matrix, 
-		const FCMetadata &data);
-	
-	// Pack the sharing of softmax result on the server and encode to plaintext polynomials
-	vector<vector<vector<Plaintext>>> 
-	preprocess_softmax_s2(HE_CKKS* he, const uint64_t *matrix, const FCMetadata &data);
-
-	void client_S1_V_R(HE_CKKS* he, const uint64_t *softmax_s1,uint64_t* V, uint64_t* result, const FCMetadata &data);
-
-	void bert_postprocess_V(HE_CKKS* he,  uint64_t* input, uint64_t* result, const FCMetadata &data, const bool &col_packing);
-	void bert_postprocess_V_enc(HE_CKKS* he, vector<Ciphertext> cts, uint64_t* result, const FCMetadata &data, const bool &col_packing);
-
-	vector<vector<vector<Plaintext>>>
-	preprocess_softmax_v_r(HE_CKKS* he, const uint64_t *matrix, const FCMetadata &data);
-
 	vector<vector<vector<Plaintext>>> bert_softmax_v_packing_single_matrix(
 		HE_CKKS* he,
 		const vector<vector<vector<uint64_t>>> &weights, 
 		const FCMetadata &data);
-
-	void bert_softmax_V(
-		HE_CKKS* he, vector<Ciphertext> &softmax_s1, 
-		vector<Ciphertext> &V, 
-		const FCMetadata &data, 
-		vector<Ciphertext> &result);
-
-	vector<Ciphertext> w_ln(HE_CKKS* he, vector<Ciphertext> ln);
-
-	void preprocess_softmax(const uint64_t *input, uint64_t *output, const FCMetadata &data);
 
 	void softmax_v(
 		HE_CKKS* he,
@@ -452,8 +424,6 @@ public:
 		double output_mask_value = 1.0,
 		const vector<bool> *active_heads = nullptr,
 		bool post_av_rescale = true);
-
-	vector<vector<Plaintext>> softmax_mask_ct_ct(HE_CKKS* he, const FCMetadata &data);
 
 	void preprocess_softmax_s1_ct_ct(
 		HE_CKKS* he, const vector<UnifiedCiphertext> &matrix,

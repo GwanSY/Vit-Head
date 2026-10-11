@@ -1,3 +1,4 @@
+#include "execution_observer.h"
 // Clean OURS fork of the faithful BLB CKKS/MPC baseline for ViT-B/16.
 //
 // This driver deliberately keeps the original BLB evaluator graph:
@@ -273,7 +274,7 @@ static uint64_t ring_mask(int ell) {
 }
 
 static FixArray b_projected_tensor_to_token_major(
-    const FixArray &packed, int party, int tokens) {
+    const FixArray &packed, int party, int tokens, bool diagonal=false) {
   const size_t expected =
       static_cast<size_t>(tokens) * kHeads * kHeadDim;
   if (packed.size != static_cast<int>(expected))
@@ -287,10 +288,9 @@ static FixArray b_projected_tensor_to_token_major(
     for (int slot = 0; slot < slots; ++slot) {
       const int token = slot % tokens;
       const int packed_feature = slot / tokens;
-      const bool upper_half = slot >= slots / 2;
-      const int head = (ciphertext / 2) * 2 + (upper_half ? 1 : 0);
-      const int feature = packed_feature % (kHeadDim / 2) +
-                          (ciphertext % 2) * (kHeadDim / 2);
+      const int head=(ciphertext/4)*4+packed_feature%4;
+      const int delta=(ciphertext%4)*16+packed_feature/4;
+      const int feature=diagonal?(token+delta)%64:delta;
       const size_t source = static_cast<size_t>(ciphertext) * slots + slot;
       const size_t target =
           static_cast<size_t>(token) * kDim + head * kHeadDim + feature;
@@ -890,7 +890,19 @@ static LOCATION parse_backend(const string &backend) {
 
 int main(int argc, char **argv) {
   try {
+    const auto request_start = chrono::steady_clock::now();
+    auto phase = [](const string &name, chrono::steady_clock::time_point begin) {
+      const auto end = chrono::steady_clock::now();
+      cout << "E2E_PHASE stage=" << name
+           << " begin_ns=" << chrono::duration_cast<chrono::nanoseconds>(begin.time_since_epoch()).count()
+           << " end_ns=" << chrono::duration_cast<chrono::nanoseconds>(end.time_since_epoch()).count() << endl;
+      return end;
+    };
     const Args args = parse_args(argc, argv);
+    if (execution_observe::force_generic() && args.version != ours_vit::Version::H)
+      throw invalid_argument("force generic all-S is a test-only H execution option");
+    const bool matched_he_control = getenv("OURS_VIT_MATCH_LINEAR_HE_CONTROL") != nullptr &&
+        string(getenv("OURS_VIT_MATCH_LINEAR_HE_CONTROL")) == "1";
     cout << "TRUNCATION_MODE mode=original_blb_interactive" << endl;
     filesystem::create_directories(args.output);
 
@@ -903,6 +915,9 @@ int main(int argc, char **argv) {
             ? ours_vit::HeteroPlan::all_softmax()
             : ours_vit::HeteroPlan::load_file(args.head_plan);
     head_plan.validate(args.version);
+    if (matched_he_control && (args.version != ours_vit::Version::H || head_plan.has_linear() ||
+        !std::all_of(head_plan.layers().begin(), head_plan.layers().end(), [](const ours_vit::LayerPlan &layer) { return std::all_of(layer.heads.begin(), layer.heads.end(), [](const ours_vit::HeadSpec &head) { return head.protocol == ours_vit::HeadProtocol::SoftmaxMpc; }); })))
+      throw invalid_argument("matched HE control requires H with an all-Softmax plan");
     ours_vit::EdgeCloudRuntime edge_cloud(
         args.party,
         {"ours_vit_b16_pre_norm_v1", kLogicalTokens, kPhysicalTokens, kDim,
@@ -941,12 +956,13 @@ int main(int argc, char **argv) {
       blb_model = convert_vit_to_blb_model(vit);
     }
 
+    phase("model_request_preparation", request_start);
     const auto setup_start = chrono::steady_clock::now();
     Bert_ckks bert(args.party, args.port, args.address, backend,
                    edge_cloud.is_cloud() ? &blb_model : nullptr,
                    args.physical_tokens, false,
                    max(1, args.stop_after_block),
-                   head_plan.has_linear());
+                   head_plan.has_linear() || matched_he_control);
     edge_cloud.agree(*bert.io);
     cout << "OURS_EDGE_CLOUD role=" << edge_cloud.role_name()
          << " contract=" << edge_cloud.contract_digest()
@@ -955,6 +971,7 @@ int main(int argc, char **argv) {
         chrono::duration<double>(chrono::steady_clock::now() - setup_start)
             .count();
     bert.io->sync();
+    phase("initial_setup", setup_start);
 
     if (args.party == sci::ALICE) {
       if (vit.tokens != kLogicalTokens || vit.dim != kDim ||
@@ -991,6 +1008,7 @@ int main(int argc, char **argv) {
     bert.io->sync();
     setup_seconds += chrono::duration<double>(chrono::steady_clock::now() -
                                                patch_setup_start).count();
+    phase("embedding_preparation", patch_setup_start);
     uint64_t initialization_bytes = bert.current_comm();
     uint64_t initialization_rounds = bert.current_round();
 
@@ -1249,6 +1267,7 @@ int main(int argc, char **argv) {
         chrono::duration<double>(chrono::steady_clock::now() - online_start)
             .count();
 
+    phase("embedding", online_start);
     vector<int64_t> attention_mask(args.physical_tokens, -10000);
     fill(attention_mask.begin(), attention_mask.begin() + kLogicalTokens, 0);
     bert.set_public_attention_mask(attention_mask);
@@ -1344,6 +1363,20 @@ int main(int argc, char **argv) {
           meta << moduli[i].bit_count();
         }
         meta << '\n';
+        meta << name << "_data_coeff_modulus_values=";
+        for (size_t i = 0; i < moduli.size(); ++i) {
+          if (i) meta << ',';
+          meta << moduli[i].value();
+        }
+        meta << '\n' << name << "_key_coeff_modulus_values=";
+        const auto &key_moduli = he->context->key_context_data()->parms().coeff_modulus();
+        for (size_t i = 0; i < key_moduli.size(); ++i) {
+          if (i) meta << ',';
+          meta << key_moduli[i].value();
+        }
+        meta << '\n' << name << "_first_chain_index="
+             << he->context->first_context_data()->chain_index() << '\n'
+             << name << "_security=tc128\n";
       };
       write_he_context("he1", bert.linear.he1);
       write_he_context("he2", bert.linear.he2);
@@ -1351,6 +1384,8 @@ int main(int argc, char **argv) {
       write_he_context("he4", bert.linear.he4);
       write_he_context("he_softmax", bert.linear.he_softmax);
       write_he_context("he_onetime", bert.linear.he_onetime);
+      meta << "force_generic_all_s=" << execution_observe::force_generic() << "\n";
+      meta << "matched_linear_he_control=" << matched_he_control << "\n";
       meta << "attention_normalization="
            << (args.version == ours_vit::Version::B ? "original_blb_softmax_he_mpc" : "public_plan_selective_mpc_native_linear")
            << '\n'
@@ -1408,11 +1443,14 @@ int main(int argc, char **argv) {
       initialization_bytes += bert.current_comm() - layer_setup_comm0;
       initialization_rounds += bert.current_round() - layer_setup_round0;
       comm.mark("block_" + to_string(layer) + "_offline_preprocessing");
+      phase("block_" + to_string(layer) + "_preparation", layer_setup_start);
 
+      const double optimized_he0=bert.he_compute_la,optimized_mpc0=bert.other_nonlinear_la,optimized_layout0=bert.optimized_layout_s;
       const uint64_t comm0 = bert.current_comm();
       const uint64_t rounds0 = bert.current_round();
       const uint64_t ctpt0 = bert.linear.ct_pt_multiply_count;
       const uint64_t ctct0 = bert.linear.ct_ct_multiply_count;
+      const auto observed_he0 = execution_observe::snapshot();
       const uint64_t rot0 = bert.linear.rotation_count;
       const uint64_t resc0 = bert.linear.rescale_count;
       const uint64_t he_resc0 = bert.he_rescale_count;
@@ -1436,6 +1474,10 @@ int main(int argc, char **argv) {
 
       BlockProfile profile;
       profile.block = layer;
+      const auto block_wall_start = chrono::steady_clock::now();
+      cout << "E2E_FUSION layer=" << layer << " ln1_statistics_source="
+           << (layer == 0 ? "embedding" : "previous_block_ffn2")
+           << " previous_statistics_present=" << !next_ln1_statistics.empty() << endl;
       bert.profile_start(BlbViTProfileStage::LAYERNORM1);
       if (hetero_attention_trace && layer == 0)
         write_hetero_attention_stage(
@@ -1491,6 +1533,7 @@ int main(int argc, char **argv) {
       const uint64_t assignment_comm_start = bert.current_comm();
       const uint64_t assignment_round_start = bert.current_round();
       const double assignment_he_start = bert.he_compute_la;
+      const double assignment_mpc_start = bert.other_nonlinear_la;
       const double assignment_conversion_start = bert.ct_transfer_la;
       const uint64_t assignment_ciphertexts_start = bert.conversion_ciphertexts;
       const uint64_t assignment_ct_pt_start =
@@ -1576,7 +1619,7 @@ int main(int argc, char **argv) {
         if (!bert.b_av_wo_ready)
           throw runtime_error("B AV/W_O observers were not populated");
         const FixArray av = b_projected_tensor_to_token_major(
-            bert.b_av_share, bert.party, args.physical_tokens);
+            bert.b_av_share, bert.party, args.physical_tokens, true);
         write_b_stage(bert, av, "block_" + to_string(layer) + "_av",
                        {kPhysicalTokens, kDim});
         write_b_stage(bert, bert.b_wo_share, "block_" + to_string(layer) + "_wo",
@@ -1595,6 +1638,11 @@ int main(int argc, char **argv) {
             bert, bert.heterogeneous_wo_share, "block_0_wo",
             {kPhysicalTokens, kDim});
       }
+      cout << "OPTIMIZED_ATTENTION_COUNTERS layer=" << layer
+           << " total_s=" << chrono::duration<double>(chrono::steady_clock::now()-assignment_start).count()
+           << " he_s=" << bert.he_compute_la-assignment_he_start
+           << " mpc_s=" << bert.other_nonlinear_la-assignment_mpc_start
+           << " boundary=QKV_QK_through_attention_WO_residual" << endl;
       if (args.version != ours_vit::Version::B) {
         const int softmax_heads = static_cast<int>(count(
             protocols.begin(), protocols.end(),
@@ -1621,11 +1669,7 @@ int main(int argc, char **argv) {
           else
             ++mpc_group_calls;
         }
-        if (!heterogeneous_group_packing) {
-          protocol_groups = static_cast<int>(protocols.size());
-          mpc_group_calls = softmax_heads + relu_heads;
-          native_linear_groups = linear_heads;
-        }
+        // Operator grouping is contiguous; selective conversion grouping is unchanged.
         cout << fixed << setprecision(6)
              << "OURS_HETERO_ASSIGNMENT_PROFILE status=PASS"
              << " version=" << ours_vit::to_string(args.version)
@@ -1688,13 +1732,15 @@ int main(int argc, char **argv) {
       FixArray ln2_b = input_layernorm_share(
           bert, bert.linear.b_ln_2, layer, args.physical_tokens, kDim);
       auto ln2 = edge_cloud.execute_node(layer, "ln2", [&]() {
-        if (args.version != ours_vit::Version::B)
-          return bert.layer_norm_part1_real(hidden, ln2_w, ln2_b);
         attention_result["w"] = ln2_w;
         attention_result["b"] = ln2_b;
         return bert.layer_norm_nonlinear(attention_result);
       });
       mask_layernorm_padding(ln2, "block_" + to_string(layer) + "_ln2");
+      if (b_trace) {
+        write_b_stage(bert, ln2.at("x_flat_avg"), "block_" + to_string(layer) + "_ln2_centered", {kPhysicalTokens, kDim});
+        write_b_stage(bert, ln2.at("sigma_flat"), "block_" + to_string(layer) + "_ln2_sigma", {kPhysicalTokens, kDim});
+      }
       profile.nonlinear_layernorm_bucket_ms += chrono::duration<double, milli>(
           chrono::steady_clock::now() - ln2_start).count();
       comm.mark("block_" + to_string(layer) + "_layer_norm_2");
@@ -1758,6 +1804,14 @@ int main(int argc, char **argv) {
       comm.mark("block_" + to_string(layer) + "_ffn2");
 
       bert.profile_stop();
+      phase("block_" + to_string(layer), block_wall_start);
+      const auto observed_he1 = execution_observe::snapshot();
+      cout << "HE_API_COUNTS layer=" << layer
+           << " rotations=" << observed_he1[0]-observed_he0[0]
+           << " ct_ct_multiply_including_square=" << observed_he1[1]-observed_he0[1]
+           << " ct_pt_multiply=" << observed_he1[2]-observed_he0[2]
+           << " conjugations=" << observed_he1[3]-observed_he0[3] << endl;
+      cout<<"OPTIMIZED_BLOCK_COUNTERS layer="<<layer<<" he_s="<<setprecision(17)<<bert.he_compute_la-optimized_he0<<" mpc_nonlinear_s="<<bert.other_nonlinear_la-optimized_mpc0<<" layout_s="<<bert.optimized_layout_s-optimized_layout0<<endl;
       profile.block_online_time_ms = 0.0;
       profile.block_online_comm_bytes = 0;
       for (size_t stage_index = 0;
@@ -1936,6 +1990,7 @@ int main(int argc, char **argv) {
         next_ln1_statistics["b"] = final_b;
         final_ln = bert.layer_norm_nonlinear(next_ln1_statistics);
       }
+      cout << "E2E_FINAL_LN statistics_source=last_block_ffn2 available=" << !next_ln1_statistics.empty() << endl;
       mask_layernorm_padding(final_ln, "final_ln");
       hidden = bert.layer_norm_affine_ckks(final_ln);
       if (b_trace)
@@ -1950,6 +2005,7 @@ int main(int argc, char **argv) {
                                                final_ln_start)
                       .count()
            << endl;
+      phase("final_ln", final_ln_start);
     } else {
       comm.mark("diagnostic_skip_final_layer_norm");
       cout << "OURS_B_DIAGNOSTIC stage=final_layer_norm status=SKIPPED"
@@ -2010,6 +2066,7 @@ int main(int argc, char **argv) {
     initialization_bytes += bert.current_comm() - classifier_setup_comm0;
     initialization_rounds += bert.current_round() - classifier_setup_round0;
     comm.mark("classifier_offline_preprocessing");
+    phase("classifier_preparation", classifier_setup_start);
     const auto classifier_start = chrono::steady_clock::now();
     FixArray all_logits = bert.linear2_from_mpc(
         hidden, classifier_params, classifier_metadata, kLayers);
@@ -2054,6 +2111,8 @@ int main(int argc, char **argv) {
     comm.mark("pooling_classification");
     secure_protocol_seconds += chrono::duration<double>(
         chrono::steady_clock::now() - classifier_start).count();
+    phase("classifier", classifier_start);
+    phase("online_envelope_including_layer_preparation", online_start);
     const double secure_seconds = secure_protocol_seconds;
     const uint64_t online_bytes = bert.current_comm() - initialization_bytes;
     const uint64_t online_rounds = bert.current_round() - initialization_rounds;

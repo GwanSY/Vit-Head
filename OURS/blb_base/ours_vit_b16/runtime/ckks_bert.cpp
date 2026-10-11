@@ -1,3 +1,4 @@
+#include "mhp_candidate.h"
 // clang-format off
 /*
 Authors: Deevashwer Rathee
@@ -24,6 +25,7 @@ SOFTWARE.
 // #include "BuildingBlocks/aux-protocols.h"
 // #include "NonLinear/argmax.h"
 #include "ckks_bert.h"
+#include "fusion_observer.h"
 #include "ckks_bert_basic.cpp"
 #include "nvtx3/nvToolsExt.h"
 #include <cmath>
@@ -161,9 +163,9 @@ void import_target_scale(Bert_ckks &owner,
         owner.profile_set_conversion_bucket(
             BlbViTCommAuditBucket::SOFTMAX_TO_CKKS_CONVERSION);
     }
-    vector<Plaintext> host_plaintexts = owner.mpc_to_ckks(
+    vector<Plaintext> host_plaintexts = fusion_observe::call(__func__,__LINE__,"shares",[&](){return owner.mpc_to_ckks(
         shares, slot, he->get_conversion_prime(), ell, input_scale,
-        target_scale, he, false, false); // HE rounding does not prove MSB=0.
+        target_scale, he, false, false);}); // HE rounding does not prove MSB=0.
     owner.profile_set_conversion_bucket(previous_conversion_bucket);
     const auto first_data = he->context->first_context_data();
     if (host_plaintexts.empty() || !first_data) {
@@ -208,8 +210,8 @@ void import_broadcast_scale(
     for (const auto &share : shares)
         if (share != shares.front())
             throw runtime_error(string("invalid LayerNorm broadcast layout: ") + stage);
-    import_target_scale(owner, {shares.front()}, slot, ell, input_scale,
-                        target_scale, he, destination, stage);
+    fusion_observe::call(__func__,__LINE__,"owner",[&](){return import_target_scale(owner, {shares.front()}, slot, ell, input_scale,
+                        target_scale, he, destination, stage);});
     const UnifiedPlaintext prototype = destination.front();
     destination.resize(shares.size(), prototype);
     cout << "FORMAL_BROADCAST_IMPORT stage=" << stage
@@ -277,7 +279,7 @@ void lift_unified_with_actual_one(Linear_ckks &linear, HE_CKKS *he,
                             ciphertexts.front().hcipher().parms_id(),
                             unit_scale, unit_plain);
         for (auto &ciphertext : ciphertexts) {
-            he->evaluator->multiply_plain_inplace(ciphertext, unit_plain);
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(ciphertext, unit_plain);});
         }
     } else if (location == LOCATION::DEVICE) {
         const auto chain_index =
@@ -285,7 +287,7 @@ void lift_unified_with_actual_one(Linear_ckks &linear, HE_CKKS *he,
         he->dencoder->encode(*he->dcontext, public_one, unit_scale,
                              unit_plain, chain_index);
         for (auto &ciphertext : ciphertexts) {
-            he->devaluator->multiply_plain_inplace(ciphertext, unit_plain);
+            execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(ciphertext, unit_plain);});
         }
     } else {
         throw runtime_error("formal actual-one lift backend is invalid");
@@ -404,8 +406,8 @@ void prepare_host_conversion_from_actual_scale(
             Plaintext per_ciphertext_unit;
             he->encoder->encode(public_one, ciphertext.parms_id(),
                                 unit_scale, per_ciphertext_unit);
-            he->evaluator->multiply_plain_inplace(ciphertext,
-                                                  per_ciphertext_unit);
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(ciphertext,
+                                                  per_ciphertext_unit);});
         }
         owner.linear.ct_pt_multiply_count += ciphertexts.size();
         upward_actual_one_lift = true;
@@ -440,6 +442,7 @@ void prepare_host_conversion_from_actual_scale(
 // and reveals no value.
 FixArray token_major_to_feature_major(const FixArray &input, int tokens,
                                       int features, const char *stage) {
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
     if (tokens <= 0 || features <= 0 ||
         input.size != tokens * features) {
         throw runtime_error(string("formal token/feature layout mismatch: ") +
@@ -458,6 +461,7 @@ FixArray token_major_to_feature_major(const FixArray &input, int tokens,
 
 FixArray feature_major_to_token_major(const FixArray &input, int tokens,
                                       int features, const char *stage) {
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
     if (tokens <= 0 || features <= 0 ||
         input.size != tokens * features) {
         throw runtime_error(string("formal feature/token layout mismatch: ") +
@@ -503,6 +507,7 @@ void require_bsgs_output_layout(const FixArray &input,
 FixArray token_major_to_bsgs_output(const FixArray &input,
                                     const FCMetadata &data,
                                     const char *stage) {
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
     require_bsgs_output_layout(input, data, stage);
     const int tokens = data.image_size;
     const int features = data.filter_w;
@@ -529,6 +534,7 @@ FixArray token_major_to_bsgs_output(const FixArray &input,
 FixArray bsgs_output_to_token_major(const FixArray &input,
                                     const FCMetadata &data,
                                     const char *stage) {
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
     require_bsgs_output_layout(input, data, stage);
     const int tokens = data.image_size;
     const int features = data.filter_w;
@@ -691,7 +697,7 @@ FixArray bsgs_output_to_token_major(const FixArray &input,
 vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
     std::map<char*,FixArray> input, int layer_id){
     // mult. depth = 4
-    auto start = high_resolution_clock::now();
+    auto start = steady_clock::now();
     const bool raw_input = input.size() == 1 && input.begin()->first != nullptr &&
                            string(input.begin()->first) == "raw_input";
     // The BERT Figure-10 path uses x+y*j half packing. ViT's pre-norm path
@@ -824,7 +830,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
     vector<Plaintext> raw_v_pts(raw_v_cts.size());
     const bool selective_conversion =
         ordinary_full_slot_output && !raw_input &&
-        heterogeneous_version != ours_vit::Version::B;
+        heterogeneous_version != ours_vit::Version::B &&
+        (execution_observe::force_generic() ||
+         std::any_of(heterogeneous_protocols.begin(),heterogeneous_protocols.end(),
+                     [](ours_vit::HeadProtocol p){return p!=ours_vit::HeadProtocol::SoftmaxMpc;}));
     struct SelectiveGroupConversion {
         ours_vit::HeadProtocol protocol;
         int head_begin = 0;
@@ -843,16 +852,8 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             throw runtime_error(
                 "heterogeneous selective QKV conversion has no public assignment");
         }
-        const size_t ciphertexts_per_pair =
-            qk_ct_count / (PACKING_NUM / 2);
-        const size_t v_ciphertexts_per_pair =
-            v_ct_count / (PACKING_NUM / 2);
-        if (qk_ct_count % (PACKING_NUM / 2) != 0 ||
-            v_ct_count % (PACKING_NUM / 2) != 0 ||
-            ciphertexts_per_pair == 0 || v_ciphertexts_per_pair == 0) {
-            throw runtime_error(
-                "heterogeneous QK/V head-pair ciphertext layout is invalid");
-        }
+        const size_t ciphertexts_per_pair = qk_ct_count / 3;
+        const size_t v_ciphertexts_per_pair = v_ct_count / 3;
         for (int begin = 0; begin < PACKING_NUM;) {
             int end = begin + 1;
             while (heterogeneous_group_packing_enabled &&
@@ -867,29 +868,11 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 group.protocol = heterogeneous_protocols[begin];
                 group.head_begin = begin;
                 group.head_end = end;
-                for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-                    const bool first = 2 * pair >= begin && 2 * pair < end;
-                    const bool second = 2 * pair + 1 >= begin &&
-                                        2 * pair + 1 < end;
-                    if (first || second) {
-                        for (size_t local = 0;
-                             local < ciphertexts_per_pair; ++local) {
-                            group.qk_indices.push_back(
-                                pair * ciphertexts_per_pair + local);
-                        }
-                    }
-                }
-                for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-                    const bool first = 2 * pair >= begin && 2 * pair < end;
-                    const bool second = 2 * pair + 1 >= begin &&
-                                        2 * pair + 1 < end;
-                    if (first || second) {
-                        for (size_t local = 0;
-                             local < v_ciphertexts_per_pair; ++local) {
-                            group.v_indices.push_back(
-                                pair * v_ciphertexts_per_pair + local);
-                        }
-                    }
+                for (int g = begin / 4; g <= (end - 1) / 4; ++g) {
+                    for (size_t k=0; k<ciphertexts_per_pair; ++k)
+                        group.qk_indices.push_back(g*ciphertexts_per_pair+k);
+                    for (size_t k=0; k<v_ciphertexts_per_pair; ++k)
+                        group.v_indices.push_back(g*v_ciphertexts_per_pair+k);
                 }
                 group.qk_cts.resize(group.qk_indices.size());
                 group.v_cts.resize(group.v_indices.size());
@@ -924,9 +907,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         raw_input || pre_norm_attention_output_only ? 0 : num_cts / 2);
     cout << this->get_comm() << endl;
     cout << this->get_round() << endl;
-    this->he_compute_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    execution_observe::interval("CKKS",__func__,__LINE__,start);
+    this->he_compute_la += ((steady_clock::now() - start)).count()/1e+9;
     
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     // For the post-norm layer-0 entry, main has already applied BERT's real
     // x_scale[0] transition (s12 -> s5) with secure truncate_reduce.  The
     // official BLB path imports this tensor at he1's Table-6 scale.  The
@@ -953,30 +937,30 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
              << " source=table6_he1_scale" << endl;
     }
     if (raw_input) {
-        mpc_to_ckks(pts_x_flat_avg, vec_x_flat_avg, slot_count,
+        fusion_observe::call(__func__,__LINE__,"pts_x_flat_avg",[&](){return mpc_to_ckks(pts_x_flat_avg, vec_x_flat_avg, slot_count,
                     he->get_conversion_prime(),
-                    bitwidth, s, x_ckks_scale_bits, he);
+                    bitwidth, s, x_ckks_scale_bits, he);});
     } else {
-        mpc_to_ckks(pts_x_flat_avg, vec_x_flat_avg, slot_count,
+        fusion_observe::call(__func__,__LINE__,"pts_x_flat_avg",[&](){return mpc_to_ckks(pts_x_flat_avg, vec_x_flat_avg, slot_count,
                     he->get_conversion_prime(),
-                    bitwidth, s, x_ckks_scale_bits, he);
+                    bitwidth, s, x_ckks_scale_bits, he);});
     }
     // MARK: Can be parallel
     // cout << "mpc_to_ckks1 comm:" << this->get_comm() << endl;
     // cout << "mpc_to_ckks1 round:" << this->get_round() << endl;
     if (!raw_input) {
         if (pre_norm_attention_output_only) {
-            import_broadcast_scale(*this, vec_sigma_flat, slot_count, bitwidth,
-                s, he->he_scale, he, pts_sigma_flat, "qkv_inv_sigma_input");
+            fusion_observe::call(__func__,__LINE__,"*this:qkv_inv_sigma_input",[&](){return import_broadcast_scale(*this, vec_sigma_flat, slot_count, bitwidth,
+                s, he->he_scale, he, pts_sigma_flat, "qkv_inv_sigma_input");});
         } else {
-            mpc_to_ckks(pts_sigma_flat, vec_sigma_flat, slot_count,
+            fusion_observe::call(__func__,__LINE__,"pts_sigma_flat",[&](){return mpc_to_ckks(pts_sigma_flat, vec_sigma_flat, slot_count,
                     he->get_conversion_prime(),
-                    bitwidth, s, he->he_scale, he);
+                    bitwidth, s, he->he_scale, he);});
         }
     }
     // cout << "mpc_to_ckks2 comm:" << this->get_comm() << endl;
     // cout << "mpc_to_ckks2 round:" << this->get_round() << endl;
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     
@@ -1003,9 +987,9 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         cout << "send_encrypted_vector" << endl;
 			// test_util();
         if (!use_bert_half_packing) {
-            he->encrypt_send(pts_x_flat_avg, cts_x_flat_full);
+            fusion_observe::encrypt_send(he,pts_x_flat_avg, cts_x_flat_full,__func__,__LINE__);
             if (!raw_input)
-                he->encrypt_send(pts_sigma_flat, cts_sigma_flat_full);
+                fusion_observe::encrypt_send(he,pts_sigma_flat, cts_sigma_flat_full,__func__,__LINE__);
             cout << (raw_input ? "RAW_INPUT_TRANSFER_LAYOUT"
                                : "FORMAL_TRANSFER_LAYOUT stage=ln_attention_input")
                  << " status=PASS layout=ordinary_full_slot cts="
@@ -1023,6 +1007,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 recv_encrypted_vector(he->context, io, raw_qk_cts);
             } else if (selective_conversion) {
                 for (auto &group : selective_groups) {
+                    fusion_observe::Context group_context(fusion_observe::public_heads,
+                        "head_begin="+std::to_string(group.head_begin)+" head_end="+std::to_string(group.head_end)+
+                        " qk_indices="+[&](){std::string x;for(auto i:group.qk_indices)x+=(x.empty()?"":",")+std::to_string(i);return x;}()+
+                        " v_indices="+[&](){std::string x;for(auto i:group.v_indices)x+=(x.empty()?"":",")+std::to_string(i);return x;}());
                     recv_encrypted_vector(he->context, io, group.qk_cts);
                     recv_encrypted_vector(he->context, io, group.v_cts);
                     #pragma omp parallel for
@@ -1139,7 +1127,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             raw_input ? 0 : pts_sigma_flat.size(), UnifiedCiphertext(loc));
         
         // Revice ciphertexts from BOB (or clinet)
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         if (!use_bert_half_packing) {
             recv_encrypted_vector(he->context, io, cts_x_flat_full);
             if (!raw_input)
@@ -1149,12 +1137,12 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             recv_encrypted_vector(he->context, io, cts_x_flat_half);
             recv_encrypted_vector(he->context, io, cts_sigma_flat_half);
         }
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
         
         NVTX_PUSH("LN2-ATT", true);
         if (he->is_gpu_enable()) {
             // Load reviced ciphertexts to GPU
-            start = high_resolution_clock::now();
+            start = steady_clock::now();
             if (!use_bert_half_packing) {
                 for_each_n(cts_x_flat_full.begin(), cts_x_flat_full.size(),
                         [he](auto &ct) { ct.to_device(*he->context, *he->dcontext); });
@@ -1177,10 +1165,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 for_each_n(pts_sigma_flat.begin(), pts_sigma_flat.size(),
                         [he](auto &pt) { pt.to_device(*he->context, *he->dcontext); });
             }
-            this->ct_transfer_mem_la += ((high_resolution_clock::now() - start)).count() / 1e+9;
+            this->ct_transfer_mem_la += ((steady_clock::now() - start)).count() / 1e+9;
         }
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         if (!use_bert_half_packing) {
             for (size_t i = 0; i < cts_x_flat_full.size(); ++i) {
                 cts_x_flat[i] = std::move(cts_x_flat_full[i]);
@@ -1277,10 +1265,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 if (!use_bert_half_packing) {
                     UnifiedCiphertext x_conjugate(LOCATION::HOST);
                     UnifiedCiphertext sigma_conjugate(LOCATION::HOST);
-                    he->evaluator->complex_conjugate(
-                        cts_x_flat[i], *he->gal_keys, x_conjugate);
-                    he->evaluator->complex_conjugate(
-                        cts_sigma_flat[i], *he->gal_keys, sigma_conjugate);
+                    execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(
+                        cts_x_flat[i], *he->gal_keys, x_conjugate);});
+                    execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(
+                        cts_sigma_flat[i], *he->gal_keys, sigma_conjugate);});
                     he->evaluator->add_inplace(cts_x_flat[i], x_conjugate);
                     he->evaluator->add_inplace(cts_sigma_flat[i],
                                                sigma_conjugate);
@@ -1290,10 +1278,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 // ciphertext product first; applying w first raises x's
                 // scale and makes the subsequent ciphertext multiplication
                 // invalid.  This is the paper's (x*sigma)*w+b order.
-                he->evaluator->multiply_inplace(cts_x_flat[i], cts_sigma_flat[i]);
+                execution_observe::he_call(1,[&](){return he->evaluator->multiply_inplace(cts_x_flat[i], cts_sigma_flat[i]);});
                 he->evaluator->relinearize_inplace(cts_x_flat[i],
                                                    *he->relin_keys);
-                he->evaluator->multiply_plain_inplace(cts_x_flat[i], tmp_w[i]);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(cts_x_flat[i], tmp_w[i]);});
                 he->evaluator->add_plain_inplace(cts_x_flat[i], tmp_b[i]);
                 ++this->he_rescale_count;
                 he->evaluator->rescale_to_next_inplace(cts_x_flat[i]);
@@ -1303,20 +1291,20 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 if (!use_bert_half_packing) {
                     UnifiedCiphertext x_conjugate(LOCATION::DEVICE);
                     UnifiedCiphertext sigma_conjugate(LOCATION::DEVICE);
-                    he->devaluator->complex_conjugate(
-                        cts_x_flat[i], *he->dgal_keys, x_conjugate);
-                    he->devaluator->complex_conjugate(
+                    execution_observe::he_call(3,[&](){return he->devaluator->complex_conjugate(
+                        cts_x_flat[i], *he->dgal_keys, x_conjugate);});
+                    execution_observe::he_call(3,[&](){return he->devaluator->complex_conjugate(
                         cts_sigma_flat[i], *he->dgal_keys,
-                        sigma_conjugate);
+                        sigma_conjugate);});
                     he->devaluator->add_inplace(cts_x_flat[i], x_conjugate);
                     he->devaluator->add_inplace(cts_sigma_flat[i],
                                                 sigma_conjugate);
                 }
 
-                he->devaluator->multiply_inplace(cts_x_flat[i], cts_sigma_flat[i]);
+                execution_observe::he_call(1,[&](){return he->devaluator->multiply_inplace(cts_x_flat[i], cts_sigma_flat[i]);});
                 he->devaluator->relinearize_inplace(cts_x_flat[i],
                                                     *he->drelin_keys);
-                he->devaluator->multiply_plain_inplace(cts_x_flat[i], tmp_w[i]);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(cts_x_flat[i], tmp_w[i]);});
 
                 he->devaluator->add_plain_inplace(cts_x_flat[i], tmp_b[i]);
                 ++this->he_rescale_count;
@@ -1385,9 +1373,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 linear.pp_1[layer_id],
                 data,
                 q_k_v,
-                b_trace && !raw_input ? &b_qkv_ciphertexts : nullptr
+                (b_trace || (linear.native_linear_enabled && selective_conversion)) && !raw_input ? &b_qkv_ciphertexts : nullptr
             );
         }
+        if(linear.native_linear_enabled && selective_conversion) optimized_native_qkv=b_qkv_ciphertexts;
         cout << "qkv_scale:" << log2(q_k_v[0].scale()) << endl;
         /*
             before rescale, ct scale=145, Q=(60,55,60)
@@ -1397,7 +1386,8 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         cout << "scale:" << log2(q_k_v[0].scale()) << endl;
         cout << "num of output cts:" << q_k_v.size() << endl;
         cout << "bitwidth of output ct:" << q_k_v[0].coeff_modulus_size() << endl;
-        this->he_compute_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        execution_observe::interval("CKKS",__func__,__LINE__,start);
+    this->he_compute_la += ((steady_clock::now() - start)).count()/1e+9;
         
         if (q_k_v.size() != output_ct_count) {
             throw runtime_error("formal QK/V ciphertext count mismatch");
@@ -1422,7 +1412,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         }
         // Load result ciphertexts to CPU.  Algorithm 1 samples masks in the
         // host SEAL RNS ring, but no ciphertext is decrypted on the evaluator.
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         if (ordinary_full_slot_output) {
             for (size_t i = 0; i < output_ct_count; ++i) {
                 if (he->is_gpu_enable()) {
@@ -1518,83 +1508,20 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 Plaintext mask_pt;
                 he->encoder->encode(mask, ciphertext.parms_id(), 1.0,
                                     mask_pt);
-                he->evaluator->multiply_plain_inplace(ciphertext, mask_pt);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(ciphertext, mask_pt);});
                 ++linear.ct_pt_multiply_count;
             };
 
-            if (linear.native_linear_enabled) {
-                native_linear_qk_he1_cts.assign(
-                    qk_ct_count, UnifiedCiphertext(LOCATION::HOST));
-                native_linear_v_he1_cts.assign(
-                    v_ct_count, UnifiedCiphertext(LOCATION::HOST));
-                for (size_t index = 0; index < qk_ct_count; ++index) {
-                    const int pair = static_cast<int>(
-                        index / ciphertexts_per_pair);
-                    const bool first = heterogeneous_protocols[2 * pair] ==
-                        ours_vit::HeadProtocol::HeLinear;
-                    const bool second =
-                        heterogeneous_protocols[2 * pair + 1] ==
-                        ours_vit::HeadProtocol::HeLinear;
-                    if (!first && !second) continue;
-                    native_linear_qk_he1_cts[index].hcipher() =
-                        raw_qk_cts[index];
-                    mask_pair_halves(
-                        native_linear_qk_he1_cts[index].hcipher(), index,
-                        ciphertexts_per_pair, true, true,
-                        [&](int head) {
-                            return heterogeneous_protocols[head] ==
-                                   ours_vit::HeadProtocol::HeLinear;
-                        }, "NATIVE QK half mask");
-                }
-                for (size_t index = 0; index < v_ct_count; ++index) {
-                    const int pair = static_cast<int>(
-                        index / v_ciphertexts_per_pair);
-                    const bool first = heterogeneous_protocols[2 * pair] ==
-                        ours_vit::HeadProtocol::HeLinear;
-                    const bool second = heterogeneous_protocols[2 * pair + 1] ==
-                        ours_vit::HeadProtocol::HeLinear;
-                    if (!first && !second) continue;
-                    native_linear_v_he1_cts[index].hcipher() = raw_v_cts[index];
-                    mask_pair_halves(
-                        native_linear_v_he1_cts[index].hcipher(), index,
-                        v_ciphertexts_per_pair, false, true,
-                        [&](int head) {
-                            return heterogeneous_protocols[head] ==
-                                   ours_vit::HeadProtocol::HeLinear;
-                        }, "NATIVE V half mask");
-                }
-                native_linear_operands_ready = true;
-            } else {
-                native_linear_qk_he1_cts.clear();
-                native_linear_v_he1_cts.clear();
-                native_linear_operands_ready = false;
-            }
-
+            native_linear_operands_ready = linear.native_linear_enabled;
             for (auto &group : selective_groups) {
-                for (size_t local = 0; local < group.qk_indices.size();
-                     ++local) {
-                    const size_t index = group.qk_indices[local];
-                    group.qk_cts[local] = raw_qk_cts[index];
-                    mask_pair_halves(
-                        group.qk_cts[local], index,
-                        ciphertexts_per_pair, true, false,
-                        [&](int head) {
-                            return head >= group.head_begin &&
-                                   head < group.head_end;
-                        }, "SELECTIVE grouped QK half mask");
-                }
-                for (size_t local = 0; local < group.v_indices.size();
-                     ++local) {
-                    const size_t index = group.v_indices[local];
-                    group.v_cts[local] = raw_v_cts[index];
-                    mask_pair_halves(
-                        group.v_cts[local], index,
-                        v_ciphertexts_per_pair, false, false,
-                        [&](int head) {
-                            return head >= group.head_begin &&
-                                   head < group.head_end;
-                        }, "SELECTIVE grouped V half mask");
-                }
+                    fusion_observe::Context group_context(fusion_observe::public_heads,
+                        "head_begin="+std::to_string(group.head_begin)+" head_end="+std::to_string(group.head_end)+
+                        " qk_indices="+[&](){std::string x;for(auto i:group.qk_indices)x+=(x.empty()?"":",")+std::to_string(i);return x;}()+
+                        " v_indices="+[&](){std::string x;for(auto i:group.v_indices)x+=(x.empty()?"":",")+std::to_string(i);return x;}());
+                for (size_t i=0;i<group.qk_indices.size();++i)
+                    group.qk_cts[i]=raw_qk_cts[group.qk_indices[i]];
+                for (size_t i=0;i<group.v_indices.size();++i)
+                    group.v_cts[i]=raw_v_cts[group.v_indices[i]];
             }
             cout << "OURS_SELECTIVE_QKV_PARTITION status=PASS layer=" << layer_id
                  << " mpc_groups=" << selective_groups.size()
@@ -1602,7 +1529,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                  << count(heterogeneous_protocols.begin(),
                           heterogeneous_protocols.end(),
                           ours_vit::HeadProtocol::HeLinear)
-                 << " qk_pair_half_mask=1 v_pair_half_mask=1"
+                 << " qk_pair_half_mask=0 v_pair_half_mask=0 local_share_selection=1"
                  << " mpc_logical_padding_mask=normalization_output"
                  << " linear_logical_padding_mask=1"
                  << " retained_he1="
@@ -1611,13 +1538,13 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
         }
         if (he->is_gpu_enable()) {
             this->ct_transfer_mem_la +=
-                ((high_resolution_clock::now() - start)).count()/1e+9;
+                ((steady_clock::now() - start)).count()/1e+9;
         }
         NVTX_POP(true);
 
         // BLB Algorithm 1: mask in the current RNS ring before sending. The
         // evaluator keeps -r as its field-to-ring input share.
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         if (ordinary_full_slot_output) {
             if (qkv_only_diagnostic) {
                 prepare_host_conversion_from_actual_scale(
@@ -1629,6 +1556,10 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 size_t qk_sent = 0;
                 size_t v_sent = 0;
                 for (auto &group : selective_groups) {
+                    fusion_observe::Context group_context(fusion_observe::public_heads,
+                        "head_begin="+std::to_string(group.head_begin)+" head_end="+std::to_string(group.head_end)+
+                        " qk_indices="+[&](){std::string x;for(auto i:group.qk_indices)x+=(x.empty()?"":",")+std::to_string(i);return x;}()+
+                        " v_indices="+[&](){std::string x;for(auto i:group.v_indices)x+=(x.empty()?"":",")+std::to_string(i);return x;}());
                     prepare_host_conversion_from_actual_scale(
                         *this, group.qk_cts,
                         kFormalConversionScaleBits, he,
@@ -1654,7 +1585,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                          << group.head_end - group.head_begin
                          << " qk_ciphertexts=" << group.qk_cts.size()
                          << " v_ciphertexts=" << group.v_cts.size()
-                         << " packing_granularity=head_pair_half_mask"
+                         << " packing_granularity=existing_MHP_four_head_slots"
                          << endl;
                 }
                 cout << "FORMAL_QKV_CONVERSION_LAYOUT status=PASS"
@@ -1747,12 +1678,12 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                 send_encrypted_vector(io, b_v_cts);
             }
         }
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
     }
     if (ordinary_full_slot_output) {
         attention_v_he_ready = false;
     }
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     this->ct_transfer_comm += this->get_comm();
     this->ct_transfer_round += this->get_round();
     // cout << "send and receive comm:" << this->get_comm() << endl;
@@ -1760,9 +1691,9 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
     // he->print_parameters(he->context->get_context_data(output_pts[0].parms_id())->parms());
     vector<vector<HE_CKKS::scalar_t>> output_vector;
     if (!raw_input && !pre_norm_attention_output_only) {
-        auto normalized_input_vector = ckks_to_mpc(
+        auto normalized_input_vector = fusion_observe::call(__func__,__LINE__,"normalized_input_pts",[&](){return ckks_to_mpc(
             normalized_input_pts, degree, he->get_Q(normalized_input_pts[0]),
-            NL_ELL, NL_SCALE, he, true);
+            NL_ELL, NL_SCALE, he, true);});
         attention_input_residual_share = FixArray(
             party, static_cast<int>(x_flat_avg.size), true, NL_ELL, NL_SCALE);
         size_t normalized_offset = 0;
@@ -1791,9 +1722,9 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
     }
     if (ordinary_full_slot_output) {
         if (qkv_only_diagnostic) {
-            output_vector = ckks_to_mpc(
+            output_vector = fusion_observe::call(__func__,__LINE__,"raw_qk_pts",[&](){return ckks_to_mpc(
                 raw_qk_pts, degree, he->get_Q(raw_qk_pts[0]), NL_ELL,
-                ATTENTION_V_SCALE, he, false);
+                ATTENTION_V_SCALE, he, false);});
         } else if (selective_conversion) {
             output_vector.assign(
                 qk_ct_count + v_ct_count,
@@ -1802,18 +1733,22 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             const auto previous_conversion_bucket =
                 profile_conversion_bucket();
             for (auto &group : selective_groups) {
+                    fusion_observe::Context group_context(fusion_observe::public_heads,
+                        "head_begin="+std::to_string(group.head_begin)+" head_end="+std::to_string(group.head_end)+
+                        " qk_indices="+[&](){std::string x;for(auto i:group.qk_indices)x+=(x.empty()?"":",")+std::to_string(i);return x;}()+
+                        " v_indices="+[&](){std::string x;for(auto i:group.v_indices)x+=(x.empty()?"":",")+std::to_string(i);return x;}());
                 profile_set_conversion_bucket(
                     BlbViTCommAuditBucket::QK_TO_SOFTMAX_CONVERSION);
-                auto qk_group = ckks_to_mpc(
+                auto qk_group = fusion_observe::call(__func__,__LINE__,"group.qk_pts",[&](){return ckks_to_mpc(
                     group.qk_pts, degree,
                     he->get_Q(group.qk_pts.front()), NL_ELL, NL_SCALE,
-                    he, false);
+                    he, false);});
                 profile_set_conversion_bucket(
                     BlbViTCommAuditBucket::OTHER_CONVERSION);
-                auto v_group = ckks_to_mpc(
+                auto v_group = fusion_observe::call(__func__,__LINE__,"group.v_pts",[&](){return ckks_to_mpc(
                     group.v_pts, degree,
                     he->get_Q(group.v_pts.front()), NL_ELL,
-                    ATTENTION_V_SCALE, he, false);
+                    ATTENTION_V_SCALE, he, false);});
                 if (qk_group.size() != group.qk_indices.size() ||
                     v_group.size() != group.v_indices.size()) {
                     throw runtime_error(
@@ -1823,6 +1758,8 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                     auto &target = output_vector[group.qk_indices[local]];
                     for (size_t slot_index = 0;
                          slot_index < target.size(); ++slot_index) {
+                        const int head=(group.qk_indices[local]/16)*4+(slot_index/256)%4;
+                        if(head<group.head_begin || head>=group.head_end) continue;
                         target[slot_index] =
                             (target[slot_index] +
                              qk_group[local][slot_index]) & ring_mask;
@@ -1833,6 +1770,8 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
                         qk_ct_count + group.v_indices[local]];
                     for (size_t slot_index = 0;
                          slot_index < target.size(); ++slot_index) {
+                        const int head=(group.v_indices[local]/4)*4+(slot_index/256)%4;
+                        if(head<group.head_begin || head>=group.head_end) continue;
                         target[slot_index] =
                             (target[slot_index] +
                              v_group[local][slot_index]) & ring_mask;
@@ -1850,29 +1789,29 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
             const auto previous_conversion_bucket = profile_conversion_bucket();
             profile_set_conversion_bucket(
                 BlbViTCommAuditBucket::QK_TO_SOFTMAX_CONVERSION);
-            output_vector = ckks_pairs_to_mpc(
-                raw_qk_pts, qk_ct_count, NL_ELL, NL_SCALE, he);
+            output_vector = fusion_observe::call(__func__,__LINE__,"raw_qk_pts",[&](){return ckks_pairs_to_mpc(
+                raw_qk_pts, qk_ct_count, NL_ELL, NL_SCALE, he);});
             profile_set_conversion_bucket(
                 BlbViTCommAuditBucket::OTHER_CONVERSION);
-            auto v_vector = ckks_pairs_to_mpc(
-                raw_v_pts, v_ct_count, NL_ELL, ATTENTION_V_SCALE, he);
+            auto v_vector = fusion_observe::call(__func__,__LINE__,"raw_v_pts",[&](){return ckks_pairs_to_mpc(
+                raw_v_pts, v_ct_count, NL_ELL, ATTENTION_V_SCALE, he);});
             output_vector.insert(output_vector.end(),
                                  make_move_iterator(v_vector.begin()),
                                  make_move_iterator(v_vector.end()));
             profile_set_conversion_bucket(previous_conversion_bucket);
         }
     } else {
-        output_vector = ckks_to_mpc(output_pts_half, degree,
+        output_vector = fusion_observe::call(__func__,__LINE__,"output_pts_half",[&](){return ckks_to_mpc(output_pts_half, degree,
                                     he->get_Q(output_pts_half[0]), bitwidth, s,
-                                    he, true);
+                                    he, true);});
     }
     if (b_trace && !raw_input) {
         auto observer_to_fix = [&](const vector<Plaintext> &points,
                                    int fixed_scale,
                                    const char *stage) -> FixArray {
-            auto pieces = ckks_to_mpc(
+            auto pieces = fusion_observe::call(__func__,__LINE__,"points",[&](){return ckks_to_mpc(
                 points, degree, he->get_Q(points[0]), NL_ELL, fixed_scale,
-                he, false);
+                he, false);});
             const size_t expected =
                 projected_tensor_ct_count * static_cast<size_t>(slot_count);
             FixArray result(party, static_cast<int>(expected), true, NL_ELL,
@@ -1902,7 +1841,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
              << " v_elements=" << b_v_share.size
              << " production_path=0 intermediate_reconstruction=1" << endl;
     }
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     // cout << "ckks_to_mpc comm:" << this->get_comm() << endl;
     // cout << "ckks_to_mpc round:" << this->get_round() << endl;
     this->conversion_comm += this->get_comm();
@@ -1910,906 +1849,103 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::layer_norm_part2_attention(
     return output_vector;
 }
 
-vector<vector<HE_CKKS::scalar_t>> Bert_ckks::attention_from_real_input(
-    const FixArray &input, int layer_id) {
-    if (input.size <= 0 || input.size % COMMON_DIM != 0) {
-        throw runtime_error("formal real BERT input shape mismatch");
-    }
-    map<char*, FixArray> raw;
-    raw["raw_input"] = input;
-    return layer_norm_part2_attention(raw, layer_id);
+std::vector<CT> associative_linear(HE_CKKS *he,std::vector<CT> Q,std::vector<CT> K,std::vector<CT> V,int heads,const std::vector<int>&protocols){
+ MhpKernel ops(*he);int groups=(heads+3)/4;const int slots=16384;
+ auto masked=[&](const CT &x,const std::vector<double>&mask,double bits){CT y=ops.mask(x,mask,bits);he->devaluator->rescale_to_next_inplace(y);return y;};
+ auto extract=[&](const CT &x,int feature,double bits){
+  std::vector<double>mask(slots,0);for(int h=0;h<4;h++)for(int r=0;r<197;r++)mask[feature*1024+h*256+r]=1;
+  CT y=masked(x,mask,bits);y=ops.rot(y,feature*1024);
+  for(int stride=1;stride<16;stride*=2){auto t=ops.rot(y,-stride*1024);he->devaluator->add_inplace(y,t);}return y;
+ };
+ std::vector<double>valid(slots),rowzero(slots);for(int s=0;s<slots;s++){valid[s]=s%256<197;rowzero[s]=s%256==0;}
+ std::vector<CT>out(groups*4,CT(LOCATION::DEVICE));
+ int first_active=-1;
+ for(int g=0;g<groups;g++){
+  bool active=false;for(int h=0;h<4;h++)active|=protocols[g*4+h]==2; if(!active)continue;if(first_active<0)first_active=g*4;
+  std::vector<CT>vv;for(int f=0;f<4;f++)vv.push_back(masked(V[g*4+f],valid,50));
+  for(int j=0;j<64;j++){
+   CT kk=extract(K[g*4+j/16],j%16,50),qq=extract(Q[g*4+j/16],j%16,60);
+   // K/V normalize -> chain6, multiply -> chain5, row selection -> chain4.
+   while(qq.coeff_modulus_size()>5)he->devaluator->mod_switch_to_next_inplace(qq);
+   for(int f=0;f<4;f++){
+    CT kv(LOCATION::DEVICE);execution_observe::he_call(1,[&](){return he->devaluator->multiply(kk,vv[f],kv);});he->devaluator->relinearize_inplace(kv,*he->drelin_keys);he->devaluator->rescale_to_next_inplace(kv);
+    // Only row0 is used from the sliding 256-token sum; its window
+    // stays inside its head. Then broadcast without crossing head lanes.
+    for(int step=1;step<256;step*=2){auto t=ops.rot(kv,step);he->devaluator->add_inplace(kv,t);}
+    kv=masked(kv,rowzero,40);
+    for(int step=1;step<256;step*=2){auto t=ops.rot(kv,-step);he->devaluator->add_inplace(kv,t);}
+    CT product(LOCATION::DEVICE);execution_observe::he_call(1,[&](){return he->devaluator->multiply(qq,kv,product);});
+    if(j==0)out[g*4+f]=std::move(product);else he->devaluator->add_inplace(out[g*4+f],product);
+   }
+  }
+  for(int f=0;f<4;f++){
+   auto &o=out[g*4+f];he->devaluator->relinearize_inplace(o,*he->drelin_keys);he->devaluator->rescale_to_next_inplace(o);
+   std::vector<double>a(slots);for(int s=0;s<slots;s++){int h=g*4+s/256%4;if(h<heads && protocols[h]==2)a[s]=1.0;}
+   // Keep alpha exclusively in frozen W_O rows; mask inactive heads and align AV.
+   double target=0;for(auto c=he->context->first_context_data();c;c=c->next_context_data())if(c->parms().coeff_modulus().size()==2)target=std::ldexp(double(c->parms().coeff_modulus().back().value()),49-he->he_scale);
+   UnifiedPlaintext align(LOCATION::DEVICE);
+   he->dencoder->encode(*he->dcontext,a,ops.drop(o)*target/o.scale(),align,o.dcipher().chain_index());
+   execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(o,align);});he->devaluator->rescale_to_next_inplace(o);
+   // Canonicalize only floating-point metadata roundoff AFTER the real
+   // multiply/rescale. Avoid exp2(log2(target)) for the non-power-of-two
+   // scale expected by the existing alpha-WO bias plaintext.
+   if(std::abs(o.scale()-target)>8*std::numeric_limits<double>::epsilon()*target)throw runtime_error("Native WO physical scale alignment failed");
+   o.scale()=target;
+   while(o.coeff_modulus_size()>2)he->devaluator->mod_switch_to_next_inplace(o);
+  }
+ }
+ if(first_active<0)throw std::runtime_error("missing Linear group");
+ for(int g=0;g<groups;g++){bool active=false;for(int h=0;h<4;h++)active|=protocols[g*4+h]==2;if(!active)for(int f=0;f<4;f++){UnifiedPlaintext z(LOCATION::DEVICE);he->dencoder->encode(*he->dcontext,std::vector<double>(slots,0),1.0,z,out[first_active].dcipher().chain_index());execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(out[first_active],z,out[g*4+f]);});}}
+ return out;
 }
 
-map<char*, FixArray> Bert_ckks::heterogeneous_attention_output(
-    FixArray normalized_qk, int layer_id) {
-    if (heterogeneous_version == ours_vit::Version::B) {
-        throw runtime_error("selective attention output requires SELECTIVE or NATIVE");
+map<char*, FixArray> Bert_ckks::heterogeneous_attention_output(FixArray normalized_qk, int layer_id) {
+    const int heads=std::count(heterogeneous_protocols.begin(),heterogeneous_protocols.end(),ours_vit::HeadProtocol::HeLinear);
+    if(heads==0) return Softmax_v_linear_layer_norm_part1(normalized_qk,layer_id);
+    if(!linear.native_linear_enabled || (party==sci::ALICE && !native_linear_operands_ready))
+        throw runtime_error("Native MHP operands unavailable");
+    HE_CKKS *he=linear.he1;
+    constexpr int slots=16384,tokens=256;
+    vector<UnifiedCiphertext> av(12,UnifiedCiphertext(LOCATION::DEVICE)),wo;
+    const auto start=steady_clock::now();
+    if(party==sci::ALICE) {
+        if(optimized_native_qkv.size()!=36)throw runtime_error("native encrypted QKV missing");
+        vector<int> selected(12);for(int h=0;h<12;h++)selected[h]=heterogeneous_protocols[h]==ours_vit::HeadProtocol::HeLinear?2:0;
+        av=associative_linear(he,vector<CT>(optimized_native_qkv.begin(),optimized_native_qkv.begin()+12),vector<CT>(optimized_native_qkv.begin()+12,optimized_native_qkv.begin()+24),vector<CT>(optimized_native_qkv.begin()+24,optimized_native_qkv.end()),12,selected);
+        const int first=0;const double selector_scale=av[0].scale();
+        profile_switch(BlbViTProfileStage::OUTPUT_PROJECTION);
+        linear.linear_2(he,av,linear.pp_2_native[layer_id],linear.data_lin2,wo);
+        for(auto &ct:wo) {he->devaluator->rescale_to_next_inplace(ct);++linear.rescale_count;}
+        execution_observe::interval("CKKS",__func__,__LINE__,start);
+    he_compute_la+=chrono::duration<double>(steady_clock::now()-start).count();
+        cout<<"OURS_NATIVE_MHP_AV status=PASS layer="<<layer_id<<" linear_heads="<<heads
+            <<" selector_output_scale_bits="<<log2(selector_scale)<<" av_scale_bits="<<log2(av[first].scale())
+            <<" AV=optimized_Q_KtV_existing_four_head_layout alpha_fused_into=WO shared_QK_prefix_retained=1"
+            <<" client_decrypt_reencrypt=0 mpc_reference=0"<<endl;
     }
-    if (!pre_norm_attention_output_only ||
-        heterogeneous_protocols.size() != PACKING_NUM ||
-        heterogeneous_alphas.size() != PACKING_NUM ||
-        normalized_qk.ell != NL_ELL || normalized_qk.s != NL_SCALE ||
-        normalized_qk.size != PACKING_NUM * linear.data_lin1_0.image_size *
-                                  linear.data_lin1_0.image_size ||
-        !attention_v_ready ||
-        attention_v_share.size !=
-            linear.data_lin1_0.image_size * COMMON_DIM ||
-        !attention_input_residual_ready ||
-        attention_input_residual_share.size !=
-            linear.data_lin1_0.image_size * COMMON_DIM) {
-        throw runtime_error("heterogeneous attention output state mismatch");
-    }
-
-    const FCMetadata av_data = linear.data_lin1_0;
-    const int tokens = av_data.image_size;
-    const int slot = av_data.slot_count;
-    const int qk_ct_count =
-        PACKING_NUM * tokens * tokens / slot;
-    const int v_ct_count = PACKING_NUM * tokens * OUTPUT_DIM / slot;
-    const int qk_cts_per_pair =
-        qk_ct_count / (PACKING_NUM / 2);
-    const int v_cts_per_pair =
-        v_ct_count / (PACKING_NUM / 2);
-    if (qk_ct_count % (PACKING_NUM / 2) != 0 ||
-        v_ct_count % (PACKING_NUM / 2) != 0 ||
-        qk_cts_per_pair <= 0 || v_cts_per_pair <= 0)
-        throw runtime_error("heterogeneous packed conversion geometry is invalid");
-
-    vector<bool> mpc_heads(PACKING_NUM, false);
-    vector<bool> linear_heads(PACKING_NUM, false);
-    for (int head = 0; head < PACKING_NUM; ++head) {
-        linear_heads[head] = heterogeneous_protocols[head] ==
-                             ours_vit::HeadProtocol::HeLinear;
-        mpc_heads[head] = !linear_heads[head];
-    }
-    const int mpc_head_count = count(mpc_heads.begin(), mpc_heads.end(), true);
-    const int linear_head_count =
-        count(linear_heads.begin(), linear_heads.end(), true);
-    const bool heterogeneous_trace =
-        getenv("OURS_VIT_HETERO_ATTENTION_TRACE") != nullptr &&
-        string(getenv("OURS_VIT_HETERO_ATTENTION_TRACE")) == "1";
-    vector<Ciphertext> heterogeneous_mpc_av_observer;
-    vector<Ciphertext> heterogeneous_linear_av_observer;
-    auto snapshot_observer_ciphertexts = [](
-        HE_CKKS *he, const vector<UnifiedCiphertext> &source,
-        vector<Ciphertext> &destination, const char *stage) {
-        destination.resize(source.size());
-        for (size_t i = 0; i < source.size(); ++i) {
-            if (source[i].location() == LOCATION::DEVICE) {
-                UnifiedCiphertext::to_host(
-                    *he->dcontext, source[i].dcipher(), *he->context,
-                    destination[i]);
-            } else if (source[i].location() == LOCATION::HOST) {
-                destination[i] = source[i].hcipher();
-            } else {
-                throw runtime_error(string(stage) +
-                                    ": observer location is invalid");
-            }
-        }
-    };
-    int linear_pair_count = 0;
-    for (int pair = 0; pair < PACKING_NUM / 2; ++pair)
-        linear_pair_count +=
-            (linear_heads[2 * pair] || linear_heads[2 * pair + 1]) ? 1 : 0;
-
-    auto add_plain_share = [](HE_CKKS *he,
-                              vector<UnifiedCiphertext> &ciphertexts,
-                              const vector<UnifiedPlaintext> &shares) {
-        if (ciphertexts.size() != shares.size())
-            throw runtime_error("grouped MPC-to-CKKS share count mismatch");
-        for (size_t i = 0; i < ciphertexts.size(); ++i)
-            he->evaluator->add_plain_inplace(ciphertexts[i], shares[i]);
-    };
-    auto add_or_move_ciphertext = [](HE_CKKS *he,
-                                     UnifiedCiphertext &target,
-                                     uint8_t &ready,
-                                     UnifiedCiphertext source) {
-        if (!ready) {
-            target = std::move(source);
-            ready = true;
-        } else {
-            he->evaluator->add_inplace(target, source);
-        }
-    };
-    auto zero_host_ciphertext = [&](HE_CKKS *he,
-                                    const UnifiedCiphertext &reference) {
-        UnifiedCiphertext result = reference;
-        vector<double> zeros(he->num_slots, 0.0);
-        UnifiedPlaintext zero(LOCATION::HOST);
-        he->encoder->encode(zeros, reference.hcipher().parms_id(), 1.0,
-                            zero);
-        he->evaluator->multiply_plain_inplace(result, zero);
-        ++linear.ct_pt_multiply_count;
-        return result;
-    };
-
-    vector<UnifiedCiphertext> mpc_qk_cts(
-        qk_ct_count, UnifiedCiphertext(LOCATION::HOST));
-    vector<UnifiedCiphertext> mpc_v_cts(
-        v_ct_count, UnifiedCiphertext(LOCATION::HOST));
-    vector<uint8_t> mpc_qk_ready(qk_ct_count, 0);
-    vector<uint8_t> mpc_v_ready(v_ct_count, 0);
-    if (mpc_head_count > 0) {
-        vector<uint64_t> packed_qk(normalized_qk.size);
-        linear.preprocess_softmax(normalized_qk.data, packed_qk.data(),
-                                  av_data);
-        // MPC-normalized groups stay on BLB's original he2 schedule.  The
-        // extended he1 chain is reserved exclusively for native NATIVE Linear
-        // heads, so Softmax/ReLU work never pays its extra modulus limbs.
-        HE_CKKS *he = linear.he2;
-        const int import_scale_bits = he->he_scale;
-        for (int begin = 0; begin < PACKING_NUM;) {
-            int end = begin + 1;
-            while (heterogeneous_group_packing_enabled &&
-                   end < PACKING_NUM &&
-                   heterogeneous_protocols[end] ==
-                       heterogeneous_protocols[begin])
-                ++end;
-            if (heterogeneous_protocols[begin] ==
-                ours_vit::HeadProtocol::HeLinear) {
-                begin = end;
-                continue;
-            }
-
-            vector<int> qk_indices;
-            vector<vector<HE_CKKS::scalar_t>> qk_shares;
-            for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-                const bool first = 2 * pair >= begin && 2 * pair < end;
-                const bool second = 2 * pair + 1 >= begin &&
-                                    2 * pair + 1 < end;
-                if (!first && !second) continue;
-                for (int local = 0; local < qk_cts_per_pair; ++local) {
-                    const int index = pair * qk_cts_per_pair + local;
-                    qk_indices.push_back(index);
-                    vector<HE_CKKS::scalar_t> share(
-                        packed_qk.begin() + static_cast<size_t>(index) * slot,
-                        packed_qk.begin() +
-                            static_cast<size_t>(index + 1) * slot);
-                    if (!first)
-                        fill(share.begin(), share.begin() + slot / 2, 0);
-                    if (!second)
-                        fill(share.begin() + slot / 2, share.end(), 0);
-                    qk_shares.push_back(std::move(share));
-                }
-            }
-            vector<int> v_indices;
-            vector<vector<HE_CKKS::scalar_t>> v_shares;
-            for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-                const bool first = 2 * pair >= begin && 2 * pair < end;
-                const bool second = 2 * pair + 1 >= begin &&
-                                    2 * pair + 1 < end;
-                if (!first && !second) continue;
-                for (int local = 0; local < v_cts_per_pair; ++local) {
-                    const int index = pair * v_cts_per_pair + local;
-                    v_indices.push_back(index);
-                    vector<HE_CKKS::scalar_t> share(
-                        attention_v_share.data +
-                            static_cast<size_t>(index) * slot,
-                        attention_v_share.data +
-                            static_cast<size_t>(index + 1) * slot);
-                    if (!first)
-                        fill(share.begin(), share.begin() + slot / 2, 0);
-                    if (!second)
-                        fill(share.begin() + slot / 2, share.end(), 0);
-                    v_shares.push_back(std::move(share));
-                }
-            }
-            vector<UnifiedPlaintext> qk_pts;
-            vector<UnifiedPlaintext> v_pts;
-            const auto conversion_start = high_resolution_clock::now();
-            const uint64_t conversion_comm_start = current_comm();
-            const uint64_t conversion_round_start = current_round();
-            import_target_scale(*this, qk_shares, slot, NL_ELL, NL_SCALE,
-                                import_scale_bits, he, qk_pts,
-                                "selective_grouped_qk");
-            import_target_scale(*this, v_shares, slot, NL_ELL,
-                                ATTENTION_V_SCALE, import_scale_bits, he, v_pts,
-                                "selective_grouped_v");
-            vector<UnifiedCiphertext> group_qk(
-                qk_pts.size(), UnifiedCiphertext(LOCATION::HOST));
-            vector<UnifiedCiphertext> group_v(
-                v_pts.size(), UnifiedCiphertext(LOCATION::HOST));
-            if (party == BOB) {
-                for (size_t i = 0; i < group_qk.size(); ++i)
-                    he->encryptor->encrypt(qk_pts[i], group_qk[i]);
-                for (size_t i = 0; i < group_v.size(); ++i)
-                    he->encryptor->encrypt(v_pts[i], group_v[i]);
-                send_encrypted_vector(io, group_qk);
-                send_encrypted_vector(io, group_v);
-            } else {
-                recv_encrypted_vector(he->context, io, group_qk);
-                recv_encrypted_vector(he->context, io, group_v);
-                add_plain_share(he, group_qk, qk_pts);
-                add_plain_share(he, group_v, v_pts);
-                for (size_t local = 0; local < group_qk.size(); ++local)
-                    add_or_move_ciphertext(
-                        he, mpc_qk_cts[qk_indices[local]],
-                        mpc_qk_ready[qk_indices[local]],
-                        std::move(group_qk[local]));
-                for (size_t local = 0; local < group_v.size(); ++local)
-                    add_or_move_ciphertext(
-                        he, mpc_v_cts[v_indices[local]],
-                        mpc_v_ready[v_indices[local]],
-                        std::move(group_v[local]));
-            }
-            cout << "OURS_SELECTIVE_SELECTIVE_MPC_TO_CKKS status=PASS layer="
-                 << layer_id << " protocol="
-                 << ours_vit::to_string(heterogeneous_protocols[begin])
-                 << " physical_head_begin=" << begin
-                 << " head_count=" << end - begin
-                 << " qk_ciphertexts=" << qk_indices.size()
-                 << " v_ciphertexts=" << v_indices.size()
-                 << " latency_ms="
-                 << chrono::duration<double, milli>(
-                        high_resolution_clock::now() - conversion_start)
-                        .count()
-                 << " communication_bytes="
-                 << current_comm() - conversion_comm_start
-                 << " rounds="
-                 << current_round() - conversion_round_start
-                 << " packing="
-                 << (heterogeneous_group_packing_enabled
-                         ? "head_pair_half_mask"
-                         : "disabled_per_head")
-                 << " grouped_call="
-                 << (heterogeneous_group_packing_enabled ? 1 : 0)
-                 << " dynamic_selection=0" << endl;
-            begin = end;
-        }
-    }
-
-    // Preserve BLB's add-before-final-rescale residual boundary.  A mixed NATIVE
-    // layer anchors the residual to the he2 MPC-head contribution; an
-    // all-Linear layer anchors it to the native he1 contribution.
-    HE_CKKS *output_he = mpc_head_count > 0 ? linear.he2 : linear.he1;
-    const int output_ct_count =
-        linear.data_lin2.image_size * linear.data_lin2.filter_w / slot;
-    vector<UnifiedCiphertext> residual_cts;
-    {
-        FixArray residual_packed = token_major_to_bsgs_output(
-            attention_input_residual_share, linear.data_lin2,
-            "hetero_attention_residual_to_h3");
-        vector<vector<HE_CKKS::scalar_t>> residual_shares(output_ct_count);
-        for (int i = 0; i < output_ct_count; ++i) {
-            residual_shares[i].assign(
-                residual_packed.data + static_cast<size_t>(i) * slot,
-                residual_packed.data + static_cast<size_t>(i + 1) * slot);
-        }
-        vector<UnifiedPlaintext> residual_pts;
-        residual_cts.assign(
-            output_ct_count, UnifiedCiphertext(LOCATION::HOST));
-        const auto residual_conversion_start = high_resolution_clock::now();
-        const uint64_t residual_conversion_comm_start = current_comm();
-        const uint64_t residual_conversion_round_start = current_round();
-        import_target_scale(
-            *this, residual_shares, slot, attention_input_residual_share.ell,
-            attention_input_residual_share.s, output_he->he_scale, output_he,
-            residual_pts, "hetero_attention_residual");
-        if (party == BOB) {
-            for (int i = 0; i < output_ct_count; ++i)
-                output_he->encryptor->encrypt(residual_pts[i], residual_cts[i]);
-            send_encrypted_vector(io, residual_cts);
-        } else {
-            recv_encrypted_vector(output_he->context, io, residual_cts);
-            add_plain_share(output_he, residual_cts, residual_pts);
-        }
-        cout << "OURS_HETERO_RESIDUAL_MPC_TO_CKKS status=PASS layer="
-             << layer_id << " context="
-             << (output_he == linear.he1 ? "he1" : "he2")
-             << " ciphertexts=" << output_ct_count
-             << " latency_ms="
-             << chrono::duration<double, milli>(
-                    high_resolution_clock::now() - residual_conversion_start)
-                    .count()
-             << " communication_bytes="
-             << current_comm() - residual_conversion_comm_start
-             << " rounds="
-             << current_round() - residual_conversion_round_start
-             << " layout=bsgs2_split_feature_halves" << endl;
-    }
-
-    vector<UnifiedCiphertext> non_linear_h3;
-    if (mpc_head_count > 0 && party == sci::ALICE) {
-        const auto he_path_start = high_resolution_clock::now();
-        HE_CKKS *he = linear.he2;
-        // In a boundary pair, the inactive V operand is an encrypted public
-        // zero at identical metadata. This preserves BLB half/complex packing
-        // without executing or importing the inactive head.
-        int reference_v = -1;
-        for (int i = 0; i < v_ct_count; ++i)
-            if (mpc_v_ready[i]) { reference_v = i; break; }
-        if (reference_v < 0)
-            throw runtime_error("SELECTIVE grouped V import is empty");
-        for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-            if (!mpc_heads[2 * pair] && !mpc_heads[2 * pair + 1]) continue;
-            for (int local = 0; local < v_cts_per_pair; ++local) {
-                const int index = pair * v_cts_per_pair + local;
-                if (!mpc_v_ready[index]) {
-                    mpc_v_cts[index] =
-                        zero_host_ciphertext(he, mpc_v_cts[reference_v]);
-                    mpc_v_ready[index] = true;
-                }
-            }
-        }
-        // Both imported operands are ordinary full-slot additive shares.
-        // Project to the real subspace exactly as the original BLB ViT path;
-        // its factor four is absorbed by the unchanged AV mask 0.25.
-        for (int i = 0; i < qk_ct_count; ++i) {
-            if (!mpc_qk_ready[i]) continue;
-            UnifiedCiphertext conjugate(LOCATION::HOST);
-            he->evaluator->complex_conjugate(
-                mpc_qk_cts[i], *he->gal_keys, conjugate);
-            he->evaluator->add_inplace(mpc_qk_cts[i], conjugate);
-        }
-        for (int i = 0; i < v_ct_count; ++i) {
-            if (!mpc_v_ready[i]) continue;
-            UnifiedCiphertext conjugate(LOCATION::HOST);
-            he->evaluator->complex_conjugate(
-                mpc_v_cts[i], *he->gal_keys, conjugate);
-            he->evaluator->add_inplace(mpc_v_cts[i], conjugate);
-        }
-        linear.rotation_count +=
-            count(mpc_qk_ready.begin(), mpc_qk_ready.end(), true) +
-            count(mpc_v_ready.begin(), mpc_v_ready.end(), true);
-        if (he->is_gpu_enable()) {
-            for (int i = 0; i < qk_ct_count; ++i)
-                if (mpc_qk_ready[i])
-                    mpc_qk_cts[i].to_device(*he->context, *he->dcontext);
-            for (int i = 0; i < v_ct_count; ++i)
-                if (mpc_v_ready[i])
-                    mpc_v_cts[i].to_device(*he->context, *he->dcontext);
-        }
-        // The measured BLB AV kernel reuses packed diagonals without the
-        // selector multiply/rescale.  Drop the same public modulus level once
-        // on the compact source vectors, before diagonal aliases are created,
-        // so AV still enters the unchanged W_O cache at chain 3 / scale 2^69.
-        uint64_t blb_fast_modswitches = 0;
-        for (int i = 0; i < qk_ct_count; ++i) {
-            if (!mpc_qk_ready[i]) continue;
-            if (mpc_qk_cts[i].location() == LOCATION::HOST)
-                he->evaluator->mod_switch_to_next_inplace(mpc_qk_cts[i]);
-            else
-                he->devaluator->mod_switch_to_next_inplace(mpc_qk_cts[i]);
-            ++blb_fast_modswitches;
-        }
-        for (int i = 0; i < v_ct_count; ++i) {
-            if (!mpc_v_ready[i]) continue;
-            if (mpc_v_cts[i].location() == LOCATION::HOST)
-                he->evaluator->mod_switch_to_next_inplace(mpc_v_cts[i]);
-            else
-                he->devaluator->mod_switch_to_next_inplace(mpc_v_cts[i]);
-            ++blb_fast_modswitches;
-        }
-        cout << "OURS_BLB_FAST_AV_LEVEL status=PASS layer=" << layer_id
-             << " context=he2 mod_switch_only=" << blb_fast_modswitches
-             << " extra_rescales=0 extra_multiplies=0" << endl;
-        if (profile_enabled_)
-            profile_switch(BlbViTProfileStage::SOFTMAX_V);
-        const auto softmax_v_profile_start = high_resolution_clock::now();
-        vector<vector<vector<UnifiedCiphertext>>> packed_qk;
-        linear.preprocess_softmax_s1_ct_ct(
-            he, mpc_qk_cts, av_data, packed_qk, &mpc_heads);
-        const auto &level_reference = [&]() -> const UnifiedCiphertext & {
-            for (int pair = 0; pair < PACKING_NUM / 2; ++pair)
-                if (mpc_heads[2 * pair] || mpc_heads[2 * pair + 1])
-                    return packed_qk[pair][0][0];
-            throw runtime_error("SELECTIVE packed QK reference is unavailable");
-        }();
-        const size_t target_limbs = level_reference.coeff_modulus_size();
-        for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-            if (!mpc_heads[2 * pair] && !mpc_heads[2 * pair + 1]) continue;
-            for (int local = 0; local < v_cts_per_pair; ++local) {
-                auto &ciphertext =
-                    mpc_v_cts[pair * v_cts_per_pair + local];
-                while (ciphertext.coeff_modulus_size() > target_limbs)
-                    he->devaluator->mod_switch_to_next_inplace(ciphertext);
-                if (ciphertext.coeff_modulus_size() != target_limbs)
-                    throw runtime_error("SELECTIVE V crossed below packed QK level");
-            }
-        }
-        vector<UnifiedCiphertext> av_result(
-            v_ct_count, UnifiedCiphertext(he->backend()));
-        linear.softmax_v(he, packed_qk, mpc_v_cts, av_data, av_result,
-                         0.25, &mpc_heads, true);
-        if (heterogeneous_trace)
-            snapshot_observer_ciphertexts(
-                he, av_result, heterogeneous_mpc_av_observer,
-                "heterogeneous_mpc_av");
-        if (profile_enabled_)
-            profile_record_he(
-                BlbViTProfileStage::SOFTMAX_V,
-                chrono::duration<double, milli>(
-                    high_resolution_clock::now() - softmax_v_profile_start)
-                    .count());
-        if (profile_enabled_)
-            profile_switch(BlbViTProfileStage::OUTPUT_PROJECTION);
-        const auto output_projection_profile_start =
-            high_resolution_clock::now();
-        linear.linear_2(
-            he, av_result,
-            linear.native_linear_enabled
-                ? linear.pp_2_mpc[layer_id]
-                : linear.pp_2[layer_id],
-            linear.data_lin2, non_linear_h3);
-        if (profile_enabled_)
-            profile_record_he(
-                BlbViTProfileStage::OUTPUT_PROJECTION,
-                chrono::duration<double, milli>(
-                    high_resolution_clock::now() -
-                    output_projection_profile_start)
-                    .count());
-        const double he_path_seconds = chrono::duration<double>(
-            high_resolution_clock::now() - he_path_start).count();
-        he_compute_la += he_path_seconds;
-        cout << "OURS_SELECTIVE_HE_PATH_PROFILE status=PASS layer=" << layer_id
-             << " latency_ms=" << he_path_seconds * 1000.0
-             << " active_heads=" << mpc_head_count
-             << " execution_domain=he2_grouped"
-             << endl;
-    }
-
-    vector<UnifiedCiphertext> linear_h3;
-    if (linear_head_count > 0 && party == sci::ALICE) {
-        const auto he_path_start = high_resolution_clock::now();
-        const uint64_t he_path_comm_start = current_comm();
-        const uint64_t he_path_round_start = current_round();
-        const double he_path_conversion_start = conversion_la;
-        const uint64_t he_path_conversion_ct_start = conversion_ciphertexts;
-        const uint64_t he_path_ct_pt_start = linear.ct_pt_multiply_count;
-        const uint64_t he_path_ct_ct_start = linear.ct_ct_multiply_count;
-        const uint64_t he_path_rotation_start = linear.rotation_count;
-        const uint64_t he_path_rescale_start = linear.rescale_count;
-        if (!native_linear_operands_ready ||
-            native_linear_qk_he1_cts.size() != static_cast<size_t>(qk_ct_count) ||
-            native_linear_v_he1_cts.size() != static_cast<size_t>(v_ct_count)) {
-            throw runtime_error("NATIVE native he1 operands are unavailable");
-        }
-        HE_CKKS *he = linear.he1;
-        int reference_qk = -1;
-        int reference_v = -1;
-        for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-            if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
-                continue;
-            if (reference_qk < 0) reference_qk = pair * qk_cts_per_pair;
-            if (reference_v < 0) reference_v = pair * v_cts_per_pair;
-        }
-        if (reference_qk < 0 || reference_v < 0)
-            throw runtime_error("NATIVE active packed pair is empty");
-        for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-            if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
-                continue;
-            for (int local = 0; local < v_cts_per_pair; ++local) {
-                const int index = pair * v_cts_per_pair + local;
-                if (native_linear_v_he1_cts[index].hcipher().size() == 0)
-                    throw runtime_error("NATIVE active V pair was not retained");
-            }
-        }
-        if (profile_enabled_)
-            profile_switch(BlbViTProfileStage::SOFTMAX_V);
-        const auto softmax_v_profile_start = high_resolution_clock::now();
-        // Lower native V from the QKV scale to native QK's exact scale using
-        // one public value-one multiply and the single added NATIVE level. This is
-        // real CKKS arithmetic; no metadata relabel or client bridge occurs.
-        const double source_v_scale =
-            native_linear_v_he1_cts[reference_v].scale();
-        const double target_qk_scale =
-            native_linear_qk_he1_cts[reference_qk].scale();
-        auto context = he->context->get_context_data(
-            native_linear_v_he1_cts[reference_v].hcipher().parms_id());
-        if (!context || !context->next_context_data() ||
-            context->parms().coeff_modulus().empty())
-            throw runtime_error("NATIVE V scale alignment lacks one level");
-        const double dropped_modulus =
-            context->parms().coeff_modulus().back().value();
-        const double unit_scale =
-            target_qk_scale * dropped_modulus / source_v_scale;
-        vector<double> ones(slot, 1.0);
-        for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-            if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
-                continue;
-            for (int local = 0; local < v_cts_per_pair; ++local) {
-                auto &ciphertext = native_linear_v_he1_cts[
-                    pair * v_cts_per_pair + local];
-                Plaintext one;
-                he->encoder->encode(ones, ciphertext.hcipher().parms_id(),
-                                    unit_scale, one);
-                he->evaluator->multiply_plain_inplace(ciphertext, one);
-                he->evaluator->rescale_to_next_inplace(ciphertext);
-                ++linear.ct_pt_multiply_count;
-                ++linear.rescale_count;
-            }
-        }
-        const size_t qk_raw_limbs =
-            native_linear_qk_he1_cts[reference_qk].coeff_modulus_size();
-        if (qk_raw_limbs < 1)
-            throw runtime_error("NATIVE QK has no native CKKS data level");
-        // heterogeneous deliberately use the measured BLB diagonal-reuse kernel,
-        // which consumes no QK level.  V's one native alignment rescale lands
-        // directly on the raw QK level.
-        const size_t av_target_limbs = qk_raw_limbs;
-        for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-            if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
-                continue;
-            for (int local = 0; local < v_cts_per_pair; ++local) {
-                auto &ciphertext = native_linear_v_he1_cts[
-                    pair * v_cts_per_pair + local];
-                while (ciphertext.coeff_modulus_size() > av_target_limbs)
-                    he->evaluator->mod_switch_to_next_inplace(ciphertext);
-                const double error =
-                    abs(ciphertext.scale() - target_qk_scale) /
-                    target_qk_scale;
-                if (ciphertext.coeff_modulus_size() != av_target_limbs ||
-                    !isfinite(error) || error > 1e-9)
-                    throw runtime_error("NATIVE V scale/level alignment failed");
-            }
-        }
-        if (he->is_gpu_enable()) {
-            for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-                if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
-                    continue;
-                for (int local = 0; local < qk_cts_per_pair; ++local)
-                    native_linear_qk_he1_cts[pair * qk_cts_per_pair + local]
-                        .to_device(*he->context, *he->dcontext);
-                for (int local = 0; local < v_cts_per_pair; ++local)
-                    native_linear_v_he1_cts[pair * v_cts_per_pair + local]
-                        .to_device(*he->context, *he->dcontext);
-            }
-        }
-        // Diagonal extraction consumes the selector level. Align V only
-        // after extraction so the final W_O level is not dropped twice.
-        vector<vector<vector<UnifiedCiphertext>>> packed_qk;
-        linear.preprocess_softmax_s1_ct_ct(
-            he, native_linear_qk_he1_cts, av_data, packed_qk, &linear_heads);
-        // Align against the actual packed operands, after the selector has
-        // consumed its level. Modulus switching preserves values and scales.
-        size_t common_limbs =
-            native_linear_v_he1_cts[reference_v].coeff_modulus_size();
-        for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-            if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
-                continue;
-            for (const auto &diagonals : packed_qk[pair])
-                for (const auto &ciphertext : diagonals)
-                    common_limbs = min(common_limbs,
-                                       ciphertext.coeff_modulus_size());
-            for (int local = 0; local < v_cts_per_pair; ++local)
-                common_limbs = min(common_limbs,
-                    native_linear_v_he1_cts[pair * v_cts_per_pair + local]
-                        .coeff_modulus_size());
-        }
-        if (common_limbs < 2)
-            throw runtime_error("NATIVE packed AV lacks the final W_O level");
-        auto align_av_level = [&](UnifiedCiphertext &ciphertext) {
-            while (ciphertext.coeff_modulus_size() > common_limbs) {
-                if (ciphertext.location() == LOCATION::HOST)
-                    he->evaluator->mod_switch_to_next_inplace(ciphertext);
-                else
-                    he->devaluator->mod_switch_to_next_inplace(ciphertext);
-            }
-        };
-        for (int pair = 0; pair < PACKING_NUM / 2; ++pair) {
-            if (!linear_heads[2 * pair] && !linear_heads[2 * pair + 1])
-                continue;
-            for (auto &diagonals : packed_qk[pair])
-                for (auto &ciphertext : diagonals)
-                    align_av_level(ciphertext);
-            for (int local = 0; local < v_cts_per_pair; ++local)
-                align_av_level(native_linear_v_he1_cts[
-                    pair * v_cts_per_pair + local]);
-        }
-        cout << "OURS_NATIVE_AV_LEVEL status=PASS layer=" << layer_id
-             << " coeff_modulus_size=" << common_limbs
-             << " packing=complete_diagonal"
-             << " heterogeneous_head_grouping="
-             << (heterogeneous_group_packing_enabled ? 1 : 0)
-             << endl;
-        vector<UnifiedCiphertext> av_result(
-            v_ct_count, UnifiedCiphertext(he->backend()));
-        linear.softmax_v(he, packed_qk, native_linear_v_he1_cts, av_data,
-                         av_result, 1.0, &linear_heads, false);
-        if (heterogeneous_trace)
-            snapshot_observer_ciphertexts(
-                he, av_result, heterogeneous_linear_av_observer,
-                "heterogeneous_linear_av");
-        if (profile_enabled_)
-            profile_record_he(
-                BlbViTProfileStage::SOFTMAX_V,
-                chrono::duration<double, milli>(
-                    high_resolution_clock::now() - softmax_v_profile_start)
-                    .count());
-        if (profile_enabled_)
-            profile_switch(BlbViTProfileStage::OUTPUT_PROJECTION);
-        const auto output_projection_profile_start =
-            high_resolution_clock::now();
-        linear.linear_2(he, av_result, linear.pp_2_native[layer_id],
-                        linear.data_lin2, linear_h3);
-        if (profile_enabled_)
-            profile_record_he(
-                BlbViTProfileStage::OUTPUT_PROJECTION,
-                chrono::duration<double, milli>(
-                    high_resolution_clock::now() -
-                    output_projection_profile_start)
-                    .count());
-        cout << "OURS_NATIVE_NATIVE_CKKS status=PASS layer=" << layer_id
-             << " linear_heads=" << linear_head_count
-             << " active_pairs=" << linear_pair_count
-             << " qk_scale_bits=" << log2(target_qk_scale)
-             << " v_scale_bits="
-             << log2(native_linear_v_he1_cts[reference_v].scale())
-             << " alpha_fused_into=WO"
-             << " v_alignment_rescales=1"
-             << " client_decrypt_reencrypt=0 mpc_reference=0" << endl;
-        const double he_path_seconds = chrono::duration<double>(
-            high_resolution_clock::now() - he_path_start).count();
-        he_compute_la += he_path_seconds;
-        const uint64_t he_path_conversion_ct =
-            conversion_ciphertexts - he_path_conversion_ct_start;
-        const uint64_t he_path_he_muls =
-            linear.ct_pt_multiply_count - he_path_ct_pt_start +
-            linear.ct_ct_multiply_count - he_path_ct_ct_start;
-        cout << "OURS_NATIVE_HE_PATH_PROFILE status=PASS layer=" << layer_id
-             << " latency_ms=" << he_path_seconds * 1000.0
-             << " he_ms=" << he_path_seconds * 1000.0
-             << " mpc_ms=0 conversion_ms="
-             << (conversion_la - he_path_conversion_start) * 1000.0
-             << " conversion_ct=" << he_path_conversion_ct
-             << " he_muls=" << he_path_he_muls
-             << " he_rotations="
-             << linear.rotation_count - he_path_rotation_start
-             << " he_rescales="
-             << linear.rescale_count - he_path_rescale_start
-             << " communication_bytes="
-             << current_comm() - he_path_comm_start
-             << " rounds=" << current_round() - he_path_round_start
-             << " active_heads=" << linear_head_count
-             << " active_pairs=" << linear_pair_count
-             << " execution_domain=he1_native" << endl;
-    }
-
-    if (heterogeneous_trace) {
-        auto export_av_observer = [&](HE_CKKS *he,
-                                      vector<Ciphertext> &alice_ciphertexts,
-                                      bool enabled,
-                                      const char *stage) -> FixArray {
-            if (!enabled)
-                return FixArray(party, tokens * COMMON_DIM, true, NL_ELL,
-                                NL_SCALE);
-            vector<Ciphertext> transport(v_ct_count);
-            vector<Plaintext> points(v_ct_count);
-            if (party == BOB) {
-                recv_encrypted_vector(he->context, io, transport);
-                for (int i = 0; i < v_ct_count; ++i)
-                    he->decryptor->decrypt(transport[i], points[i]);
-            } else {
-                if (alice_ciphertexts.size() !=
-                    static_cast<size_t>(v_ct_count))
-                    throw runtime_error(string(stage) +
-                                        ": observer source mismatch");
-                transport = std::move(alice_ciphertexts);
-                prepare_host_conversion_from_actual_scale(
-                    *this, transport, kFormalConversionScaleBits, he, stage);
-                mask_ckks_to_mpc_inplace(transport, points, he);
-                send_encrypted_vector(io, transport);
-            }
-            auto pieces = ckks_to_mpc(
-                points, he->poly_modulus_degree, he->get_Q(points.front()),
-                NL_ELL, NL_SCALE, he, false);
-            FixArray packed(party, v_ct_count * slot, true, NL_ELL,
-                            NL_SCALE);
-            size_t offset = 0;
-            for (const auto &piece : pieces) {
-                if (piece.size() != static_cast<size_t>(slot) ||
-                    offset + piece.size() > static_cast<size_t>(packed.size))
-                    throw runtime_error(string(stage) +
-                                        ": observer decode mismatch");
-                copy(piece.begin(), piece.end(), packed.data + offset);
-                offset += piece.size();
-            }
-            if (offset != static_cast<size_t>(packed.size))
-                throw runtime_error(string(stage) +
-                                    ": observer decode incomplete");
-            cout << "OURS_HETERO_ENCRYPTED_OBSERVER status=PASS layer="
-                 << layer_id << " stage=" << stage
-                 << " ciphertexts=" << v_ct_count
-                 << " feeds_secure_graph=0 timing_eligible=0" << endl;
-            return packed;
-        };
-        FixArray mpc_av = export_av_observer(
-            linear.he2, heterogeneous_mpc_av_observer, mpc_head_count > 0,
-            "heterogeneous_mpc_av");
-        FixArray linear_av = export_av_observer(
-            linear.he1, heterogeneous_linear_av_observer,
-            linear_head_count > 0, "heterogeneous_linear_av");
-        if (mpc_head_count > 0 && linear_head_count > 0)
-            heterogeneous_av_share =
-                nonlinear.fpmath[0]->fix->add(mpc_av, linear_av);
-        else if (mpc_head_count > 0)
-            heterogeneous_av_share = std::move(mpc_av);
-        else
-            heterogeneous_av_share = std::move(linear_av);
-    }
-
-    if (party == sci::ALICE) {
-        vector<UnifiedCiphertext> *residual_anchor =
-            mpc_head_count > 0 ? &non_linear_h3 : &linear_h3;
-        if (residual_anchor->size() != residual_cts.size() ||
-            residual_anchor->empty())
-            throw runtime_error("heterogeneous residual merge size mismatch");
-        const auto residual_he_start = high_resolution_clock::now();
-        if (output_he->is_gpu_enable()) {
-            for (auto &ciphertext : residual_cts)
-                ciphertext.to_device(*output_he->context,
-                                     *output_he->dcontext);
-        }
-        align_unified_to_cipher_metadata(
-            linear, output_he, residual_cts, *residual_anchor,
-            "hetero_attention_residual");
-        for (size_t i = 0; i < residual_anchor->size(); ++i) {
-            if (output_he->is_gpu_enable()) {
-                output_he->devaluator->add_inplace((*residual_anchor)[i],
-                                                    residual_cts[i]);
-                output_he->devaluator->rescale_to_next_inplace(
-                    (*residual_anchor)[i]);
-            } else {
-                output_he->evaluator->add_inplace((*residual_anchor)[i],
-                                                   residual_cts[i]);
-                output_he->evaluator->rescale_to_next_inplace(
-                    (*residual_anchor)[i]);
-            }
-            ++linear.rescale_count;
-        }
-        size_t final_rescales = residual_anchor->size();
-        // Mixed NATIVE contributions live in distinct CKKS parameter contexts.
-        // The he2 contribution receives the residual above.  Finish the he1
-        // Linear contribution independently, then combine their two genuine
-        // Algorithm-1 exports as additive MPC shares below.
-        if (linear.native_linear_enabled &&
-            mpc_head_count > 0 && linear_head_count > 0) {
-            if (linear_h3.size() != static_cast<size_t>(output_ct_count))
-                throw runtime_error("NATIVE Linear WO contribution is incomplete");
-            for (auto &ciphertext : linear_h3) {
-                if (ciphertext.location() == LOCATION::DEVICE)
-                    linear.he1->devaluator->rescale_to_next_inplace(ciphertext);
-                else
-                    linear.he1->evaluator->rescale_to_next_inplace(ciphertext);
-                ++linear.rescale_count;
-            }
-            final_rescales += linear_h3.size();
-        }
-        const double residual_he_seconds = chrono::duration<double>(
-            high_resolution_clock::now() - residual_he_start).count();
-        he_compute_la += residual_he_seconds;
-        cout << "OURS_HETERO_CKKS_RESIDUAL_MERGE status=PASS layer="
-             << layer_id << " ciphertexts=" << residual_anchor->size()
-             << " add_before_rescale=1 final_rescales="
-             << final_rescales
-             << " residual_context="
-             << (output_he == linear.he1 ? "he1" : "he2")
-             << " latency_ms=" << residual_he_seconds * 1000.0 << endl;
-    }
-
-    auto export_contribution = [&](HE_CKKS *he,
-                                   vector<UnifiedCiphertext> &ciphertexts,
-                                   bool enabled,
-                                   const char *stage) -> FixArray {
-        const auto conversion_start = high_resolution_clock::now();
-        const uint64_t conversion_comm_start = current_comm();
-        const uint64_t conversion_round_start = current_round();
-        const int output_cts =
-            linear.data_lin2.image_size * linear.data_lin2.filter_w /
-            he->num_slots;
-        vector<Ciphertext> transport(output_cts);
-        vector<Plaintext> points(output_cts);
-        if (party == BOB) {
-            if (enabled) {
-                recv_encrypted_vector(he->context, io, transport);
-                for (int i = 0; i < output_cts; ++i)
-                    he->decryptor->decrypt(transport[i], points[i]);
-            }
-        } else if (enabled) {
-            if (ciphertexts.size() != static_cast<size_t>(output_cts))
-                throw runtime_error(string(stage) +
-                                    ": output ciphertext count mismatch");
-            for (int i = 0; i < output_cts; ++i) {
-                if (he->is_gpu_enable())
-                    ciphertexts[i].to_host(*he->context, *he->dcontext);
-                transport[i] = std::move(ciphertexts[i].hcipher());
-            }
-            prepare_host_conversion_from_actual_scale(
-                *this, transport, kFormalConversionScaleBits, he, stage);
-            mask_ckks_to_mpc_inplace(transport, points, he);
-            send_encrypted_vector(io, transport);
-        }
-        if (!enabled)
-            return FixArray(party, tokens * COMMON_DIM, true, NL_ELL,
-                            NL_SCALE);
-        auto pieces = ckks_to_mpc(
-            points, he->poly_modulus_degree, he->get_Q(points.front()),
-            NL_ELL, NL_SCALE, he, false);
-        FixArray packed(party, output_cts * he->num_slots, true, NL_ELL,
-                        NL_SCALE);
-        size_t offset = 0;
-        for (const auto &piece : pieces) {
-            if (piece.size() != static_cast<size_t>(he->num_slots) ||
-                offset + piece.size() > static_cast<size_t>(packed.size))
-                throw runtime_error(string(stage) + ": decode mismatch");
-            copy(piece.begin(), piece.end(), packed.data + offset);
-            offset += piece.size();
-        }
-        if (offset != static_cast<size_t>(packed.size))
-            throw runtime_error(string(stage) + ": incomplete decode");
-        cout << "OURS_SELECTIVE_OUTPUT_CONVERSION status=PASS layer="
-             << layer_id << " stage=" << stage
-             << " ciphertexts=" << output_cts
-             << " latency_ms="
-             << chrono::duration<double, milli>(
-                    high_resolution_clock::now() - conversion_start).count()
-             << " communication_bytes="
-             << current_comm() - conversion_comm_start
-             << " rounds=" << current_round() - conversion_round_start
-             << " algorithm=BLB_Algorithm_1 client_reencrypt=0" << endl;
-        return bsgs_output_to_token_major(
-            packed, linear.data_lin2, stage);
-    };
-
-    FixArray result(party, tokens * COMMON_DIM, true, NL_ELL, NL_SCALE);
-    if (!linear.native_linear_enabled) {
-        result = export_contribution(
-            linear.he2, non_linear_h3, true, "mpc_heads_wo");
+    // The native result is converted to additive shares with Algorithm 1.
+    // Merge it into the existing residual import, before the unchanged BLB
+    // AV/W_O/fused-LN operator. No intermediate activation is reconstructed.
+    vector<Ciphertext> wire(12);vector<Plaintext> points(12);
+    if(party==sci::ALICE) {
+        for(int k=0;k<12;++k) {wo[k].to_host(*he->context,*he->dcontext);wire[k]=std::move(wo[k].hcipher());}
+        prepare_host_conversion_from_actual_scale(*this,wire,kFormalConversionScaleBits,he,"native_wo");
+        mask_ckks_to_mpc_inplace(wire,points,he);send_encrypted_vector(io,wire);
     } else {
-        FixArray mpc_contribution(
-            party, tokens * COMMON_DIM, true, NL_ELL, NL_SCALE);
-        FixArray linear_contribution(
-            party, tokens * COMMON_DIM, true, NL_ELL, NL_SCALE);
-        if (mpc_head_count > 0)
-            mpc_contribution = export_contribution(
-                linear.he2, non_linear_h3, true, "mpc_heads_wo");
-        if (linear_head_count > 0)
-            linear_contribution = export_contribution(
-                linear.he1, linear_h3, true, "linear_heads_wo");
-        if (mpc_head_count > 0 && linear_head_count > 0) {
-            result = nonlinear.fpmath[0]->fix->add(
-                mpc_contribution, linear_contribution);
-        } else if (mpc_head_count > 0) {
-            result = std::move(mpc_contribution);
-        } else {
-            result = std::move(linear_contribution);
-        }
+        recv_encrypted_vector(he->context,io,wire);
+        for(int k=0;k<12;++k) he->decryptor->decrypt(wire[k],points[k]);
     }
-    if (heterogeneous_trace) {
-        if (result.size != attention_input_residual_share.size ||
-            result.ell != attention_input_residual_share.ell ||
-            result.s != attention_input_residual_share.s)
-            throw runtime_error("heterogeneous W_O observer shape mismatch");
-        heterogeneous_wo_share = FixArray(
-            party, result.size, result.signed_, result.ell, result.s);
-        for (int i = 0; i < result.size; ++i)
-            heterogeneous_wo_share.data[i] =
-                result.data[i] - attention_input_residual_share.data[i];
-        heterogeneous_av_wo_ready = true;
-        cout << "OURS_HETERO_WO_OBSERVER status=PASS layer=" << layer_id
-             << " elements=" << result.size
-             << " operation=local_share_subtract_public_boundary"
-             << " feeds_secure_graph=0 timing_eligible=0" << endl;
-    }
-    attention_v_ready = false;
-    attention_input_residual_ready = false;
-    native_linear_operands_ready = false;
-    native_linear_qk_he1_cts.clear();
-    native_linear_v_he1_cts.clear();
-    cout << "OURS_HETERO_ATTENTION_OUTPUT status=PASS layer=" << layer_id
-         << " version=" << ours_vit::to_string(heterogeneous_version)
-         << " mpc_heads=" << mpc_head_count
-         << " linear_heads=" << linear_head_count
-         << " residual_merge=CKKS_before_rescale"
-         << " native_cross_context_merge="
-         << (linear.native_linear_enabled &&
-                     mpc_head_count > 0 && linear_head_count > 0
-                 ? "MPC_additive_after_two_real_conversions"
-                 : "single_context_one_real_conversion")
-         << " dynamic_selection=0 surrogate=0" << endl;
-    map<char*, FixArray> output;
-    output["residual"] = std::move(result);
-    return output;
+    auto shares=fusion_observe::call(__func__,__LINE__,"points",[&](){return ckks_to_mpc(points,he->poly_modulus_degree,he->get_Q(points[0]),NL_ELL,NL_SCALE,he,false);});
+    const auto merge_layout_start=std::chrono::steady_clock::now();
+    FixArray packed(party,tokens*COMMON_DIM,true,NL_ELL,NL_SCALE);
+    for(int k=0;k<12;++k) std::copy(shares[k].begin(),shares[k].end(),packed.data+k*slots);
+    auto contribution=bsgs_output_to_token_major(packed,linear.data_lin2,"native_wo_to_residual");
+    attention_input_residual_share=nonlinear.fpmath[0]->fix->add(attention_input_residual_share,contribution);
+    execution_observe::interval("Layout",__func__,__LINE__,merge_layout_start);
+    optimized_layout_s+=std::chrono::duration<double>(std::chrono::steady_clock::now()-merge_layout_start).count();
+    native_linear_operands_ready=false;optimized_native_qkv.clear();
+    cout<<"OURS_NATIVE_MERGE status=PASS layer="<<layer_id<<" boundary=existing_residual_import client_reconstruction=0 new_conversion_packing=0"<<endl;
+    return Softmax_v_linear_layer_norm_part1(normalized_qk,layer_id);
 }
 
 FixArray Bert_ckks::linear2_from_mpc(const FixArray &input,
@@ -2842,8 +1978,8 @@ FixArray Bert_ckks::linear2_from_mpc(const FixArray &input,
                          feature_major.data + (i + 1) * slot);
     }
     vector<UnifiedPlaintext> pts;
-    import_target_scale(*this, shares, slot, input.ell, input.s,
-                            he->he_scale, he, pts, "generic_bsgs_input");
+    fusion_observe::call(__func__,__LINE__,"*this:generic_bsgs_input",[&](){return import_target_scale(*this, shares, slot, input.ell, input.s,
+                            he->he_scale, he, pts, "generic_bsgs_input");});
 
     // The generic ViT matrices use the same full-real input layout as the
     // existing ViT attention/FFN paths.  The BERT compatibility branch sends
@@ -2855,7 +1991,7 @@ FixArray Bert_ckks::linear2_from_mpc(const FixArray &input,
     vector<Ciphertext> output_pts_host;
     vector<Plaintext> output_pts(output_num_cts);
     if (party == BOB) {
-        he->encrypt_send(pts, input_cts);
+        fusion_observe::encrypt_send(he,pts, input_cts,__func__,__LINE__);
         if (final_he_logits_diagnostic) {
             vector<Ciphertext> diagnostic_cts(output_num_cts);
             recv_encrypted_vector(he->context, io, diagnostic_cts);
@@ -2961,9 +2097,9 @@ FixArray Bert_ckks::linear2_from_mpc(const FixArray &input,
     ct_transfer_comm += get_comm();
     ct_transfer_round += get_round();
 
-    auto decoded = ckks_to_mpc(
+    auto decoded = fusion_observe::call(__func__,__LINE__,"output_pts",[&](){return ckks_to_mpc(
         output_pts, he->poly_modulus_degree, he->get_Q(output_pts[0]),
-        input.ell, input.s, he, false);
+        input.ell, input.s, he, false);});
     const int output_size = data.image_size * data.filter_w;
     FixArray packed(party, output_size, true, input.ell, input.s);
     size_t offset = 0;
@@ -3032,15 +2168,15 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
     };
     vector<UnifiedPlaintext> x_pts;
     vector<UnifiedPlaintext> sigma_pts;
-    auto start = high_resolution_clock::now();
-    import_target_scale(*this, pack(x_flat_avg), slot, bitwidth, scale,
+    auto start = steady_clock::now();
+    fusion_observe::call(__func__,__LINE__,"*this:final_ln_centered_input",[&](){return import_target_scale(*this, pack(x_flat_avg), slot, bitwidth, scale,
                             he->he_scale, he, x_pts,
-                            "final_ln_centered_input");
-    import_target_scale(*this, pack(sigma_flat), slot, bitwidth, scale,
+                            "final_ln_centered_input");});
+    fusion_observe::call(__func__,__LINE__,"*this:final_ln_inv_sigma_input",[&](){return import_target_scale(*this, pack(sigma_flat), slot, bitwidth, scale,
                             he->he_scale, he, sigma_pts,
-                            "final_ln_inv_sigma_input");
+                            "final_ln_inv_sigma_input");});
     this->conversion_la +=
-        chrono::duration<double>(high_resolution_clock::now() - start).count();
+        chrono::duration<double>(steady_clock::now() - start).count();
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
 
@@ -3049,10 +2185,10 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
     vector<UnifiedCiphertext> sigma_cts(num_cts,
                                        UnifiedCiphertext(LOCATION::HOST));
     vector<Plaintext> output_pts(num_cts);
-    auto transfer_start = high_resolution_clock::now();
+    auto transfer_start = steady_clock::now();
     if (party == BOB) {
-        he->encrypt_send(x_pts, x_cts);
-        he->encrypt_send(sigma_pts, sigma_cts);
+        fusion_observe::encrypt_send(he,x_pts, x_cts,__func__,__LINE__);
+        fusion_observe::encrypt_send(he,sigma_pts, sigma_cts,__func__,__LINE__);
         vector<Ciphertext> output_cts(num_cts);
         recv_encrypted_vector(he->context, io, output_cts);
         #pragma omp parallel for
@@ -3063,7 +2199,7 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
         recv_encrypted_vector(he->context, io, x_cts);
         recv_encrypted_vector(he->context, io, sigma_cts);
         if (he->is_gpu_enable()) {
-            auto copy_start = high_resolution_clock::now();
+            auto copy_start = steady_clock::now();
             for_each_n(x_cts.begin(), x_cts.size(), [he](auto &ct) {
                 ct.to_device(*he->context, *he->dcontext);
             });
@@ -3077,7 +2213,7 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
                 pt.to_device(*he->context, *he->dcontext);
             });
             this->ct_transfer_mem_la +=
-                ((high_resolution_clock::now() - copy_start)).count() / 1e9;
+                ((steady_clock::now() - copy_start)).count() / 1e9;
         }
         cout << "FORMAL_TRANSFER_LAYOUT stage=final_layernorm_input status=PASS"
              << " layout=ordinary_full_slot cts=" << num_cts
@@ -3116,10 +2252,10 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
                 he->evaluator->add_plain_inplace(sigma_cts[i], sigma_pts[i]);
                 UnifiedCiphertext x_conjugate(LOCATION::HOST);
                 UnifiedCiphertext sigma_conjugate(LOCATION::HOST);
-                he->evaluator->complex_conjugate(x_cts[i], *he->gal_keys,
-                                                  x_conjugate);
-                he->evaluator->complex_conjugate(sigma_cts[i], *he->gal_keys,
-                                                  sigma_conjugate);
+                execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(x_cts[i], *he->gal_keys,
+                                                  x_conjugate);});
+                execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(sigma_cts[i], *he->gal_keys,
+                                                  sigma_conjugate);});
                 he->evaluator->add_inplace(x_cts[i], x_conjugate);
                 he->evaluator->add_inplace(sigma_cts[i], sigma_conjugate);
                 if (abs(x_cts[i].scale() - ln_affine_input_scale) /
@@ -3136,10 +2272,10 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
                 // public weight plaintext.  The previous order produced
                 // scale^2 for x and then attempted a ct-ct multiply against
                 // sigma at scale, which Phantom correctly rejects.
-                he->evaluator->multiply_inplace(x_cts[i], sigma_cts[i]);
+                execution_observe::he_call(1,[&](){return he->evaluator->multiply_inplace(x_cts[i], sigma_cts[i]);});
                 he->evaluator->relinearize_inplace(x_cts[i],
                                                    *he->relin_keys);
-                he->evaluator->multiply_plain_inplace(x_cts[i], tmp_w[i]);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(x_cts[i], tmp_w[i]);});
                 he->evaluator->add_plain_inplace(x_cts[i], tmp_b[i]);
                 ++this->he_rescale_count;
                 he->evaluator->rescale_to_next_inplace(x_cts[i]);
@@ -3155,11 +2291,11 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
                 he->devaluator->add_plain_inplace(sigma_cts[i], sigma_pts[i]);
                 UnifiedCiphertext x_conjugate(LOCATION::DEVICE);
                 UnifiedCiphertext sigma_conjugate(LOCATION::DEVICE);
-                he->devaluator->complex_conjugate(x_cts[i], *he->dgal_keys,
-                                                   x_conjugate);
-                he->devaluator->complex_conjugate(sigma_cts[i],
+                execution_observe::he_call(3,[&](){return he->devaluator->complex_conjugate(x_cts[i], *he->dgal_keys,
+                                                   x_conjugate);});
+                execution_observe::he_call(3,[&](){return he->devaluator->complex_conjugate(sigma_cts[i],
                                                    *he->dgal_keys,
-                                                   sigma_conjugate);
+                                                   sigma_conjugate);});
                 he->devaluator->add_inplace(x_cts[i], x_conjugate);
                 he->devaluator->add_inplace(sigma_cts[i], sigma_conjugate);
                 if (abs(x_cts[i].scale() - ln_affine_input_scale) /
@@ -3171,10 +2307,10 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
                     throw runtime_error(
                         "formal final LN Algorithm-2 target scale mismatch");
                 }
-                he->devaluator->multiply_inplace(x_cts[i], sigma_cts[i]);
+                execution_observe::he_call(1,[&](){return he->devaluator->multiply_inplace(x_cts[i], sigma_cts[i]);});
                 he->devaluator->relinearize_inplace(x_cts[i],
                                                     *he->drelin_keys);
-                he->devaluator->multiply_plain_inplace(x_cts[i], tmp_w[i]);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(x_cts[i], tmp_w[i]);});
                 he->devaluator->add_plain_inplace(x_cts[i], tmp_b[i]);
                 ++this->he_rescale_count;
                 he->devaluator->rescale_to_next_inplace(x_cts[i]);
@@ -3190,14 +2326,14 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
         linear.ct_ct_multiply_count += num_cts;
         vector<Ciphertext> output_cts(num_cts);
         if (he->is_gpu_enable()) {
-            auto copy_start = high_resolution_clock::now();
+            auto copy_start = steady_clock::now();
             for (size_t i = 0; i < num_cts; ++i) {
                 UnifiedCiphertext::to_host(*he->dcontext,
                                            x_cts[i].dcipher(), *he->context,
                                            output_cts[i]);
             }
             this->ct_transfer_mem_la +=
-                ((high_resolution_clock::now() - copy_start)).count() / 1e9;
+                ((steady_clock::now() - copy_start)).count() / 1e9;
         } else {
             for (size_t i = 0; i < num_cts; ++i) {
                 output_cts[i] = x_cts[i].hcipher();
@@ -3213,16 +2349,16 @@ FixArray Bert_ckks::layer_norm_affine_ckks(
              << " half_decode=0" << endl;
     }
     this->ct_transfer_la +=
-        chrono::duration<double>(high_resolution_clock::now() - transfer_start).count();
+        chrono::duration<double>(steady_clock::now() - transfer_start).count();
     this->ct_transfer_comm += this->get_comm();
     this->ct_transfer_round += this->get_round();
 
-    start = high_resolution_clock::now();
-    auto output_vector = ckks_to_mpc(
+    start = steady_clock::now();
+    auto output_vector = fusion_observe::call(__func__,__LINE__,"output_pts",[&](){return ckks_to_mpc(
         output_pts, degree, he->get_Q(output_pts[0]), bitwidth,
-        scale, he, false);
+        scale, he, false);});
     this->conversion_la +=
-        chrono::duration<double>(high_resolution_clock::now() - start).count();
+        chrono::duration<double>(steady_clock::now() - start).count();
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     FixArray output(party, x_flat_avg.size, x_flat_avg.signed_, bitwidth,
@@ -3256,19 +2392,20 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
     vector<vector<uint64_t>> local(count, vector<uint64_t>(slots));
     for (int i=0; i<count; ++i) copy_n(packed.data+i*slots, slots, local[i].data());
     vector<UnifiedPlaintext> plain;
-    import_target_scale(*this, local, slots, input.ell, input.s, he->he_scale,
-                        he, plain, "initial_ln_input");
+    fusion_observe::call(__func__,__LINE__,"*this:initial_ln_input",[&](){return import_target_scale(*this, local, slots, input.ell, input.s, he->he_scale,
+                        he, plain, "initial_ln_input");});
     vector<UnifiedCiphertext> ct(count, UnifiedCiphertext(LOCATION::HOST));
     vector<Ciphertext> centered_wire(count), variance_wire(1);
     vector<Plaintext> centered_pts(count), variance_pts(1);
     if (party == BOB) {
-        he->encrypt_send(plain, ct);
+        fusion_observe::encrypt_send(he,plain, ct,__func__,__LINE__);
         recv_encrypted_vector(he->context, io, centered_wire);
         recv_encrypted_vector(he->context, io, variance_wire);
         for (int i=0; i<count; ++i) he->decryptor->decrypt(centered_wire[i], centered_pts[i]);
         he->decryptor->decrypt(variance_wire[0], variance_pts[0]);
     } else {
         recv_encrypted_vector(he->context, io, ct);
+        const auto optimized_initial_ln_he_start=steady_clock::now();
         auto loc = he->backend();
         if (loc == LOCATION::DEVICE) {
             for (auto &v : ct) v.to_device(*he->context, *he->dcontext);
@@ -3292,7 +2429,7 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
                 for (auto &v : values) {
                     for (int stride=tokens; stride<slots; stride*=2) {
                         UnifiedCiphertext rotated(loc);
-                        ev->rotate_vector(v, stride, galois, rotated);
+                        execution_observe::he_call(0,[&](){return ev->rotate_vector(v, stride, galois, rotated);});
                         ev->add_inplace(v, rotated);
                     }
                 }
@@ -3302,7 +2439,7 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
             };
             auto mean = reduce_features(ct);
             auto inverse_width = encode_scalar(mean, 1.0/COMMON_DIM, drop_prime(mean));
-            ev->multiply_plain_inplace(mean, inverse_width);
+            execution_observe::he_call(2,[&](){return ev->multiply_plain_inplace(mean, inverse_width);});
             ev->rescale_to_next_inplace(mean);
             he_rescale_count++;
             vector<UnifiedCiphertext> squares(count, UnifiedCiphertext(loc));
@@ -3310,7 +2447,7 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
                 ev->mod_switch_to_next_inplace(ct[i]);
                 mean.scale() = ct[i].scale();
                 ev->sub_inplace(ct[i], mean);
-                ev->square(ct[i], squares[i]);
+                execution_observe::he_call(1,[&](){return ev->square(ct[i], squares[i]);});
                 ev->relinearize_inplace(squares[i], relin);
                 // Keep the square at scale 2^86 through the feature sum.
                 // Rescaling here by a 60-bit prime leaves only 26 scale bits
@@ -3322,12 +2459,14 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
             variance = reduce_features(squares);
             auto inverse_width2 = encode_scalar(variance, 1.0/COMMON_DIM,
                 drop_prime(variance));
-            ev->multiply_plain_inplace(variance, inverse_width2);
+            execution_observe::he_call(2,[&](){return ev->multiply_plain_inplace(variance, inverse_width2);});
             ev->rescale_to_next_inplace(variance);
             he_rescale_count++;
         };
         if (loc == LOCATION::HOST) evaluate(he->evaluator, *he->gal_keys, *he->relin_keys);
         else evaluate(he->devaluator, *he->dgal_keys, *he->drelin_keys);
+        execution_observe::interval("CKKS",__func__,__LINE__,optimized_initial_ln_he_start);
+    he_compute_la += chrono::duration<double>(steady_clock::now()-optimized_initial_ln_he_start).count();
         for (int i=0; i<count; ++i) {
             if (loc == LOCATION::DEVICE) ct[i].to_host(*he->context, *he->dcontext);
             centered_wire[i] = ct[i].hcipher();
@@ -3341,8 +2480,8 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_part1_real(
         mask_ckks_to_mpc_inplace(variance_wire, variance_pts, he);
         send_encrypted_vector(io, variance_wire);
     }
-    auto centers = ckks_to_mpc(centered_pts, he->poly_modulus_degree, he->get_Q(centered_pts[0]), input.ell, input.s, he, false);
-    auto variances = ckks_to_mpc(variance_pts, he->poly_modulus_degree, he->get_Q(variance_pts[0]), input.ell, input.s, he, false);
+    auto centers = fusion_observe::call(__func__,__LINE__,"centered_pts",[&](){return ckks_to_mpc(centered_pts, he->poly_modulus_degree, he->get_Q(centered_pts[0]), input.ell, input.s, he, false);});
+    auto variances = fusion_observe::call(__func__,__LINE__,"variance_pts",[&](){return ckks_to_mpc(variance_pts, he->poly_modulus_degree, he->get_Q(variance_pts[0]), input.ell, input.s, he, false);});
     for (int i=0; i<count; ++i) copy_n(centers[i].data(), slots, packed.data+i*slots);
     FixArray sigma(party, tokens, true, input.ell, input.s);
     copy_n(variances[0].data(), tokens, sigma.data);
@@ -3377,8 +2516,8 @@ static FixArray export_prenorm_skip(Bert_ckks &bert,
         recv_encrypted_vector(he->context, bert.io, wire);
         for (size_t i=0; i<count; ++i) he->decryptor->decrypt(wire[i], pts[i]);
     }
-    auto values = bert.ckks_to_mpc(pts, he->poly_modulus_degree,
-        he->get_Q(pts[0]), NL_ELL, NL_SCALE, he, false);
+    auto values = fusion_observe::call(__func__,__LINE__,"pts",[&](){return bert.ckks_to_mpc(pts, he->poly_modulus_degree,
+        he->get_Q(pts[0]), NL_ELL, NL_SCALE, he, false);});
     FixArray packed(bert.party, data.image_size * data.filter_w, true, NL_ELL, NL_SCALE);
     for (size_t i=0; i<count; ++i)
         copy_n(values[i].data(), he->num_slots, packed.data+i*he->num_slots);
@@ -3406,11 +2545,10 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
     const bool use_bert_half_packing = bert_post_norm;
     int softmax_output_size = PACKING_NUM*softmax_dim*softmax_dim;
     uint64_t* softmax_output_pack = new uint64_t[softmax_output_size];
-    linear.preprocess_softmax(
-        input.data,
-        softmax_output_pack,
-        data
-    );
+    for(int ct=0;ct<48;ct++)for(int slot=0;slot<16384;slot++) {
+        int h=(ct/16)*4+(slot/256)%4,row=slot%256,k=(ct%16)*16+slot/1024;
+        softmax_output_pack[ct*16384+slot]=input.data[(h*256+row)*256+k];
+    }
     cout << "OK2" << endl;
     HE_CKKS* he = linear.he2;
     int poly_modulus_degree = he->poly_modulus_degree;
@@ -3453,7 +2591,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         "attention_residual_to_h3");
     vector<vector<HE_CKKS::scalar_t>> softmax_output_pack_vector(num_cts_softmax);
     vector<vector<HE_CKKS::scalar_t>> v_share_vector(
-        use_he_v ? 0 : num_cts_ln);
+        use_he_v ? 0 : 48);
     vector<vector<HE_CKKS::scalar_t>> attention_residual_vector(num_cts_ln);
     vector<UnifiedPlaintext> softmax_output_pack_pts;
     for(int i=0;i<num_cts_softmax;i++){
@@ -3461,10 +2599,15 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
             softmax_output_pack_vector[i].push_back(softmax_output_pack[i*slot+j]);
         }
     }
-    if (!use_he_v) {
-        for (int i = 0; i < num_cts_ln; ++i) {
-            v_share_vector[i].assign(attention_v_share.data + i * slot,
-                                     attention_v_share.data + (i + 1) * slot);
+    if(use_he_v || bert_post_norm)throw runtime_error("isolated MHP candidate requires ViT MPC V boundary");
+    for(int ct=0;ct<48;ct++) {
+        v_share_vector[ct].resize(slot);
+        for(int pos=0;pos<slot;pos++) {
+            int group=ct/16,h=(pos/256)%4,t=pos/1024,k=(ct%16)*16+t,col=(pos%256+t)%256;
+            // Figure 7 reduce-first V, including public row preprocessing.
+            if(col<64) {int srcct=group*4+col/16,srcslot=((col%16)*4+h)*256+k;
+                v_share_vector[ct][pos]=attention_v_share.data[srcct*slot+srcslot];}
+            else v_share_vector[ct][pos]=0;
         }
     }
     for (int i = 0; i < num_cts_ln; ++i) {
@@ -3477,24 +2620,24 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
          << " target=bsgs2_split_feature_halves elements="
          << attention_residual_packed.size
          << " communication=0 public_share_permutation=1" << endl;
-    auto start = high_resolution_clock::now();
-    import_target_scale(*this, softmax_output_pack_vector, slot,
+    auto start = steady_clock::now();
+    fusion_observe::call(__func__,__LINE__,"*this:softmax",[&](){return import_target_scale(*this, softmax_output_pack_vector, slot,
                             bitwidth, s, he->he_scale, he,
-                            softmax_output_pack_pts, "softmax");
+                            softmax_output_pack_pts, "softmax");});
     vector<UnifiedPlaintext> v_share_pts;
     vector<UnifiedPlaintext> attention_residual_pts;
     if (!use_he_v) {
-        import_target_scale(*this, v_share_vector, slot,
+        fusion_observe::call(__func__,__LINE__,"*this:attention_v",[&](){return import_target_scale(*this, v_share_vector, slot,
                                 attention_v_share.ell, attention_v_share.s,
-                                he->he_scale, he, v_share_pts, "attention_v");
+                                he->he_scale, he, v_share_pts, "attention_v");});
     }
     if (!pre_norm_attention_output_only)
-      import_target_scale(*this, attention_residual_vector, slot,
+      fusion_observe::call(__func__,__LINE__,"*this:attention_residual",[&](){return import_target_scale(*this, attention_residual_vector, slot,
                             attention_input_residual_share.ell,
                             attention_input_residual_share.s, he->he_scale,
                             he, attention_residual_pts,
-                            "attention_residual");
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+                            "attention_residual");});
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     vector<Plaintext> x_avg_pts(num_cts_ln);
@@ -3510,7 +2653,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         num_cts_softmax % 2 == 0 ? num_cts_softmax / 2 : 0,
         UnifiedCiphertext(LOCATION::HOST));
     vector<UnifiedCiphertext> enc_v(
-        use_he_v ? 0 : num_cts_ln, UnifiedCiphertext(LOCATION::HOST));
+        use_he_v ? 0 : 48, UnifiedCiphertext(LOCATION::HOST));
     vector<UnifiedCiphertext> enc_attention_residual(
         pre_norm_attention_output_only ? 0 : num_cts_ln,
         UnifiedCiphertext(LOCATION::HOST));
@@ -3558,9 +2701,9 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
             mask_ckks_to_mpc_inplace(transport, points, he);
             send_encrypted_vector(io, transport);
         }
-        auto pieces = ckks_to_mpc(
+        auto pieces = fusion_observe::call(__func__,__LINE__,"points",[&](){return ckks_to_mpc(
             points, he->poly_modulus_degree, he->get_Q(points.front()),
-            NL_ELL, NL_SCALE, he, false);
+            NL_ELL, NL_SCALE, he, false);});
         FixArray packed(party, expected_ciphertexts * slot, true, NL_ELL,
                         NL_SCALE);
         size_t offset = 0;
@@ -3602,10 +2745,10 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         if (use_bert_half_packing) {
             send_encrypted_vector(io, enc_softmax_half);
         } else {
-            he->encrypt_send(softmax_output_pack_pts, enc_softmax);
+            fusion_observe::encrypt_send(he,softmax_output_pack_pts, enc_softmax,__func__,__LINE__);
         }
         if (!use_he_v) {
-            he->encrypt_send(v_share_pts, enc_v);
+            fusion_observe::encrypt_send(he,v_share_pts, enc_v,__func__,__LINE__);
         }
         if (!enc_attention_residual.empty())
             send_encrypted_vector(io, enc_attention_residual);
@@ -3717,14 +2860,14 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                                     cts.front().hcipher().parms_id(),
                                     unit_scale, unit_plain);
                 for (auto &ct : cts) {
-                    he->evaluator->multiply_plain_inplace(ct, unit_plain);
+                    execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(ct, unit_plain);});
                 }
             } else if (loc == LOCATION::DEVICE) {
                 const auto chain_index = cts.front().dcipher().chain_index();
                 he->dencoder->encode(*he->dcontext, public_one, unit_scale,
                                      unit_plain, chain_index);
                 for (auto &ct : cts) {
-                    he->devaluator->multiply_plain_inplace(ct, unit_plain);
+                    execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(ct, unit_plain);});
                 }
             } else {
                 throw runtime_error("formal public-one lift backend is invalid");
@@ -3746,7 +2889,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                  << " plaintext_value=1" << endl;
         };
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         if (use_bert_half_packing && enc_softmax_half.empty()) {
             throw runtime_error("formal Softmax half-packing requires an even ciphertext count");
         }
@@ -3765,7 +2908,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         }
         if (!enc_attention_residual.empty())
             recv_encrypted_vector(he->context, io, enc_attention_residual);
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
 
         // In the HE-V path, perform the existing share additions and the
         // required level alignment while the received ciphertexts are still
@@ -3821,7 +2964,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         NVTX_PUSH("SM-LN1", true);
         if (he->is_gpu_enable()) {
             // Load reviced ciphertexts to GPU
-            start = high_resolution_clock::now();
+            start = steady_clock::now();
             for_each_n(enc_softmax.begin(), enc_softmax.size(),
                     [he](auto &ct) { ct.to_device(*he->context, *he->dcontext); });
             for_each_n(enc_v.begin(), enc_v.size(),
@@ -3836,7 +2979,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
             for_each_n(attention_residual_pts.begin(),
                     attention_residual_pts.size(),
                     [he](auto &pt) { pt.to_device(*he->context, *he->dcontext); });
-            this->ct_transfer_mem_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+            this->ct_transfer_mem_la += ((steady_clock::now() - start)).count()/1e+9;
         }
 
         // The original BLB HE boundary keeps V at the level emitted by the
@@ -3878,7 +3021,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                  << " v_transport=HE_at_Alice" << endl;
         }
         
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         cout << "FORMAL_TRANSFER_LAYOUT stage=softmax_v_input status=PASS"
              << " layout=ordinary_full_slot softmax_cts=" << enc_softmax.size()
              << " v_cts=" << enc_v.size()
@@ -3964,28 +3107,28 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                 #pragma omp parallel for num_threads(4)
                 for (int i = 0; i < static_cast<int>(enc_softmax.size()); ++i) {
                     UnifiedCiphertext conjugate(LOCATION::HOST);
-                    he->evaluator->complex_conjugate(
-                        enc_softmax[i], *he->gal_keys, conjugate);
+                    execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(
+                        enc_softmax[i], *he->gal_keys, conjugate);});
                     he->evaluator->add_inplace(enc_softmax[i], conjugate);
                 }
                 #pragma omp parallel for num_threads(4)
                 for (int i = 0; i < static_cast<int>(enc_v.size()); ++i) {
                     UnifiedCiphertext conjugate(LOCATION::HOST);
-                    he->evaluator->complex_conjugate(
-                        enc_v[i], *he->gal_keys, conjugate);
+                    execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(
+                        enc_v[i], *he->gal_keys, conjugate);});
                     he->evaluator->add_inplace(enc_v[i], conjugate);
                 }
             } else {
                 for (size_t i = 0; i < enc_softmax.size(); ++i) {
                     UnifiedCiphertext conjugate(LOCATION::DEVICE);
-                    he->devaluator->complex_conjugate(
-                        enc_softmax[i], *he->dgal_keys, conjugate);
+                    execution_observe::he_call(3,[&](){return he->devaluator->complex_conjugate(
+                        enc_softmax[i], *he->dgal_keys, conjugate);});
                     he->devaluator->add_inplace(enc_softmax[i], conjugate);
                 }
                 for (size_t i = 0; i < enc_v.size(); ++i) {
                     UnifiedCiphertext conjugate(LOCATION::DEVICE);
-                    he->devaluator->complex_conjugate(
-                        enc_v[i], *he->dgal_keys, conjugate);
+                    execution_observe::he_call(3,[&](){return he->devaluator->complex_conjugate(
+                        enc_v[i], *he->dgal_keys, conjugate);});
                     he->devaluator->add_inplace(enc_v[i], conjugate);
                 }
             }
@@ -4004,61 +3147,22 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                  << " extra_multiply=0 extra_rescale=0" << endl;
         }
         cout << "OK4" << endl;
-        vector<vector<vector<UnifiedCiphertext>>> pack_softmax_ct;
-        linear.preprocess_softmax_s1_ct_ct(
-            he, enc_softmax, data, pack_softmax_ct);
-        if (pack_softmax_ct.empty() || pack_softmax_ct.front().empty() ||
-            pack_softmax_ct.front().front().empty()) {
-            throw runtime_error("formal Softmax*V diagonal packing is empty");
+        vector<UnifiedCiphertext> softmax_V_result;
+        if(profile_enabled_)profile_switch(BlbViTProfileStage::SOFTMAX_V);
+        const auto softmax_v_profile_start=steady_clock::now();
+        MhpKernel kernel(*he);
+        for(int group=0;group<3;group++) {
+            vector<UnifiedCiphertext> A,B;
+            for(int n=0;n<16;n++){A.push_back(enc_softmax[group*16+n]);B.push_back(enc_v[group*16+n]);}
+            auto out=kernel.run(A,B,true,69,0.25);
+            for(int n=0;n<4;n++) {for(int k=1;k<4;k++)he->devaluator->add_inplace(out[n],out[n+4*k]);softmax_V_result.push_back(std::move(out[n]));}
         }
-        const auto &av_level_reference =
-            pack_softmax_ct.front().front().front();
-        const size_t av_target_limbs =
-            av_level_reference.coeff_modulus_size();
-        for (auto &ciphertext : enc_v) {
-            while (ciphertext.coeff_modulus_size() > av_target_limbs) {
-                if (loc == LOCATION::HOST) {
-                    he->evaluator->mod_switch_to_next_inplace(ciphertext);
-                } else {
-                    he->devaluator->mod_switch_to_next_inplace(ciphertext);
-                }
-            }
-            if (ciphertext.coeff_modulus_size() != av_target_limbs) {
-                throw runtime_error(
-                    "formal V level is below the packed Softmax level");
-            }
-        }
-        require_uniform_metadata(enc_v, "attention_v_av_aligned");
-        bool av_same_level = false;
-        if (loc == LOCATION::HOST) {
-            av_same_level = enc_v.front().hcipher().parms_id() ==
-                            av_level_reference.hcipher().parms_id();
-        } else {
-            av_same_level = enc_v.front().dcipher().chain_index() ==
-                            av_level_reference.dcipher().chain_index();
-        }
-        if (!av_same_level) {
-            throw runtime_error(
-                "formal V and packed Softmax levels do not match");
-        }
-        cout << "FORMAL_AV_LEVEL_ALIGNMENT status=PASS"
-             << " limbs=" << av_target_limbs
-             << " softmax_scale_bits=" << log2(av_level_reference.scale())
-             << " v_scale_bits=" << log2(enc_v.front().scale())
-             << " v_cts=" << enc_v.size() << endl;
-        cout << "OK5" << endl;
-        vector<UnifiedCiphertext> softmax_V_result(
-            PACKING_NUM * data.image_size * data.filter_w / data.slot_count,
-            UnifiedCiphertext(loc));
-        if (profile_enabled_)
-            profile_switch(BlbViTProfileStage::SOFTMAX_V);
-        const auto softmax_v_profile_start = high_resolution_clock::now();
-        linear.softmax_v(he, pack_softmax_ct, enc_v, data, softmax_V_result,
-                         use_bert_half_packing ? 1.0 : 0.25);
+        linear.rotation_count+=kernel.rotations;linear.ct_ct_multiply_count+=kernel.ctct;linear.ct_pt_multiply_count+=kernel.ctpt;linear.rescale_count+=kernel.rescales;
+        cout<<"BLB_MHP_AV rotations="<<kernel.rotations<<" ctct="<<kernel.ctct<<" ctpt="<<kernel.ctpt<<" rescale="<<kernel.rescales<<" diagonal_to_spatial_repacking=0"<<endl;
         if (profile_enabled_)
             profile_record_he(
                 BlbViTProfileStage::SOFTMAX_V,
-                chrono::duration<double, milli>(high_resolution_clock::now() -
+                chrono::duration<double, milli>(steady_clock::now() -
                                                 softmax_v_profile_start)
                     .count());
         if (b_trace)
@@ -4072,11 +3176,11 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
             profile_switch(
                 BlbViTProfileStage::OUTPUT_PROJECTION);
         const auto output_projection_profile_start =
-            high_resolution_clock::now();
+            steady_clock::now();
         linear.linear_2(
             he,
             softmax_V_result, 
-            linear.pp_2[layer_id],
+            (linear.native_linear_enabled ? linear.pp_2_mpc[layer_id] : linear.pp_2[layer_id]),
             data,
             h3
         );
@@ -4084,7 +3188,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
             profile_record_he(
                 BlbViTProfileStage::OUTPUT_PROJECTION,
                 chrono::duration<double, milli>(
-                    high_resolution_clock::now() - output_projection_profile_start)
+                    steady_clock::now() - output_projection_profile_start)
                     .count());
         if (b_trace) {
             b_wo_share = bsgs_output_to_token_major(
@@ -4237,13 +3341,13 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                 #pragma omp parallel for num_threads(4)
                 for(int j=0;j<h3.size();j++){
                     Ciphertext tmp;
-                    he->evaluator->rotate_vector(X_avg[j],pow(2,i-1)*L,*he->gal_keys,tmp);
+                    execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(X_avg[j],pow(2,i-1)*L,*he->gal_keys,tmp);});
                     he->evaluator->add_inplace(X_avg[j],tmp);
                 }
             } else {
                 for(int j=0;j<h3.size();j++){
                     UnifiedCiphertext tmp(loc);
-                    he->devaluator->rotate_vector(X_avg[j],pow(2,i-1)*L,*he->dgal_keys,tmp);
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(X_avg[j],pow(2,i-1)*L,*he->dgal_keys,tmp);});
                     he->devaluator->add_inplace(X_avg[j],tmp);
                 }
             }
@@ -4265,9 +3369,9 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         // 2. X_avg, scale=4s-60
         for(int i=0;i<X_avg.size();i++){
             if (!he->is_gpu_enable()) {
-                he->evaluator->multiply_plain_inplace(X_avg[i], inv_D_p);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(X_avg[i], inv_D_p);});
             } else {
-                he->devaluator->multiply_plain_inplace(X_avg[i], inv_D_p);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(X_avg[i], inv_D_p);});
             }
         }
         cout << "OK3" << endl;
@@ -4280,12 +3384,12 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         cout << "X_avg.scale:" << log2(X_avg[0].scale()) << endl;
         for(int i=0;i<h3.size();i++){
            if (!he->is_gpu_enable()) {
-                he->evaluator->multiply_plain_inplace(h3[i],scale_up);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(h3[i],scale_up);});
                 he->evaluator->sub_inplace(h3[i],X_avg[i]);
                 ++this->he_rescale_count;
                 he->evaluator->rescale_to_next_inplace(h3[i]);
             } else {
-                he->devaluator->multiply_plain_inplace(h3[i],scale_up);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(h3[i],scale_up);});
                 he->devaluator->sub_inplace(h3[i],X_avg[i]);
                 ++this->he_rescale_count;
                 he->devaluator->rescale_to_next_inplace(h3[i]);
@@ -4301,12 +3405,12 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         for(int i=0;i<h3.size();i++){
             sigma[i] = h3[i];
             if (!he->is_gpu_enable()) {
-                he->evaluator->square_inplace(sigma[i]);
+                execution_observe::he_call(1,[&](){return he->evaluator->square_inplace(sigma[i]);});
                 he->evaluator->relinearize_inplace(sigma[i], *he->relin_keys);
                 ++this->he_rescale_count;
                 he->evaluator->rescale_to_next_inplace(sigma[i]);
             } else {
-                he->devaluator->square_inplace(sigma[i]);
+                execution_observe::he_call(1,[&](){return he->devaluator->square_inplace(sigma[i]);});
                 he->devaluator->relinearize_inplace(sigma[i], *he->drelin_keys);
                 ++this->he_rescale_count;
                 he->devaluator->rescale_to_next_inplace(sigma[i]);
@@ -4318,13 +3422,13 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
                 #pragma omp parallel for num_threads(4)
                 for(int j=0;j<sigma.size();j++){
                     Ciphertext tmp;
-                    he->evaluator->rotate_vector(sigma[j],pow(2,i-1)*L,*he->gal_keys,tmp);
+                    execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(sigma[j],pow(2,i-1)*L,*he->gal_keys,tmp);});
                     he->evaluator->add_inplace(sigma[j],tmp);
                 }
             } else {
                 for(int j=0;j<sigma.size();j++){
                     UnifiedCiphertext tmp(loc);
-                    he->devaluator->rotate_vector(sigma[j],pow(2,i-1)*L,*he->dgal_keys,tmp);
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(sigma[j],pow(2,i-1)*L,*he->dgal_keys,tmp);});
                     he->devaluator->add_inplace(sigma[j],tmp);
                 }
             }
@@ -4454,19 +3558,19 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
              << " target_scale_bits=" << kFormalConversionScaleBits
              << " source_limbs=2" << endl;
         if (!he->is_gpu_enable()) {
-        he->evaluator->multiply_plain_inplace(X_sum2,mask_p);
+        execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(X_sum2,mask_p);});
         } else {
-        he->devaluator->multiply_plain_inplace(X_sum2,mask_p);
+        execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(X_sum2,mask_p);});
         }
         cout << "OK6" << endl;
         if (!he->is_gpu_enable()) {
-        he->evaluator->multiply_plain_inplace(X_sum2,inv_D_p2);
+        execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(X_sum2,inv_D_p2);});
         //before scale=130, Q=[60, 40, 60]; after 2*rs scale = 30, Q = 60
         ++this->he_rescale_count;
         he->evaluator->rescale_to_next_inplace(X_sum2);
         // he->evaluator->rescale_to_next_inplace(X_sum2);
         } else {
-        he->devaluator->multiply_plain_inplace(X_sum2,inv_D_p2);
+        execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(X_sum2,inv_D_p2);});
         ++this->he_rescale_count;
         he->devaluator->rescale_to_next_inplace(X_sum2);
         }
@@ -4481,17 +3585,18 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         cout << "FORMAL_VARIANCE_SCALE_READY stage=ln1 status=PASS"
              << " actual_scale_bits=" << log2(X_sum2.scale())
              << " limbs=" << X_sum2.coeff_modulus_size() << endl;
-        this->he_compute_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        execution_observe::interval("CKKS",__func__,__LINE__,start);
+    this->he_compute_la += ((steady_clock::now() - start)).count()/1e+9;
         
         if (he->is_gpu_enable()) {
         // Load result ciphertexts to CPU
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         X_sum2.to_host(*he->context, *he->dcontext);
-        this->ct_transfer_mem_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_mem_la += ((steady_clock::now() - start)).count()/1e+9;
         }
         NVTX_POP(true);
         
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         cout << "num of output cts:" << sigma.size()+1 << endl;
         cout << "bitwidth of h3 ct:" << h3[0].coeff_modulus_size() << endl;
         cout << "bitwidth of X_sum2 ct:" << X_sum2.coeff_modulus_size() << endl;
@@ -4522,7 +3627,7 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
         mask_ckks_to_mpc_inplace(enc_sigma, sigma_pts, he);
         send_encrypted_vector(io, enc_sigma);
         cout << "STRICT_BLB_FUSION stage=Softmax_v_linear_layer_norm_part1 statistics=HE skip_branch=masked" << endl;
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
         }
     }
     this->ct_transfer_comm += this->get_comm();
@@ -4531,9 +3636,9 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
     // cout << "send and receive cts, round:" << this->get_round() << endl;
     cout << "send and receive done in linear4_add_layernorm_part1" << endl;
     if (pre_norm_attention_output_only) {
-        vector<vector<HE_CKKS::scalar_t>> residual_vector = ckks_to_mpc(
+        vector<vector<HE_CKKS::scalar_t>> residual_vector = fusion_observe::call(__func__,__LINE__,"x_avg_pts",[&](){return ckks_to_mpc(
             x_avg_pts, poly_modulus_degree,
-            he->get_Q(x_avg_pts[0]), bitwidth, s, he, false);
+            he->get_Q(x_avg_pts[0]), bitwidth, s, he, false);});
         FixArray packed(party, num_cts_ln * slot, true, bitwidth, s);
         size_t offset = 0;
         for (const auto &part : residual_vector) {
@@ -4562,18 +3667,18 @@ std::map<char*,FixArray> Bert_ckks::Softmax_v_linear_layer_norm_part1(FixArray i
     }
     vector<vector<HE_CKKS::scalar_t>> vec_x_avg(x_avg_pts.size());
     vector<vector<HE_CKKS::scalar_t>> vec_sigma(sigma_pts.size());
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     if (!pre_norm_attention_output_only && !x_avg_pts_half.empty()) {
-        vec_x_avg = ckks_to_mpc(x_avg_pts_half, poly_modulus_degree,
+        vec_x_avg = fusion_observe::call(__func__,__LINE__,"x_avg_pts_half",[&](){return ckks_to_mpc(x_avg_pts_half, poly_modulus_degree,
                                 he->get_Q(x_avg_pts_half[0]), bitwidth, s,
-                                he, true);
+                                he, true);});
     } else {
-        vec_x_avg = ckks_to_mpc(x_avg_pts, poly_modulus_degree,
+        vec_x_avg = fusion_observe::call(__func__,__LINE__,"x_avg_pts",[&](){return ckks_to_mpc(x_avg_pts, poly_modulus_degree,
                                 he->get_Q(x_avg_pts[0]), bitwidth, s, he,
-                                false);
+                                false);});
     }
-    vec_sigma = ckks_to_mpc(sigma_pts, poly_modulus_degree, he->get_Q(sigma_pts[0]), bitwidth, s, he, false);
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    vec_sigma = fusion_observe::call(__func__,__LINE__,"sigma_pts",[&](){return ckks_to_mpc(sigma_pts, poly_modulus_degree, he->get_Q(sigma_pts[0]), bitwidth, s, he, false);});
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     cout << "vec_sigma.size():" << vec_sigma.size() << ", should be 1" << endl;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
@@ -4731,20 +3836,20 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
     vector<Plaintext> normalized_residual_pts(
         pre_norm_ffn_residual_from_external ? 0 : num_cts);
     cout << "gelu_cts_size:" << gelu_cts_size << endl;
-    auto start = high_resolution_clock::now();
-    import_target_scale(*this, vec_x_flat_avg, slot_count, bitwidth, s,
+    auto start = steady_clock::now();
+    fusion_observe::call(__func__,__LINE__,"*this:ln1_centered_input",[&](){return import_target_scale(*this, vec_x_flat_avg, slot_count, bitwidth, s,
                             he->he_scale, he, pts_x_flat_avg,
-                            "ln1_centered_input");
+                            "ln1_centered_input");});
     if (pre_norm_ffn_residual_from_external) {
-        import_broadcast_scale(*this, vec_sigma_flat, slot_count, bitwidth, s,
+        fusion_observe::call(__func__,__LINE__,"*this:ln1_inv_sigma_input",[&](){return import_broadcast_scale(*this, vec_sigma_flat, slot_count, bitwidth, s,
                             he->he_scale, he, pts_sigma_flat,
-                            "ln1_inv_sigma_input");
+                            "ln1_inv_sigma_input");});
     } else {
-        import_target_scale(*this, vec_sigma_flat, slot_count, bitwidth, s,
+        fusion_observe::call(__func__,__LINE__,"*this:ln1_inv_sigma_input",[&](){return import_target_scale(*this, vec_sigma_flat, slot_count, bitwidth, s,
                             he->he_scale, he, pts_sigma_flat,
-                            "ln1_inv_sigma_input");
+                            "ln1_inv_sigma_input");});
     }
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     // cout << "mpc_to_ckks comm:" << this->get_comm() << endl;
     // cout << "mpc_to_ckks round:" << this->get_round() << endl;
     this->conversion_comm += this->get_comm();
@@ -4785,8 +3890,8 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
                  << " sigma_cts=" << cts_sigma_flat_half.size()
                  << " imag_repack=1 source=Figure10_Block5" << endl;
         } else {
-            he->encrypt_send(pts_x_flat_avg, cts_x_flat);
-            he->encrypt_send(pts_sigma_flat, cts_sigma_flat);
+            fusion_observe::encrypt_send(he,pts_x_flat_avg, cts_x_flat,__func__,__LINE__);
+            fusion_observe::encrypt_send(he,pts_sigma_flat, cts_sigma_flat,__func__,__LINE__);
             cout << "FORMAL_TRANSFER_LAYOUT stage=ln_ffn_input status=PASS"
                  << " layout=ordinary_full_slot x_cts=" << cts_x_flat.size()
                  << " sigma_cts=" << cts_sigma_flat.size()
@@ -4835,7 +3940,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
         }
 	}
     else{
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         if (use_bert_half_packing) {
             if (cts_x_flat_half.empty() || cts_sigma_flat_half.empty()) {
                 throw runtime_error("formal FFN1 input half-packing requires an even ciphertext count");
@@ -4853,12 +3958,12 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
             recv_encrypted_vector(he->context, io, cts_x_flat);
             recv_encrypted_vector(he->context, io, cts_sigma_flat);
         }
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
         
         NVTX_PUSH("LN2-L3-GL1", true);
         if (he->is_gpu_enable()) {
         // Load revice ciphertexts to GPU
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         for_each_n(cts_x_flat.begin(), cts_x_flat.size(),
             [he](auto &ct) { ct.to_device(*he->context, *he->dcontext); });
         for_each_n(cts_sigma_flat.begin(), cts_sigma_flat.size(),
@@ -4867,10 +3972,10 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
                 [he](auto &pt) { pt.to_device(*he->context, *he->dcontext); });
         for_each_n(pts_sigma_flat.begin(), pts_sigma_flat.size(),
                 [he](auto &pt) { pt.to_device(*he->context, *he->dcontext); });
-        this->ct_transfer_mem_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_mem_la += ((steady_clock::now() - start)).count()/1e+9;
         }
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         cout << "FORMAL_TRANSFER_LAYOUT stage=ln_ffn_input status=PASS"
              << " layout=" << (use_bert_half_packing ? "xyj_half_slot" : "ordinary_full_slot")
              << " x_cts=" << (use_bert_half_packing ? cts_x_flat_half.size() : cts_x_flat.size())
@@ -4944,10 +4049,10 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
                 if (!use_bert_half_packing) {
                     UnifiedCiphertext x_conjugate(LOCATION::HOST);
                     UnifiedCiphertext sigma_conjugate(LOCATION::HOST);
-                    he->evaluator->complex_conjugate(
-                        cts_x_flat[i], *he->gal_keys, x_conjugate);
-                    he->evaluator->complex_conjugate(
-                        cts_sigma_flat[i], *he->gal_keys, sigma_conjugate);
+                    execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(
+                        cts_x_flat[i], *he->gal_keys, x_conjugate);});
+                    execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(
+                        cts_sigma_flat[i], *he->gal_keys, sigma_conjugate);});
                     he->evaluator->add_inplace(cts_x_flat[i], x_conjugate);
                     he->evaluator->add_inplace(cts_sigma_flat[i],
                                                sigma_conjugate);
@@ -4960,11 +4065,11 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
                 if (!use_bert_half_packing) {
                     UnifiedCiphertext x_conjugate(LOCATION::DEVICE);
                     UnifiedCiphertext sigma_conjugate(LOCATION::DEVICE);
-                    he->devaluator->complex_conjugate(
-                        cts_x_flat[i], *he->dgal_keys, x_conjugate);
-                    he->devaluator->complex_conjugate(
+                    execution_observe::he_call(3,[&](){return he->devaluator->complex_conjugate(
+                        cts_x_flat[i], *he->dgal_keys, x_conjugate);});
+                    execution_observe::he_call(3,[&](){return he->devaluator->complex_conjugate(
                         cts_sigma_flat[i], *he->dgal_keys,
-                        sigma_conjugate);
+                        sigma_conjugate);});
                     he->devaluator->add_inplace(cts_x_flat[i], x_conjugate);
                     he->devaluator->add_inplace(cts_sigma_flat[i],
                                                 sigma_conjugate);
@@ -5002,20 +4107,20 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
                 // x and sigma share the input scale.  Form that ct-ct
                 // product first, then multiply by the public weight so the
                 // resulting scale matches the bias plaintext.
-                he->evaluator->multiply_inplace(cts_x_flat[i],
-                                                cts_sigma_flat[i]);
+                execution_observe::he_call(1,[&](){return he->evaluator->multiply_inplace(cts_x_flat[i],
+                                                cts_sigma_flat[i]);});
                 he->evaluator->relinearize_inplace(cts_x_flat[i],
                                                    *he->relin_keys);
-                he->evaluator->multiply_plain_inplace(cts_x_flat[i], tmp_w[i]);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(cts_x_flat[i], tmp_w[i]);});
                 he->evaluator->add_plain_inplace(cts_x_flat[i], tmp_b[i]);
                 ++this->he_rescale_count;
                 he->evaluator->rescale_to_next_inplace(cts_x_flat[i]);
             } else {
-                he->devaluator->multiply_inplace(cts_x_flat[i],
-                                                 cts_sigma_flat[i]);
+                execution_observe::he_call(1,[&](){return he->devaluator->multiply_inplace(cts_x_flat[i],
+                                                 cts_sigma_flat[i]);});
                 he->devaluator->relinearize_inplace(cts_x_flat[i],
                                                     *he->drelin_keys);
-                he->devaluator->multiply_plain_inplace(cts_x_flat[i], tmp_w[i]);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(cts_x_flat[i], tmp_w[i]);});
                 he->devaluator->add_plain_inplace(cts_x_flat[i], tmp_b[i]);
                 ++this->he_rescale_count;
                 he->devaluator->rescale_to_next_inplace(cts_x_flat[i]);
@@ -5029,14 +4134,14 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
             // boundary.  Keep cts_x_flat on DEVICE for the following FFN1;
             // no unmasked ciphertext and no reconstructed intermediate is
             // exposed to either party.
-            auto copy_start = high_resolution_clock::now();
+            auto copy_start = steady_clock::now();
             for (size_t i = 0; i < normalized_residual_cts.size(); ++i) {
                 UnifiedCiphertext::to_host(
                     *he->dcontext, cts_x_flat[i].dcipher(), *he->context,
                     normalized_residual_cts[i]);
             }
             this->ct_transfer_mem_la +=
-                ((high_resolution_clock::now() - copy_start)).count() / 1e9;
+                ((steady_clock::now() - copy_start)).count() / 1e9;
         } else {
             for (size_t i = 0; i < normalized_residual_cts.size(); ++i) {
                 normalized_residual_cts[i] = cts_x_flat[i].hcipher();
@@ -5056,7 +4161,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
         */
         FCMetadata data = linear.data_lin3;
         vector<UnifiedCiphertext> linear3_output;
-        const auto linear3_profile_start = high_resolution_clock::now();
+        const auto linear3_profile_start = steady_clock::now();
         linear.linear_2(
             he,
             cts_x_flat, 
@@ -5067,7 +4172,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
         if (profile_enabled_)
             profile_record_he(
                 BlbViTProfileStage::FFN1,
-                chrono::duration<double, milli>(high_resolution_clock::now() -
+                chrono::duration<double, milli>(steady_clock::now() -
                                                 linear3_profile_start)
                     .count());
         cout << "linear2 done" << endl;
@@ -5090,17 +4195,18 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
         // Snapshot the true post-linear3, pre-polynomial ciphertext.  The
         // snapshot is ciphertext-only and remains masked before it leaves
         // Alice.  linear3_output itself stays available to eval_gelu_poly.
-        this->he_compute_la +=
-            ((high_resolution_clock::now() - start)).count()/1e+9;
+        execution_observe::interval("CKKS",__func__,__LINE__,start);
+    this->he_compute_la +=
+            ((steady_clock::now() - start)).count()/1e+9;
         if (he->is_gpu_enable()) {
-            auto copy_start = high_resolution_clock::now();
+            auto copy_start = steady_clock::now();
             for (size_t i = 0; i < linear3_output.size(); ++i) {
                 UnifiedCiphertext::to_host(
                     *he->dcontext, linear3_output[i].dcipher(), *he->context,
                     pre_gelu_cts[i]);
             }
             this->ct_transfer_mem_la +=
-                ((high_resolution_clock::now() - copy_start)).count()/1e+9;
+                ((steady_clock::now() - copy_start)).count()/1e+9;
         } else {
             for (size_t i = 0; i < linear3_output.size(); ++i) {
                 pre_gelu_cts[i] = linear3_output[i].hcipher();
@@ -5111,26 +4217,27 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
              << " source_scale_bits=" << log2(linear3_output[0].scale())
              << " source_limbs=" << linear3_output[0].coeff_modulus_size()
              << " plaintext_recovery=0 constant_placeholder=0" << endl;
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         /*
             before: scale 64, Q= (60, 32, 60, 60, 60)
         */
         vector<UnifiedCiphertext> gelu_output;
         eval_gelu_poly(gelu_output, linear3_output, he,
                        kGeluConversionScaleBits);
-        this->he_compute_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        execution_observe::interval("CKKS",__func__,__LINE__,start);
+    this->he_compute_la += ((steady_clock::now() - start)).count()/1e+9;
         
         if (he->is_gpu_enable()) {
         // Load result ciphertexts to CPU
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         for(size_t i = 0;i < gelu_output.size();i ++){
             gelu_output[i].to_host(*he->context, *he->dcontext);
         }
-        this->ct_transfer_mem_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_mem_la += ((steady_clock::now() - start)).count()/1e+9;
         }
         NVTX_POP(true);
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         cout << "num of output cts:" << gelu_output.size() << endl;
         cout << "bitwidth of output ct:" << gelu_output[0].coeff_modulus_size() << endl;
         if (gelu_output.size() != output_cts.size()) {
@@ -5189,7 +4296,7 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
                  << " masked_algorithm1=1 half_decode=1 intermediate_tensor_opened=0"
                  << " source=ViT_original_path" << endl;
         }
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
         cout << "linear3_output.size():" << linear3_output.size() << endl;
         cout << "output_pts.size():" << output_pts.size() << endl;
     }
@@ -5199,9 +4306,9 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
     cout << "send and receive done in ln_part2_linear3_gelu_part1" << endl;
     vector<vector<HE_CKKS::scalar_t>> normalized_residual_vector;
     if (!normalized_residual_pts.empty()) {
-        normalized_residual_vector = ckks_to_mpc(
+        normalized_residual_vector = fusion_observe::call(__func__,__LINE__,"normalized_residual_pts",[&](){return ckks_to_mpc(
             normalized_residual_pts, poly_modulus_degree,
-            he->get_Q(normalized_residual_pts[0]), bitwidth, s, he, false);
+            he->get_Q(normalized_residual_pts[0]), bitwidth, s, he, false);});
         FixArray ffn_residual_column(
             party, linear.data_lin1_0.image_size * COMMON_DIM, true,
             bitwidth, s);
@@ -5232,22 +4339,22 @@ std::map<char*,FixArray> Bert_ckks::ln_part2_linear3_gelu_part1(
         use_bert_half_packing ? pre_gelu_pts_half.size() : pre_gelu_pts.size());
     vector<vector<HE_CKKS::scalar_t>> vec_output(
         use_bert_half_packing ? output_pts_half.size() : output_pts.size());
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     if (use_bert_half_packing) {
-        vec_pre_gelu = ckks_to_mpc(
+        vec_pre_gelu = fusion_observe::call(__func__,__LINE__,"pre_gelu_pts_half",[&](){return ckks_to_mpc(
             pre_gelu_pts_half, poly_modulus_degree,
-            he->get_Q(pre_gelu_pts_half[0]), bitwidth, s, he, true);
-        vec_output = ckks_to_mpc(
+            he->get_Q(pre_gelu_pts_half[0]), bitwidth, s, he, true);});
+        vec_output = fusion_observe::call(__func__,__LINE__,"output_pts_half",[&](){return ckks_to_mpc(
             output_pts_half, poly_modulus_degree,
-            he->get_Q(output_pts_half[0]), bitwidth, s, he, true);
+            he->get_Q(output_pts_half[0]), bitwidth, s, he, true);});
     } else {
-        vec_pre_gelu = ckks_pairs_to_mpc(
-            pre_gelu_pts, gelu_cts_size, bitwidth, s, he);
-        vec_output = ckks_pairs_to_mpc(
-            output_pts, 2 * gelu_cts_size, bitwidth, s, he);
+        vec_pre_gelu = fusion_observe::call(__func__,__LINE__,"pre_gelu_pts",[&](){return ckks_pairs_to_mpc(
+            pre_gelu_pts, gelu_cts_size, bitwidth, s, he);});
+        vec_output = fusion_observe::call(__func__,__LINE__,"output_pts",[&](){return ckks_pairs_to_mpc(
+            output_pts, 2 * gelu_cts_size, bitwidth, s, he);});
     }
     
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     // cout << "mpc_to_ckks comm:" << this->get_comm() << endl;
@@ -5370,15 +4477,15 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
             residual_packed.data + i * slot,
             residual_packed.data + (i + 1) * slot);
     }
-    auto start = high_resolution_clock::now();
-    import_target_scale(*this, h6, slot, bitwidth, s, he->he_scale,
-                            he, h6_pts, "ffn2_gelu_input");
+    auto start = steady_clock::now();
+    fusion_observe::call(__func__,__LINE__,"*this:ffn2_gelu_input",[&](){return import_target_scale(*this, h6, slot, bitwidth, s, he->he_scale,
+                            he, h6_pts, "ffn2_gelu_input");});
     vector<UnifiedPlaintext> residual_pts;
     if (!pre_norm_ffn_output_only)
-      import_target_scale(*this, residual_share, slot, bitwidth, s,
+      fusion_observe::call(__func__,__LINE__,"*this:ffn2_residual_input",[&](){return import_target_scale(*this, residual_share, slot, bitwidth, s,
                             he->he_scale, he, residual_pts,
-                            "ffn2_residual_input");
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+                            "ffn2_residual_input");});
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     
@@ -5410,7 +4517,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
                  << " residual_cts=" << enc_residual.size()
                  << " imag_repack=1 source=Figure10_Block1" << endl;
         } else {
-            he->encrypt_send(h6_pts, enc_h6);
+            fusion_observe::encrypt_send(he,h6_pts, enc_h6,__func__,__LINE__);
             cout << "FORMAL_TRANSFER_LAYOUT stage=ffn2_input status=PASS"
                  << " layout=ordinary_full_slot h6_cts=" << enc_h6.size()
                  << " residual_cts=" << enc_residual.size()
@@ -5447,7 +4554,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
     else{
         LOCATION loc = he->backend();
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         if (use_bert_half_packing) {
             if (enc_h6_half.empty()) {
                 throw runtime_error("formal FFN2 input half-packing requires an even ciphertext count");
@@ -5463,12 +4570,12 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         }
         if (!enc_residual.empty())
             recv_encrypted_vector(he->context, io, enc_residual);
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
         
         NVTX_PUSH("L4-LN1", true);
         if (he->is_gpu_enable()) {
         // Load revice ciphertexts to GPU
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         for_each_n(enc_h6.begin(), enc_h6.size(),
                 [he](auto &ct) { ct.to_device(*he->context, *he->dcontext); });
         for_each_n(enc_residual.begin(), enc_residual.size(),
@@ -5477,10 +4584,10 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
                 [he](auto &pt) { pt.to_device(*he->context, *he->dcontext); });
         for_each_n(residual_pts.begin(), residual_pts.size(),
                 [he](auto &pt) { pt.to_device(*he->context, *he->dcontext); });
-        this->ct_transfer_mem_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_mem_la += ((steady_clock::now() - start)).count()/1e+9;
         }
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         cout << "FORMAL_TRANSFER_LAYOUT stage=ffn2_input status=PASS"
              << " layout=" << (use_bert_half_packing ? "xyj_half_slot" : "ordinary_full_slot")
              << " h6_cts=" << (use_bert_half_packing ? enc_h6_half.size() : enc_h6.size())
@@ -5508,7 +4615,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
             }
         }
         vector<UnifiedCiphertext> h7;
-        const auto linear4_profile_start = high_resolution_clock::now();
+        const auto linear4_profile_start = steady_clock::now();
         linear.linear_2(
             he,
             enc_h6, 
@@ -5519,7 +4626,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         if (profile_enabled_)
             profile_record_he(
                 BlbViTProfileStage::FFN2,
-                chrono::duration<double, milli>(high_resolution_clock::now() -
+                chrono::duration<double, milli>(steady_clock::now() -
                                                 linear4_profile_start)
                     .count());
         cout << "h7.size():" << h7.size() << ", should be:" << num_cts_ln << endl;
@@ -5651,13 +4758,13 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
             #pragma omp parallel for num_threads(4)
                 for(int j=0;j<h7.size();j++){
                     Ciphertext tmp;
-                    he->evaluator->rotate_vector(X_avg[j],pow(2,i-1)*L,*he->gal_keys,tmp);
+                    execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(X_avg[j],pow(2,i-1)*L,*he->gal_keys,tmp);});
                     he->evaluator->add_inplace(X_avg[j],tmp);
                 }
             } else {
                 for(int j=0;j<h7.size();j++){
                     UnifiedCiphertext tmp(loc);
-                    he->devaluator->rotate_vector(X_avg[j], pow(2,i-1)*L, *he->dgal_keys, tmp);
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(X_avg[j], pow(2,i-1)*L, *he->dgal_keys, tmp);});
                     he->devaluator->add_inplace(X_avg[j],tmp);
                 }
             }
@@ -5680,9 +4787,9 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<num_cts_ln;i++){
             if (!he->is_gpu_enable()) {
-                he->evaluator->multiply_plain_inplace(X_avg[i], inv_D_p);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(X_avg[i], inv_D_p);});
             } else {
-                he->devaluator->multiply_plain_inplace(X_avg[i], inv_D_p);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(X_avg[i], inv_D_p);});
             }
         }
         cout << "OK3" << endl;
@@ -5696,12 +4803,12 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<num_cts_ln;i++){
             if (!he->is_gpu_enable()) {
-            he->evaluator->multiply_plain_inplace(h7[i],scale_up);
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(h7[i],scale_up);});
             he->evaluator->sub_inplace(h7[i],X_avg[i]);
             ++this->he_rescale_count;
             he->evaluator->rescale_to_next_inplace(h7[i]);
             } else {
-            he->devaluator->multiply_plain_inplace(h7[i],scale_up);
+            execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(h7[i],scale_up);});
             he->devaluator->sub_inplace(h7[i],X_avg[i]);
             ++this->he_rescale_count;
             he->devaluator->rescale_to_next_inplace(h7[i]);
@@ -5735,13 +4842,13 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<num_cts_ln;i++){
             if (!he->is_gpu_enable()) {
-            he->evaluator->square_inplace(sigma[i]);
+            execution_observe::he_call(1,[&](){return he->evaluator->square_inplace(sigma[i]);});
             he->evaluator->relinearize_inplace(sigma[i], *he->relin_keys);
             for (int step = 0; step < centered_mod_switches; ++step) {
                 he->evaluator->mod_switch_to_next_inplace(h7[i]);
             }
             } else {
-            he->devaluator->square_inplace(sigma[i]);
+            execution_observe::he_call(1,[&](){return he->devaluator->square_inplace(sigma[i]);});
             he->devaluator->relinearize_inplace(sigma[i], *he->drelin_keys);
             for (int step = 0; step < centered_mod_switches; ++step) {
                 he->devaluator->mod_switch_to_next_inplace(h7[i]);
@@ -5766,13 +4873,13 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
             #pragma omp parallel for num_threads(4)
             for(int j=0;j<num_cts_ln;j++){
                 Ciphertext tmp;
-                he->evaluator->rotate_vector(sigma[j],pow(2,i-1)*L,*he->gal_keys,tmp);
+                execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(sigma[j],pow(2,i-1)*L,*he->gal_keys,tmp);});
                 he->evaluator->add_inplace(sigma[j],tmp);
             }
             } else {
             for(int j=0;j<num_cts_ln;j++){
                 UnifiedCiphertext tmp(loc);
-                he->devaluator->rotate_vector(sigma[j], pow(2,i-1)*L, *he->dgal_keys, tmp);
+                execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(sigma[j], pow(2,i-1)*L, *he->dgal_keys, tmp);});
                 he->devaluator->add_inplace(sigma[j], tmp);
             }
             }
@@ -5880,8 +4987,8 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
             he->encoder->encode(mask, parms_id, variance_mask_scale, mask_p);
             he->encoder->encode(inv_D, parms_id, variance_inv_d_scale,
                                 inv_D_p2);
-            he->evaluator->multiply_plain_inplace(X_sum2,mask_p);
-            he->evaluator->multiply_plain_inplace(X_sum2,inv_D_p2);
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(X_sum2,mask_p);});
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(X_sum2,inv_D_p2);});
             ++this->he_rescale_count;
             he->evaluator->rescale_to_next_inplace(X_sum2);
             ++this->he_rescale_count;
@@ -5893,8 +5000,8 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
             he->dencoder->encode(*he->dcontext, inv_D,
                                  variance_inv_d_scale, inv_D_p2,
                                  chain_index);
-            he->devaluator->multiply_plain_inplace(X_sum2,mask_p);
-            he->devaluator->multiply_plain_inplace(X_sum2,inv_D_p2);
+            execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(X_sum2,mask_p);});
+            execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(X_sum2,inv_D_p2);});
             ++this->he_rescale_count;
             he->devaluator->rescale_to_next_inplace(X_sum2);
             ++this->he_rescale_count;
@@ -5919,20 +5026,21 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
              << " target_scale_bits=" << kFormalConversionScaleBits
              << " output_limbs=" << X_sum2.coeff_modulus_size() << endl;
         // 6. send cts to client, and ckks to mpc
-        this->he_compute_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        execution_observe::interval("CKKS",__func__,__LINE__,start);
+    this->he_compute_la += ((steady_clock::now() - start)).count()/1e+9;
         
         if (he->is_gpu_enable()) {
         // Load result ciphertexts to CPU
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         X_sum2.to_host(*he->context, *he->dcontext);
         for(size_t i = 0;i < h7.size();i ++){
             h7[i].to_host(*he->context, *he->dcontext);
         }
-        this->ct_transfer_mem_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_mem_la += ((steady_clock::now() - start)).count()/1e+9;
         }
         NVTX_POP(true);
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         cout << "num of output cts:" << sigma.size()+1 << endl;
         cout << "bitwidth of h7 ct:" << h7[0].coeff_modulus_size() << endl;
         cout << "bitwidth of X_sum2 ct:" << X_sum2.coeff_modulus_size() << endl;
@@ -5958,7 +5066,7 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
         mask_ckks_to_mpc_inplace(enc_sigma, sigma_pts, he);
         send_encrypted_vector(io, enc_sigma);
         cout << "STRICT_BLB_FUSION stage=linear4_add_layernorm_part1 statistics=HE skip_branch=masked" << endl;
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
         }
     }
     // cout << "send and receive cts, comm:" << this->get_comm() << endl;
@@ -5967,9 +5075,9 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
     this->ct_transfer_round += this->get_round();
     cout << "send and receive done in linear4_add_layernorm_part1" << endl;
     if (pre_norm_ffn_output_only) {
-        vector<vector<HE_CKKS::scalar_t>> residual_vector = ckks_to_mpc(
+        vector<vector<HE_CKKS::scalar_t>> residual_vector = fusion_observe::call(__func__,__LINE__,"x_avg_pts",[&](){return ckks_to_mpc(
             x_avg_pts, poly_modulus_degree,
-            he->get_Q(x_avg_pts[0]), bitwidth, s, he, false);
+            he->get_Q(x_avg_pts[0]), bitwidth, s, he, false);});
         FixArray packed(party, num_cts_ln * slot, true, bitwidth, s);
         size_t offset = 0;
         for (const auto &part : residual_vector) {
@@ -5998,19 +5106,19 @@ std::map<char*,FixArray> Bert_ckks::linear4_add_layernorm_part1(FixArray input, 
     }
     vector<vector<HE_CKKS::scalar_t>> vec_x_avg(x_avg_pts.size());
     vector<vector<HE_CKKS::scalar_t>> vec_sigma(sigma_pts.size());
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     if (!x_avg_pts_half.empty()) {
-        vec_x_avg = ckks_to_mpc(x_avg_pts_half, poly_modulus_degree,
+        vec_x_avg = fusion_observe::call(__func__,__LINE__,"x_avg_pts_half",[&](){return ckks_to_mpc(x_avg_pts_half, poly_modulus_degree,
                                 he->get_Q(x_avg_pts_half[0]), bitwidth, s,
-                                he, true);
+                                he, true);});
     } else {
-        vec_x_avg = ckks_to_mpc(x_avg_pts, poly_modulus_degree,
+        vec_x_avg = fusion_observe::call(__func__,__LINE__,"x_avg_pts",[&](){return ckks_to_mpc(x_avg_pts, poly_modulus_degree,
                                 he->get_Q(x_avg_pts[0]), bitwidth, s, he,
-                                false);
+                                false);});
     }
-    vec_sigma = ckks_to_mpc(sigma_pts, poly_modulus_degree,
-                            he->get_Q(sigma_pts[0]), bitwidth, s, he, false);
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    vec_sigma = fusion_observe::call(__func__,__LINE__,"sigma_pts",[&](){return ckks_to_mpc(sigma_pts, poly_modulus_degree,
+                            he->get_Q(sigma_pts[0]), bitwidth, s, he, false);});
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     cout << "vec_sigma.size():" << vec_sigma.size() << ", should be 1" << endl;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();

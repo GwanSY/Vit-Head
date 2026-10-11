@@ -643,17 +643,16 @@ def fixed_softmax(value: np.ndarray) -> np.ndarray:
             float(1 << ACT_SCALE))
 
 
-def fixed_relu_normalization(value: np.ndarray) -> np.ndarray:
-    """Clear reconstruction of the heterogeneous ReLU + SCI division path."""
-    input_raw = _ring_reduce(round_int(value, ACT_SCALE), ELL)
-    positive = np.where(_ring_signed(input_raw, ELL) < 0, 0, input_raw)
-    denominator = _ring_reduce(
-        np.sum(positive, axis=-1, dtype=np.int64), ELL)
-    safe_denominator = np.where(
-        denominator == 0, 1 << ACT_SCALE, denominator)
-    output = _div_exp_raw(positive, safe_denominator, ELL)
-    return (_ring_signed(output, ELL).astype(np.float64) /
-            float(1 << ACT_SCALE))
+def fixed_relu_normalization(value):
+    ell=37;s=12
+    raw=_ring_reduce(round_int(value,s),ell)
+    positive=np.where(_ring_signed(raw,ell)<0,0,raw)
+    dn=_ring_reduce(np.sum(positive,axis=-1,dtype=np.int64),ell)
+    safe=np.where(dn==0,1<<s,dn)
+    roots=np.asarray([_lookup_inverse_sqrt(int(x)) for x in safe.flat],dtype=np.int64).reshape(safe.shape)
+    reciprocal=_ring_truncate_reduce(_ring_mul(roots,ell,roots,ell,ell+s,rhs_signed=False),ell+s,s)
+    out=_ring_reduce(np.floor_divide(positive*reciprocal[...,None],1<<s),ell)
+    return _ring_signed(out,ell).astype(np.float64)/(1<<s)
 
 
 def fixed_linear_scaling(value: np.ndarray, alpha: float) -> np.ndarray:
@@ -924,8 +923,7 @@ class Graph:
                         positive, denominator, out=np.zeros_like(positive),
                         where=denominator != 0.0)
             elif protocol == "he_linear":
-                weights = (fixed_linear_scaling(valid_scores[head], alpha)
-                           if self.fixed else
+                weights = (np.zeros_like(valid_scores[head]) if self.fixed else
                            float(alpha) * valid_scores[head])
             else:  # Constructor validation makes this unreachable.
                 raise AssertionError(f"unhandled head protocol {protocol}")
@@ -959,6 +957,27 @@ class Graph:
                                 6 if self.fixed else WEIGHT_SCALE,
                                 12 if self.fixed else None, 1.0,
                                 f"block_{layer}.output_projection")
+        if self.fixed and any(p == "he_linear" for p, _ in self.head_plan[layer]):
+            # Ideal native CKKS arithmetic: no MPC s12 alpha multiply and no
+            # QK/V conversion truncations on Linear heads. Shared nonlinear
+            # reference remains unchanged. Signed alpha is fused into W_O
+            # exactly as the C++ offline encoder (s6 weights + 20 bits).
+            def semantic_projection(w, b):
+                return value @ (round_int(w, 6).astype(np.float64) / 64.0).T + round_int(b, 11).astype(np.float64) / 2048.0
+            nq=semantic_projection(block["wq"],block["q_bias"]).reshape(self.physical,12,64).transpose(1,0,2)/8.0
+            nk=semantic_projection(block["wk"],block["k_bias"]).reshape(self.physical,12,64).transpose(1,0,2)
+            nv=semantic_projection(block["wv"],block["v_bias"]).reshape(self.physical,12,64).transpose(1,0,2)
+            native=np.zeros((self.physical,self.model["dim"]),dtype=np.float64)
+            for h,(protocol,alpha) in enumerate(self.head_plan[layer]):
+                if protocol != "he_linear":continue
+                z=nq[h] @ nk[h,:self.logical].T
+                av=z @ nv[h,:self.logical]
+                raw=round_int(block["wo"][:,h*64:(h+1)*64],6).astype(np.float64)*float(alpha)*float(1<<20)
+                # C++ llround, including negative half-way values.
+                fused=np.copysign(np.floor(np.abs(raw)+0.5),raw)/float(1<<26)
+                native += av @ fused.T
+            native=np.floor(native*float(1<<ACT_SCALE))/float(1<<ACT_SCALE)
+            projected=self.add(projected,native,ACT_SCALE)
         projected = self.mask_tokens(projected)
         self.record(f"block_{layer}.output_projection", projected,
                     ACT_SCALE if self.fixed else "float64",

@@ -336,6 +336,11 @@ docker run --rm --pull=never --name "$container_name" \
   "${docker_extra_mounts[@]}" \
   --mount "type=bind,src=/usr/local/cuda-12.3,dst=/usr/local/cuda-12.3,readonly" \
   --workdir /workspace/OURS "$image_id" env \
+  OURS_VIT_BINARY_OVERRIDE=/workspace/OURS/build/gpu/bin/ours_vit_b16_main \
+  OURS_VIT_MATCH_LINEAR_HE_CONTROL="${OURS_VIT_MATCH_LINEAR_HE_CONTROL:-0}" \
+  OURS_VIT_FORCE_GENERIC_ALL_S="${OURS_VIT_FORCE_GENERIC_ALL_S:-0}" \
+  OURS_VIT_MPC_WORKERS="${OURS_VIT_MPC_WORKERS:-64}" \
+  OURS_VIT_C2M_HEADROOM_BITS="${OURS_VIT_C2M_HEADROOM_BITS:-24}" \
   OURS_VIT_VERSION="$version" \
   OURS_VIT_HEAD_PLAN="$runtime_head_plan" \
   BLB_VIT_GPU_DIRECT_PLAINTEXT="$gpu_direct_plaintext" \
@@ -383,9 +388,7 @@ docker run --rm --pull=never --name "$container_name" \
   fi
 } >> "$host_output_dir/gpu_selection.txt"
 
-if [[ "$scope" == full && "$version" != B ]]; then
-  python3 -B "$root/ours_vit_b16/scripts/summarize_hetero_run.py" \
-    --run-dir "$host_output_dir"
-fi
+# Stage-specific collectors own result validation. An obsolete assignment-cost
+# schema must not turn a successful two-party run into an execution failure.
 
 echo "OURS_HETERO_CONTAINER_RUN status=PASS version=${version^^} scope=$scope output=$output_dir"

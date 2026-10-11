@@ -100,6 +100,7 @@ public:
     double conversion_la = 0;
     double other_nonlinear_la = 0;
     double he_compute_la = 0;
+    double optimized_layout_s = 0;
     uint64_t block_online_comm_bytes = 0;
     double block_online_profile_seconds = 0;
     uint64_t ckks_to_mpc_conversions = 0;
@@ -154,8 +155,7 @@ public:
     FixArray heterogeneous_av_share;
     FixArray heterogeneous_wo_share;
     bool heterogeneous_av_wo_ready = false;
-    vector<UnifiedCiphertext> native_linear_qk_he1_cts;
-    vector<UnifiedCiphertext> native_linear_v_he1_cts;
+    vector<UnifiedCiphertext> optimized_native_qkv;
     bool native_linear_operands_ready = false;
     FixArray attention_input_residual_share;
     bool attention_v_ready = false;
@@ -477,28 +477,16 @@ public:
     vector<vector<HE_CKKS::scalar_t>> layer_norm_part2_attention(
         std::map<char*,FixArray> input, int layer_id = 0);
 
-    // BERT-base is post-norm: layer 0 starts with the exported embedding
-    // tensor, so Q/K/V must consume the real input directly.  This entry
-    // reuses the existing MPC↔CKKS and pp_1/BSGS path without manufacturing
-    // an identity LayerNorm share.
-    vector<vector<HE_CKKS::scalar_t>> attention_from_real_input(
-        const FixArray &input, int layer_id = 0);
-
     std::map<char*,FixArray> gelu_part1(uint64_t *x, int num_ops, int bitwidth, int s);
 
     FixArray gelu_nonlinear(std::map<char*,FixArray> input);
-    // my softmax
-    FixArray softmax_ot(FixArray input);
-
     FixArray softmax_he(FixArray input);
 
     vector<FixArray> softmax_fix_he(int party, FixArray x, FPMath* fpmath[],
                                     int active_heads = PACKING_NUM);
 
-    // HETERO deliberately retains BLB's full CKKS->MPC->CKKS boundary for every
-    // head.  Only the public, pre-inference normalization protocol differs;
-    // HE-linear candidates use the calibrated alpha in MPC at this version
-    // so HETERO cannot claim selective-conversion savings.
+    // Normalize Softmax/ReLU groups in MPC; defer Linear heads to the native
+    // CKKS output path. Alpha is fused into the frozen WO rows.
     FixArray heterogeneous_attention_norm(
         FixArray input,
         const vector<ours_vit::HeadProtocol> &protocols,

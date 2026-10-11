@@ -1,5 +1,7 @@
 # 运行说明
 
+> **2026-10-08 当前轮次：仅头级异构机制消融。** 执行前必须遵守 [方案首节](EXPERIMENT_PLAN.md) 与其文末表格要求。本轮只用 B/H 和固定头计划，后文 costs/offline、HA/HAP、新打包命令属于历史说明，禁止作为本轮队列运行。2026-10-09 用户已更正数据授权：直接将现有验证集按类别划分为 2000/5000/43000 张，最后 43000 张本轮不评估；无需训练集。固定的 16 个计划及状态见 [本轮契约](blb_base/outputs/heterogeneous_attention_20261009/experiment_contract.json)。本轮新增用户指定的 `HETEROGENEOUS_ATTENTION_RESULTS.md` 不受下文历史“两份 Markdown”约定限制。
+
 实验定义及后续实现任务见 [实验实现计划](EXPERIMENT_PLAN.md)。以下命令均在 `OURS/blb_base` 执行；版本迁移已通过构建与接口回归，B 已完成单图完整密态推理；数据集级准确率及 H/HA/HAP 全网实验仍待验收。
 
 ## 1. 环境与资产检查

@@ -1,3 +1,6 @@
+#include "execution_observer.h"
+#include "mhp_candidate.h"
+thread_local bool blb_mhp_diagonal_wo=false;
 #include "linear_ckks.h"
 #include "packed_block_rotation.h"
 
@@ -1102,7 +1105,7 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
     // the one-prime Algorithm-1 conversion boundary.  Its QK scale is solved
     // below from that final dropped prime, so a second padding level is not
     // necessary.
-    const size_t native_chain_offset = native_linear_enabled ? 1 : 0;
+    const size_t native_chain_offset = native_linear_enabled ? 3 : 0;
     const double ln_attention_output_scale = scale_after_rescale(
         *he1, 6 + native_chain_offset,
         std::ldexp(1.0, 3 * he1->he_scale), "QKV input scale");
@@ -1137,23 +1140,6 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
     double qkv_input_scale = ln_attention_output_scale;
     const double qk_scale_before_lift = qk_output_scale(qkv_input_scale);
     double native_qk_target_scale = std::ldexp(1.0, 49);
-    if (native_linear_enabled) {
-        const auto wo_input_context = context_at_chain(
-            *he1, 1, "NATIVE native W_O input");
-        const auto &wo_input_moduli =
-            wo_input_context->parms().coeff_modulus();
-        if (wo_input_moduli.size() < 2)
-            throw runtime_error("NATIVE native W_O lacks its final rescale level");
-        const double wo_dropped_modulus =
-            static_cast<double>(wo_input_moduli.back().value());
-        const double wo_weight_scale = std::ldexp(1.0, he1->he_scale);
-        const double conversion_scale = std::ldexp(1.0, 49);
-        // AV has scale qk_scale^2.  BSGS2 multiplies by W_O at
-        // wo_weight_scale, and the one remaining real rescale must produce
-        // conversion_scale exactly.
-        native_qk_target_scale = std::sqrt(
-            conversion_scale * wo_dropped_modulus / wo_weight_scale);
-    }
     if (sequence_length == 256) {
         qkv_input_scale *=
             std::sqrt(native_qk_target_scale / qk_scale_before_lift);
@@ -1231,7 +1217,8 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
     }
     cout << "pp_1 done" << endl;
     const auto output_projection_weights =
-        attention_output_projection_weights_for_bsgs(bm.w_o[layer_id]);
+        bm.w_o[layer_id];
+    blb_mhp_diagonal_wo=true;
     if (!native_linear_enabled) {
       pp_2[layer_id] = params_preprocessing_ct_pt(
           he2,
@@ -1243,19 +1230,20 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
           data_lin2,
           6,
           12,
-          3,
+          4,
           output_projection_input_scale
       );
     }
     if (!native_linear_enabled && he2->is_gpu_enable()) {
         auto metadata = make_offline_metadata_ciphertext(
-            *he2, 3, output_projection_input_scale, "OutputProjection");
+            *he2, 4, output_projection_input_scale, "OutputProjection");
         materialize_linear_plaintexts(he2[0], {metadata}, pp_2[layer_id]);
         cout << "CKKS_OFFLINE_MATERIALIZE op=BSGS2 layer=" << layer_id
-             << " stage=OutputProjection seal_chain=3 input_scale_bits="
+             << " stage=OutputProjection seal_chain=4 input_scale_bits="
              << setprecision(17) << log2(output_projection_input_scale)
              << defaultfloat << endl;
     }
+    blb_mhp_diagonal_wo=false;
     cout << "pp_2 done mode="
          << (native_linear_enabled ? "assignment_partitioned"
                                       : "original_full") << endl;
@@ -1315,23 +1303,29 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
                 }
             }
         }
-        const auto mpc_projection_weights =
-            attention_output_projection_weights_for_bsgs(mpc_weights);
+        const auto mpc_projection_weights = mpc_weights;
         // Keep the MPC-normalized contribution on BLB's original he2 chain.
         // Native Linear heads use the one extra he1 level for QK->AV->WO,
         // but making Softmax/ReLU heads pay for that extended chain is slower
         // than one additional real output conversion in a mixed layer.
-        const double native_av_input_scale =
-            planned_qk_output_scale * planned_qk_output_scale;
+        const double native_av_input_scale = std::ldexp(
+            double(context_at_chain(*he1,1,"Native exact output scale")->parms().coeff_modulus().back().value()),
+            49-he1->he_scale);
         if (has_mpc) {
+            blb_mhp_diagonal_wo = true;
             pp_2_mpc[layer_id] = params_preprocessing_ct_pt(
                 he2, sequence_length, COMMON_DIM, COMMON_DIM,
                 mpc_projection_weights, bm.b_o[layer_id], data_lin2,
-                6, 12, 3, output_projection_input_scale);
+                6, 12, 4, output_projection_input_scale);
+            blb_mhp_diagonal_wo = false;
         }
         if (has_linear) {
-            const auto native_projection_weights =
-                attention_output_projection_weights_for_bsgs(native_weights);
+            auto native_projection_weights = native_weights;
+            // Existing four-head MHP feature slots, without diagonal AV output.
+            for(int ct=0;ct<12;++ct) for(int c=0;c<64;++c) {
+                const int head=(ct/4)*4+c%4, feature=(ct%4)*16+c/4;
+                native_projection_weights[ct*64+c]=native_weights[head*64+feature];
+            }
             // Native QK exits at chain 2 and the diagonal selector consumes
             // one level. V is value-preservingly aligned to the same planned
             // scale; native AV therefore enters W_O at chain 1 and QK^2.
@@ -1349,7 +1343,7 @@ void Linear_ckks::weights_preprocess_layer(const BertModel &bm, int layer_id){
         }
         if (has_mpc && he2->is_gpu_enable()) {
             auto metadata = make_offline_metadata_ciphertext(
-                *he2, 3, output_projection_input_scale,
+                *he2, 4, output_projection_input_scale,
                 "SELECTIVEGroupedOutputProjection");
             materialize_linear_plaintexts(
                 he2[0], {metadata}, pp_2_mpc[layer_id]);
@@ -1715,13 +1709,9 @@ Linear_ckks::bert_cross_packing_single_matrix(
                         // [filter_w/2, filter_w) of the same matrix.  The
                         // output ciphertext selects the 32-column block;
                         // the lane half selects head 2*p or 2*p+1.
-                        const bool upper_head = output_slot >= num_diag;
-                        const int output_feature =
-                            output_ciphertext * num_diag +
-                            (output_slot % num_diag);
-                        const int matrix_column = output_feature;
-                        const int head = packing_ind * 2 +
-                            (upper_head ? 1 : 0);
+                        const int output_ct = packing_ind * num_matrix_per_col + output_ciphertext;
+                        const int matrix_column = (output_ct % 4) * 16 + output_slot / 4;
+                        const int head = (output_ct / 4) * 4 + output_slot % 4;
                         const int left_local_feature =
                             baby == 0
                                 ? source_slot
@@ -1896,28 +1886,19 @@ Linear_ckks::bert_cross_packing_single_matrix_2(
                     const int matrix_column = output_in_upper_half
                         ? output_feature - data.filter_w / 2
                         : output_feature;
-                    const uint64_t left_raw = output_in_upper_half
-                        ? matrix2[left_input_feature][matrix_column]
-                        : matrix1[left_input_feature][matrix_column];
-                    const uint64_t right_raw = output_in_upper_half
-                        ? matrix2[right_input_feature][matrix_column]
-                        : matrix1[right_input_feature][matrix_column];
-                    const double left_value = checkpoint_fixed_to_real(
-                        left_raw, semantic_multiplier);
-                    const double right_value = checkpoint_fixed_to_real(
-                        right_raw, semantic_multiplier);
-                    std::fill(
-                        left_slots[input_ciphertext].begin() +
-                            source_slot * data.image_size,
-                        left_slots[input_ciphertext].begin() +
-                            (source_slot + 1) * data.image_size,
-                        left_value);
-                    std::fill(
-                        right_slots[input_ciphertext].begin() +
-                            source_slot * data.image_size,
-                        right_slots[input_ciphertext].begin() +
-                            (source_slot + 1) * data.image_size,
-                        right_value);
+                    for(int row=0;row<data.image_size;row++) {
+                        auto map_feature=[&](int c) {
+                            if(!blb_mhp_diagonal_wo)return input_ciphertext*feature_slots+c;
+                            const int head=(input_ciphertext/4)*4+c%4;
+                            const int diag=(input_ciphertext%4)*16+c/4;
+                            return head*64+(row+diag)%64;
+                        };
+                        int li=map_feature(left_local_feature),ri=map_feature(right_local_feature);
+                        const uint64_t l=output_in_upper_half?matrix2[li][matrix_column]:matrix1[li][matrix_column];
+                        const uint64_t r=output_in_upper_half?matrix2[ri][matrix_column]:matrix1[ri][matrix_column];
+                        left_slots[input_ciphertext][source_slot*data.image_size+row]=checkpoint_fixed_to_real(l,semantic_multiplier);
+                        right_slots[input_ciphertext][source_slot*data.image_size+row]=checkpoint_fixed_to_real(r,semantic_multiplier);
+                    }
                 }
             }
 
@@ -1960,49 +1941,14 @@ vector<vector<Plaintext>> Linear_ckks::bert_cross_packing_bias(
         device_values->resize(PACKING_NUM / 2);
     const double semantic_multiplier = checkpoint_semantic_multiplier(
         fractional_bits, "QKV packed bias");
-    int current_packing = 0, matrix1_pointer = 0, matrix2_pointer = 0;
-    while(current_packing < PACKING_NUM/2) {
-        vector<double> temp(data.slot_count, 0);
-        int next_flag = 0;
-        int row = 0;
-        if (matrix1_pointer == data.filter_w && matrix2_pointer == data.filter_w) {
-            matrix1_pointer = 0;
-            matrix2_pointer = 0;
-            current_packing += 1;
-            if (current_packing >= PACKING_NUM/2)
-                break;
+    for(int ct=0;ct<12;ct++) {
+        vector<double> temp(data.slot_count);
+        for(int slot=0;slot<data.slot_count;slot++) {
+            int lane=slot/data.image_size,head=(ct/4)*4+lane%4,feature=(ct%4)*16+lane/4;
+            temp[slot]=checkpoint_fixed_to_real(bias[head][feature],semantic_multiplier);
         }
-        while (row < data.slot_count) {
-            if (row >= data.slot_count / 2) {
-                next_flag = 1;
-            }
-            if (next_flag == 0) {
-                const double value = checkpoint_fixed_to_real(
-                    bias[current_packing * 2][matrix1_pointer],
-                    semantic_multiplier);
-                for (int i = 0; i < data.image_size; i++) {
-                    temp[row + i] = value;
-                }
-                matrix1_pointer++;
-            }
-            else {
-                const double value = checkpoint_fixed_to_real(
-                    bias[current_packing * 2 + 1][matrix2_pointer],
-                    semantic_multiplier);
-                for (int i = 0; i < data.image_size; i++) {
-                    temp[row + i] = value;
-                }
-                matrix2_pointer++;
-            }
-            row += data.image_size;
-        }
-        if (device_values != nullptr) {
-            (*device_values)[current_packing].push_back(std::move(temp));
-        } else {
-            Plaintext pt;
-            he->encoder->encode(temp, target_level, target_scale, pt);
-            cross_bias_packing[current_packing].push_back(std::move(pt));
-        }
+        if(device_values)(*device_values)[ct/2].push_back(std::move(temp));
+        else { Plaintext pt;he->encoder->encode(temp,target_level,target_scale,pt);cross_bias_packing[ct/2].push_back(std::move(pt)); }
     }
     return cross_bias_packing;
 }
@@ -2160,10 +2106,10 @@ void Linear_ckks::bert_cipher_plain_bsgs(
             if (j == 0)
                 rotatedIR[i][j] = cts[i];
             else {
-                he->evaluator->rotate_vector(cts[i], (num_diag - j) * data.image_size, *(he->gal_keys), temp_rot);
+                execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(cts[i], (num_diag - j) * data.image_size, *(he->gal_keys), temp_rot);});
                 rotatedIR[i][j] = temp_rot;
             }
-            he->evaluator->rotate_vector(rotatedIR[i][j],he->poly_modulus_degree/4, *(he->gal_keys), temp_rot);
+            execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(rotatedIR[i][j],he->poly_modulus_degree/4, *(he->gal_keys), temp_rot);});
             rotatedIR[i][j + n1] = temp_rot;
         }
     } else {
@@ -2174,9 +2120,9 @@ void Linear_ckks::bert_cipher_plain_bsgs(
             if (j == 0)
                 rotatedIR[i][j] = cts[i];
             else {
-                he->devaluator->rotate_vector(cts[i], (num_diag - j) * data.image_size, *(he->dgal_keys), rotatedIR[i][j]);
+                execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(cts[i], (num_diag - j) * data.image_size, *(he->dgal_keys), rotatedIR[i][j]);});
             }
-            he->devaluator->rotate_vector(rotatedIR[i][j],he->poly_modulus_degree/4, *(he->dgal_keys), rotatedIR[i][j + n1]);
+            execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(rotatedIR[i][j],he->poly_modulus_degree/4, *(he->dgal_keys), rotatedIR[i][j + n1]);});
         }
     }
     rotation_count += cts.size() * (2 * n1 - 1);
@@ -2213,12 +2159,12 @@ void Linear_ckks::bert_cipher_plain_bsgs(
                     Ciphertext ct_l_q, ct_r_q, ct_l_k, ct_r_k, ct_l_v, ct_r_v;
 
                     const size_t diag = l * n1 * n2 + j * n1 + i;
-                    he->evaluator->multiply_plain(rotatedIR[ct_i][i], pp.wq_pack[packing_index].first[diag][ct_i], ct_l_q);
-                    he->evaluator->multiply_plain(rotatedIR[ct_i][i + n1], pp.wq_pack[packing_index].second[diag][ct_i], ct_r_q);
-                    he->evaluator->multiply_plain(rotatedIR[ct_i][i], pp.wk_pack[packing_index].first[diag][ct_i], ct_l_k);
-                    he->evaluator->multiply_plain(rotatedIR[ct_i][i + n1], pp.wk_pack[packing_index].second[diag][ct_i], ct_r_k);
-                    he->evaluator->multiply_plain(rotatedIR[ct_i][i], pp.wv_pack[packing_index].first[diag][ct_i], ct_l_v);
-                    he->evaluator->multiply_plain(rotatedIR[ct_i][i + n1], pp.wv_pack[packing_index].second[diag][ct_i], ct_r_v);
+                    execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(rotatedIR[ct_i][i], pp.wq_pack[packing_index].first[diag][ct_i], ct_l_q);});
+                    execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(rotatedIR[ct_i][i + n1], pp.wq_pack[packing_index].second[diag][ct_i], ct_r_q);});
+                    execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(rotatedIR[ct_i][i], pp.wk_pack[packing_index].first[diag][ct_i], ct_l_k);});
+                    execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(rotatedIR[ct_i][i + n1], pp.wk_pack[packing_index].second[diag][ct_i], ct_r_k);});
+                    execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(rotatedIR[ct_i][i], pp.wv_pack[packing_index].first[diag][ct_i], ct_l_v);});
+                    execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(rotatedIR[ct_i][i + n1], pp.wv_pack[packing_index].second[diag][ct_i], ct_r_v);});
                     // cout << "mul done" << endl;
                     if (i == 0) {
                         he->evaluator->add(ct_l_q, ct_r_q, temp_results_q[l][k]);
@@ -2275,11 +2221,11 @@ void Linear_ckks::bert_cipher_plain_bsgs(
                 }
                 else {
                     Ciphertext temp_rot_ct;
-                    he->evaluator->rotate_vector(temp_results[l][k], -n1 * k * data.image_size, *(he->gal_keys), temp_rot_ct);
+                    execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(temp_results[l][k], -n1 * k * data.image_size, *(he->gal_keys), temp_rot_ct);});
                     he->evaluator->add_inplace(ct_q, temp_rot_ct);
-                    he->evaluator->rotate_vector(temp_results[l + temp_result_size][k], -n1 * k * data.image_size, *(he->gal_keys), temp_rot_ct);
+                    execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(temp_results[l + temp_result_size][k], -n1 * k * data.image_size, *(he->gal_keys), temp_rot_ct);});
                     he->evaluator->add_inplace(ct_k, temp_rot_ct);
-                    he->evaluator->rotate_vector(temp_results[l + temp_result_size * 2][k], -n1 * k * data.image_size, *(he->gal_keys), temp_rot_ct);
+                    execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(temp_results[l + temp_result_size * 2][k], -n1 * k * data.image_size, *(he->gal_keys), temp_rot_ct);});
                     he->evaluator->add_inplace(ct_v, temp_rot_ct);
                 }
             }
@@ -2422,18 +2368,18 @@ void Linear_ckks::bert_cipher_plain_bsgs(
                     require_device_plain_compatible(
                         rotatedIR[ct_i][i + n1], wv_r,
                         CkksCtPtOperation::Multiply, "QKV.wv.right");
-                    he->devaluator->multiply_plain(rotatedIR[ct_i][i], wq_l,
-                                                   ct_l_q);
-                    he->devaluator->multiply_plain(rotatedIR[ct_i][i + n1],
-                                                   wq_r, ct_r_q);
-                    he->devaluator->multiply_plain(rotatedIR[ct_i][i], wk_l,
-                                                   ct_l_k);
-                    he->devaluator->multiply_plain(rotatedIR[ct_i][i + n1],
-                                                   wk_r, ct_r_k);
-                    he->devaluator->multiply_plain(rotatedIR[ct_i][i], wv_l,
-                                                   ct_l_v);
-                    he->devaluator->multiply_plain(rotatedIR[ct_i][i + n1],
-                                                   wv_r, ct_r_v);
+                    execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(rotatedIR[ct_i][i], wq_l,
+                                                   ct_l_q);});
+                    execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(rotatedIR[ct_i][i + n1],
+                                                   wq_r, ct_r_q);});
+                    execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(rotatedIR[ct_i][i], wk_l,
+                                                   ct_l_k);});
+                    execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(rotatedIR[ct_i][i + n1],
+                                                   wk_r, ct_r_k);});
+                    execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(rotatedIR[ct_i][i], wv_l,
+                                                   ct_l_v);});
+                    execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(rotatedIR[ct_i][i + n1],
+                                                   wv_r, ct_r_v);});
                     // cout << "mul done" << endl;
                     if (i == 0) {
                         he->devaluator->add(ct_l_q, ct_r_q, temp_results_q[l][k]);
@@ -2507,11 +2453,11 @@ void Linear_ckks::bert_cipher_plain_bsgs(
                 }
                 else {
                     // FIXME: Assume that temp_results[l + xxx][k] won't be reuesd
-                    he->devaluator->rotate_vector_inplace(temp_results[l][k], -n1 * k * data.image_size, *(he->dgal_keys));
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector_inplace(temp_results[l][k], -n1 * k * data.image_size, *(he->dgal_keys));});
                     he->devaluator->add_inplace(ct_q, temp_results[l][k]);
-                    he->devaluator->rotate_vector_inplace(temp_results[l + temp_result_size][k], -n1 * k * data.image_size, *(he->dgal_keys));
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector_inplace(temp_results[l + temp_result_size][k], -n1 * k * data.image_size, *(he->dgal_keys));});
                     he->devaluator->add_inplace(ct_k, temp_results[l + temp_result_size][k]);
-                    he->devaluator->rotate_vector_inplace(temp_results[l + temp_result_size * 2][k], -n1 * k * data.image_size, *(he->dgal_keys));
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector_inplace(temp_results[l + temp_result_size * 2][k], -n1 * k * data.image_size, *(he->dgal_keys));});
                     he->devaluator->add_inplace(ct_v, temp_results[l + temp_result_size * 2][k]);
                 }
             }
@@ -2737,9 +2683,9 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
             rotatedIR[i][j] = cts[i];
         }
         else {
-            he->evaluator->rotate_vector(cts[i], (num_diag - j) * data.image_size, *(he->gal_keys), rotatedIR[i][j]);
+            execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(cts[i], (num_diag - j) * data.image_size, *(he->gal_keys), rotatedIR[i][j]);});
         }
-        he->evaluator->rotate_vector(rotatedIR[i][j], he->poly_modulus_degree/4, *(he->gal_keys), rotatedIR[i][j + n1]);
+        execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(rotatedIR[i][j], he->poly_modulus_degree/4, *(he->gal_keys), rotatedIR[i][j + n1]);});
     }
     } else {
     // ******************** GPU ********************
@@ -2750,9 +2696,9 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
             rotatedIR[i][j] = cts[i];
         }
         else {
-            he->devaluator->rotate_vector(cts[i], (num_diag - j) * data.image_size, *(he->dgal_keys), rotatedIR[i][j]);
+            execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(cts[i], (num_diag - j) * data.image_size, *(he->dgal_keys), rotatedIR[i][j]);});
         }
-        he->devaluator->rotate_vector(rotatedIR[i][j], he->poly_modulus_degree/4, *(he->dgal_keys), rotatedIR[i][j + n1]);
+        execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(rotatedIR[i][j], he->poly_modulus_degree/4, *(he->dgal_keys), rotatedIR[i][j + n1]);});
     }
     rotation_count += cts.size() * (2 * n1 - 1);
     }
@@ -2785,8 +2731,8 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
                 Ciphertext ct1_l;
                 Ciphertext ct1_r;
                 const size_t diag = l * n1 * n2 + j * n1 + i;
-                he->evaluator->multiply_plain(rotatedIR[ct_i][i], pp.cross_mat_single.first[diag][ct_i], ct1_l);
-                he->evaluator->multiply_plain(rotatedIR[ct_i][i + n1], pp.cross_mat_single.second[diag][ct_i], ct1_r);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(rotatedIR[ct_i][i], pp.cross_mat_single.first[diag][ct_i], ct1_l);});
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(rotatedIR[ct_i][i + n1], pp.cross_mat_single.second[diag][ct_i], ct1_r);});
                 // cout << "after scale: " << log2(ct1_l.scale()) << endl;
                 if (i == 0)
                     he->evaluator->add(ct1_l, ct1_r, temp_results1[l][k]);
@@ -2861,10 +2807,10 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
                 require_device_plain_compatible(
                     rotatedIR[ct_i][i + n1], weight_r,
                     CkksCtPtOperation::Multiply, "BSGS2.weight.right");
-                he->devaluator->multiply_plain(rotatedIR[ct_i][i], weight_l,
-                                               ct1_l);
-                he->devaluator->multiply_plain(rotatedIR[ct_i][i + n1],
-                                               weight_r, ct1_r);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(rotatedIR[ct_i][i], weight_l,
+                                               ct1_l);});
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(rotatedIR[ct_i][i + n1],
+                                               weight_r, ct1_r);});
                 // cout << "after scale: " << log2(ct1_l.scale()) << endl;
                 if (i == 0) {
                     he->devaluator->add(ct1_l, ct1_r, temp_results1[l][k]);
@@ -2943,7 +2889,7 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
                 ct = temp_results[l][0];
             else {
                 Ciphertext temp_rot_ct;
-                he->evaluator->rotate_vector(temp_results[l][k], -n1 * k * data.image_size, *(he->gal_keys), temp_rot_ct);
+                execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(temp_results[l][k], -n1 * k * data.image_size, *(he->gal_keys), temp_rot_ct);});
                 he->evaluator->add_inplace(ct, temp_rot_ct);
             }
         }
@@ -2959,7 +2905,7 @@ void Linear_ckks::bert_cipher_plain_bsgs_2(
             }
             else {
                 UnifiedCiphertext temp_rot_ct(loc);
-                he->devaluator->rotate_vector(temp_results[l][k], -n1 * k * data.image_size, *(he->dgal_keys), temp_rot_ct);
+                execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(temp_results[l][k], -n1 * k * data.image_size, *(he->dgal_keys), temp_rot_ct);});
                 he->devaluator->add_inplace(result[l], temp_rot_ct);
             }
         }
@@ -3024,6 +2970,20 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
 	const FCMetadata &data,
 	vector<UnifiedCiphertext> Cipher_plain_result, /* FIXME: D2D copy */
 	vector<UnifiedCiphertext> &results) {
+    if(data.image_size!=256 || data.slot_count!=16384 || !he->is_gpu_enable())throw runtime_error("isolated MHP candidate is ViT GPU only");
+    {
+      MhpKernel kernel(*he);
+      for(int group=0;group<3;group++) {
+        vector<UnifiedCiphertext> q,k;
+        for(int n=0;n<4;n++){q.push_back(Cipher_plain_result[group*4+n]);k.push_back(Cipher_plain_result[12+group*4+n]);}
+        auto out=kernel.run(q,k,false,49);
+        for(int n=0;n<16;n++)results[group*16+n]=std::move(out[n]);
+      }
+      rotation_count+=kernel.rotations;ct_ct_multiply_count+=kernel.ctct;ct_pt_multiply_count+=kernel.ctpt;rescale_count+=kernel.rescales;
+      cout<<"BLB_MHP_QK rotations="<<kernel.rotations<<" ctct="<<kernel.ctct<<" ctpt="<<kernel.ctpt<<" rescale="<<kernel.rescales<<endl;
+      return;
+    }
+
     // Official BLB BERT schedule (commit 25e8d86): this is the number of
     // rotations per attention head used by the paper's packed QK^T path.
     // Keep the schedule tied to the BERT dimensions; a generic sequence
@@ -3124,13 +3084,13 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
     if (loc == LOCATION::HOST) {
         #pragma omp parallel for num_threads(Cipher_plain_result.size())
         for (int i = 0; i < static_cast<int>(Cipher_plain_result.size()); ++i) {
-            he->evaluator->multiply_plain_inplace(Cipher_plain_result[i], mask_1);
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(Cipher_plain_result[i], mask_1);});
             he->evaluator->relinearize_inplace(Cipher_plain_result[i], *(he->relin_keys));
             he->evaluator->rescale_to_next_inplace(Cipher_plain_result[i]);
         }
     } else {
         for (auto &cipher : Cipher_plain_result) {
-            he->devaluator->multiply_plain_inplace(cipher, mask_1);
+            execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(cipher, mask_1);});
             he->devaluator->rescale_to_next_inplace(cipher);
         }
     }
@@ -3157,14 +3117,14 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
                     temp_mult.push_back(Ki);
                 }
                 if (l == 0) {
-                    he->evaluator->multiply(Qi, temp_mult[0], rotation_results[i]);
-                    he->evaluator->multiply(Qi, temp_mult[1], rotation_results[i + data.image_size]);
+                    execution_observe::he_call(1,[&](){return he->evaluator->multiply(Qi, temp_mult[0], rotation_results[i]);});
+                    execution_observe::he_call(1,[&](){return he->evaluator->multiply(Qi, temp_mult[1], rotation_results[i + data.image_size]);});
                 }
                 else {
                     Ciphertext temp_qk;
-                    he->evaluator->multiply(Qi, temp_mult[0], temp_qk);
+                    execution_observe::he_call(1,[&](){return he->evaluator->multiply(Qi, temp_mult[0], temp_qk);});
                     he->evaluator->add_inplace(rotation_results[i], temp_qk);
-                    he->evaluator->multiply(Qi, temp_mult[1], temp_qk);
+                    execution_observe::he_call(1,[&](){return he->evaluator->multiply(Qi, temp_mult[1], temp_qk);});
                     he->evaluator->add_inplace(rotation_results[i + data.image_size], temp_qk);
                 }
 
@@ -3186,15 +3146,15 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
                 const int target_block = (i % data.image_size) % blocks;
                 for (int stride = 1; stride < blocks; stride <<= 1) {
                     Ciphertext rotated;
-                    he->evaluator->rotate_vector(
+                    execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(
                         rotation_results[i],
                         ours_vit::packed_block_rotation(
                             target_block, stride, data.image_size, false),
-                        *(he->gal_keys), rotated);
+                        *(he->gal_keys), rotated);});
                     he->evaluator->add_inplace(rotation_results[i], rotated);
                 }
-                he->evaluator->multiply_plain_inplace(
-                    rotation_results[i], cross_masks[i]);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(
+                    rotation_results[i], cross_masks[i]);});
             }
             he->evaluator->relinearize_inplace(rotation_results[i], *(he->relin_keys));
             he->evaluator->rescale_to_next_inplace(rotation_results[i]);
@@ -3234,28 +3194,28 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
                 if (rot_count < rot_ours) {
                     UnifiedCiphertext ct1(loc);
                     UnifiedCiphertext ct2(loc);
-                    he->devaluator->rotate_vector(Ki, i, *(he->dgal_keys), ct1);
-                    he->devaluator->rotate_vector(Ki, -(data.image_size - i), *(he->dgal_keys), ct2);
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(Ki, i, *(he->dgal_keys), ct1);});
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(Ki, -(data.image_size - i), *(he->dgal_keys), ct2);});
                     if (l == 0) {
-                        he->devaluator->multiply(Qi, ct1, rotation_results[i]);
-                        he->devaluator->multiply(Qi, ct2, rotation_results[i + data.image_size]);
+                        execution_observe::he_call(1,[&](){return he->devaluator->multiply(Qi, ct1, rotation_results[i]);});
+                        execution_observe::he_call(1,[&](){return he->devaluator->multiply(Qi, ct2, rotation_results[i + data.image_size]);});
                     } else {
                         UnifiedCiphertext temp_qk(loc);
-                        he->devaluator->multiply(Qi, ct1, temp_qk);
+                        execution_observe::he_call(1,[&](){return he->devaluator->multiply(Qi, ct1, temp_qk);});
                         he->devaluator->add_inplace(rotation_results[i], temp_qk);
-                        he->devaluator->multiply(Qi, ct2, temp_qk);
+                        execution_observe::he_call(1,[&](){return he->devaluator->multiply(Qi, ct2, temp_qk);});
                         he->devaluator->add_inplace(rotation_results[i + data.image_size], temp_qk);
                     }
                     rot_count += 2;
                 } else {
                     if (l == 0) {
-                        he->devaluator->multiply(Qi, Ki, rotation_results[i]);
-                        he->devaluator->multiply(Qi, Ki, rotation_results[i + data.image_size]);
+                        execution_observe::he_call(1,[&](){return he->devaluator->multiply(Qi, Ki, rotation_results[i]);});
+                        execution_observe::he_call(1,[&](){return he->devaluator->multiply(Qi, Ki, rotation_results[i + data.image_size]);});
                     } else {
                         UnifiedCiphertext temp_qk(loc);
-                        he->devaluator->multiply(Qi, Ki, temp_qk);
+                        execution_observe::he_call(1,[&](){return he->devaluator->multiply(Qi, Ki, temp_qk);});
                         he->devaluator->add_inplace(rotation_results[i], temp_qk);
-                        he->devaluator->multiply(Qi, Ki, temp_qk);
+                        execution_observe::he_call(1,[&](){return he->devaluator->multiply(Qi, Ki, temp_qk);});
                         he->devaluator->add_inplace(rotation_results[i + data.image_size], temp_qk);
                     }
                 }
@@ -3275,15 +3235,15 @@ void Linear_ckks::bert_cipher_cipher_cross_packing(
                 const int target_block = (i % data.image_size) % blocks;
                 for (int stride = 1; stride < blocks; stride <<= 1) {
                     UnifiedCiphertext rotated(loc);
-                    he->devaluator->rotate_vector(
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(
                         rotation_results[i],
                         ours_vit::packed_block_rotation(
                             target_block, stride, data.image_size, false),
-                        *(he->dgal_keys), rotated);
+                        *(he->dgal_keys), rotated);});
                     he->devaluator->add_inplace(rotation_results[i], rotated);
                 }
-                he->devaluator->multiply_plain_inplace(
-                    rotation_results[i], cross_masks[i]);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(
+                    rotation_results[i], cross_masks[i]);});
             }
             he->devaluator->rescale_to_next_inplace(rotation_results[i]);
         }
@@ -3347,8 +3307,8 @@ vector<Ciphertext> Linear_ckks::rotation_by_one_depth3(
     int m = -(data.image_size - k);
     Ciphertext ct1;
     Ciphertext ct2;
-    he->evaluator->rotate_vector(ct, k, *(he->gal_keys), ct1);
-    he->evaluator->rotate_vector(ct, m, *(he->gal_keys), ct2);
+    execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(ct, k, *(he->gal_keys), ct1);});
+    execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(ct, m, *(he->gal_keys), ct2);});
 
     return {ct1, ct2};
 }
@@ -3413,6 +3373,13 @@ void Linear_ckks::plain_cross_packing_postprocess(
     uint64_t * output,
     bool col_packing,
     const FCMetadata &data) {
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
+    for(int ct=0;ct<48;ct++)for(int slot=0;slot<16384;slot++) {
+      int h=(ct/16)*4+(slot/256)%4,r=slot%256,c=(r+(ct%16)*16+slot/1024)%256;
+      output[h*256*256+(col_packing?c*256+r:r*256+c)]=input[ct*16384+slot];
+    }
+    return;
+
 
     int cts_size = PACKING_NUM*data.image_size*data.image_size / data.slot_count;
 
@@ -3462,6 +3429,7 @@ void Linear_ckks::plain_cross_packing_postprocess_v(
     uint64_t * output,
     bool col_packing,
     const FCMetadata &data) {
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
     int cts_size = PACKING_NUM*data.image_size*OUTPUT_DIM / data.slot_count; 
     int num_V_per_cts = data.slot_count / (data.image_size * data.filter_w);
 
@@ -3514,6 +3482,7 @@ void Linear_ckks::plain_col_packing_preprocess(
     uint64_t plain_mod,
     int input_dim,
     int common_dim){
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
     #pragma omp parallel for num_threads(128)
     for (int j = 0; j < common_dim; j++)
             for (int i = 0; i < input_dim; i++)
@@ -3526,6 +3495,7 @@ void Linear_ckks::plain_col_packing_preprocess_vec(
     uint64_t plain_mod,
     int input_dim,
     int common_dim){
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
     for (int j = 0; j < common_dim; j++)
             for (int i = 0; i < input_dim; i++)
                 output[j*input_dim + i] = input[i][j];
@@ -3536,6 +3506,7 @@ void Linear_ckks::plain_col_packing_postprocess(
     uint64_t * output,
     bool col_packing,
     const FCMetadata &data){
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
     for (int i = 0; i < data.image_size * data.filter_w / data.slot_count; i++) {
         vector<uint64_t> plain(&input[i* data.slot_count], &input[(i+1)* data.slot_count]);
         if (col_packing) {
@@ -3597,136 +3568,6 @@ void Linear_ckks::concat(
     }
 }
 
-// matrix is row-packed with 12 * 128 rows and 128 cols
-vector<Ciphertext> Linear_ckks::preprocess_softmax_s1(HE_CKKS* he, uint64_t* matrix, const FCMetadata &data) {
-    int num_cts_per_res = data.image_size * data.image_size * 2 / data.slot_count; // 1 or 4
-    int num_col_per_ct = data.slot_count / 2 / data.image_size; // 64 or 32
-
-    int total_cts = PACKING_NUM * data.image_size * data.image_size / data.slot_count;
-    vector<Ciphertext> enc_softmax(total_cts);
-
-    #pragma omp parallel for num_threads(total_cts)
-    for (int ct_ind = 0; ct_ind < total_cts; ct_ind++) {
-        int current_col = ct_ind % num_cts_per_res;
-        int current_packing = ct_ind / num_cts_per_res;
-        vector<double> pod_matrix(data.slot_count);
-
-        for (int row = 0; row < data.slot_count; row++) {
-            int j = row / data.image_size + current_col * num_col_per_ct;
-            int k = row % data.image_size;
-            int next_flag = 0;
-            if (row >= data.slot_count / 2) {
-                next_flag = data.image_size * data.image_size;
-                j -= data.slot_count / 2 / data.image_size;
-            }
-            pod_matrix[row] = (int64_t)matrix[k * data.image_size + j + current_packing * data.image_size * data.image_size * 2 + next_flag];
-        }
-        Ciphertext ct;
-        Plaintext pt;
-        he->encoder->encode(pod_matrix,pow(2, he->he_scale), pt);
-        he->encryptor->encrypt(pt, ct);
-        enc_softmax[ct_ind] = ct;
-    }
-    return enc_softmax;
-}
-
-void Linear_ckks::client_S1_V_R(HE_CKKS* he, const uint64_t *softmax_s1, uint64_t* V, uint64_t* result, const FCMetadata &data){
-    int total_packing = PACKING_NUM;
-    for (int packing_num = 0; packing_num < total_packing; packing_num++) {
-        #pragma omp parallel for num_threads(64)
-        for(int i = 0; i < data.image_size; i++) {
-            for(int j = 0; j < data.filter_w; j++) {
-                result[packing_num * data.image_size * data.filter_w + i + j * data.image_size] = 0;
-                for(int k = 0; k < data.image_size; k++) {
-                    result[packing_num * data.image_size * data.filter_w + i + j * data.image_size] += softmax_s1[packing_num * data.image_size * data.image_size + i * data.image_size + k] * V[k + j * data.image_size + data.image_size * data.filter_w * packing_num];
-                    result[packing_num * data.image_size * data.filter_w + i + j * data.image_size] = result[packing_num * data.image_size * data.filter_w + i + j * data.image_size];
-                }
-            }
-        }
-    }
-}
-
-void Linear_ckks::bert_postprocess_V(HE_CKKS* he, uint64_t* input, uint64_t* result, const FCMetadata &data, const bool &col_packing){
-    // int total_packing = cts.size() * data.slot_count / (data.image_size * data.filter_w);
-    int num_cts_per_mat_V = data.image_size * data.filter_w / data.slot_count;
-    for (int packing_num = 0; packing_num < PACKING_NUM; packing_num++) {
-        for (int i = 0; i < num_cts_per_mat_V; i++) {
-            // vector<uint64_t> plain(data.slot_count, 0ULL);
-            // Plaintext pt;
-            // he->decryptor->decrypt(cts[i + packing_num * num_cts_per_mat_V], pt);
-            // he->encoder->decode(pt, plain);
-
-            int offset = i + packing_num * num_cts_per_mat_V;
-            vector<uint64_t> plain(&input[offset* data.slot_count], &input[offset* data.slot_count + data.slot_count]);
-
-            if (col_packing) {
-                #pragma omp parallel for num_threads(128)
-                for (int row = 0; row < data.slot_count; row++) {
-                    int j = row / data.image_size;
-                    int k = row % data.image_size;
-                    if (row >= data.slot_count / 2) {
-                        j -= data.slot_count / data.image_size / 2;
-                        j += data.filter_w / 2;
-                    }
-                    result[k + j * data.image_size + i * data.slot_count / 2 + packing_num * data.image_size * data.filter_w] = plain[row];
-                }
-            }
-            else {
-                #pragma omp parallel for num_threads(128)
-                for (int row = 0; row < data.slot_count; row++) {
-                    int j = row / data.image_size;
-                    int k = row % data.image_size;
-                    if (row >= data.slot_count / 2) {
-                        j -= data.slot_count / data.image_size / 2;
-                        j += data.filter_w / 2;
-                    }
-                    j += i * data.slot_count / data.image_size / 2;
-                    result[k * data.filter_w + j + packing_num * data.image_size * data.filter_w] = plain[row];
-                }
-            }
-        }
-    }
-}
-
-void Linear_ckks::bert_postprocess_V_enc(HE_CKKS* he, vector<Ciphertext> cts, uint64_t* result, const FCMetadata &data, const bool &col_packing){
-    // int total_packing = cts.size() * data.slot_count / (data.image_size * data.filter_w);
-    int num_cts_per_mat_V = data.image_size * data.filter_w / data.slot_count;
-    for (int packing_num = 0; packing_num < PACKING_NUM; packing_num++) {
-        for (int i = 0; i < num_cts_per_mat_V; i++) {
-            vector<double> plain(data.slot_count, 0);
-            Plaintext pt;
-            he->decryptor->decrypt(cts[i + packing_num * num_cts_per_mat_V], pt);
-            he->encoder->decode(pt, plain);
-
-            if (col_packing) {
-                #pragma omp parallel for num_threads(128)
-                for (int row = 0; row < data.slot_count; row++) {
-                    int j = row / data.image_size;
-                    int k = row % data.image_size;
-                    if (row >= data.slot_count / 2) {
-                        j -= data.slot_count / data.image_size / 2;
-                        j += data.filter_w / 2;
-                    }
-                    result[k + j * data.image_size + i * data.slot_count / 2 + packing_num * data.image_size * data.filter_w] = plain[row];
-                }
-            }
-            else {
-                #pragma omp parallel for num_threads(128)
-                for (int row = 0; row < data.slot_count; row++) {
-                    int j = row / data.image_size;
-                    int k = row % data.image_size;
-                    if (row >= data.slot_count / 2) {
-                        j -= data.slot_count / data.image_size / 2;
-                        j += data.filter_w / 2;
-                    }
-                    j += i * data.slot_count / data.image_size / 2;
-                    result[k * data.filter_w + j + packing_num * data.image_size * data.filter_w] = plain[row];
-                }
-            }
-        }
-    }
-}
-
 vector<vector<vector<uint64_t>>> softmax_mask_ckks(const FCMetadata &data) {
     vector<vector<vector<uint64_t>>> mask(2, vector<vector<uint64_t>>(data.image_size, vector<uint64_t>(data.image_size)));
     #pragma omp parallel for num_threads(64)
@@ -3743,55 +3584,6 @@ vector<vector<vector<uint64_t>>> softmax_mask_ckks(const FCMetadata &data) {
         mask[1][i] = mask2;
     }
     return mask;
-}
-
-vector<vector<vector<Plaintext>>> 
-Linear_ckks::preprocess_softmax_s2(HE_CKKS* he, const uint64_t *matrix, const FCMetadata &data){
-    
-    auto mask = softmax_mask_ckks(data);
-
-    int num_diag = data.image_size;
-    int num_diag_per_ct = data.slot_count / data.image_size / 2;
-    vector<vector<vector<Plaintext>>> s2_pack(PACKING_NUM/2);
-
-    #pragma omp parallel for num_threads(PACKING_NUM/2)
-    for (int packing_ind = 0; packing_ind < PACKING_NUM/2; packing_ind++) {
-        vector<vector<Plaintext>> weightMatrix1(2, vector<Plaintext>(num_diag));
-        #pragma omp parallel for
-        for (int diag_ind = 0; diag_ind < num_diag; diag_ind++) {
-            vector<int64_t> temp2, temp3;
-            vector<double> r1(data.image_size), r2(data.image_size), r3(data.image_size), r4(data.image_size);
-            for (int j = 0; j < num_diag; j++) {
-                temp2.push_back(matrix[((j + diag_ind) % num_diag) + j * data.image_size + packing_ind * 2 * data.image_size * data.image_size]);
-                temp3.push_back(matrix[((j + diag_ind) % num_diag) + j * data.image_size + (packing_ind * 2 + 1) * data.image_size * data.image_size]);
-            }
-            // std::rotate(temp2.begin(), temp2.begin() + temp2.size() - diag_ind, temp2.end());
-            std::transform(temp2.begin(), temp2.end(), mask[0][diag_ind].begin(), r1.begin(), std::multiplies<uint64_t>());
-            std::transform(temp2.begin(), temp2.end(), mask[1][diag_ind].begin(), r2.begin(), std::multiplies<uint64_t>());
-            std::transform(temp3.begin(), temp3.end(), mask[0][diag_ind].begin(), r3.begin(), std::multiplies<uint64_t>());
-            std::transform(temp3.begin(), temp3.end(), mask[1][diag_ind].begin(), r4.begin(), std::multiplies<uint64_t>());
-            for (int j = 0; j < std::log2(num_diag_per_ct); j++) {
-                r1.reserve(r1.size() + distance(r1.begin(), r1.end()));
-                r1.insert(r1.end(), r1.begin(), r1.end());
-                r2.reserve(r2.size() + distance(r2.begin(), r2.end()));
-                r2.insert(r2.end(), r2.begin(), r2.end());
-                r3.reserve(r3.size() + distance(r3.begin(), r3.end()));
-                r3.insert(r3.end(), r3.begin(), r3.end());
-                r4.reserve(r4.size() + distance(r4.begin(), r4.end()));
-                r4.insert(r4.end(), r4.begin(), r4.end());
-            }
-            r1.insert(r1.end(), r3.begin(), r3.end());
-            r2.insert(r2.end(), r4.begin(), r4.end());
-
-            Plaintext pt;
-            he->encoder->encode(r1, pow(2, he->he_scale), pt);
-            weightMatrix1[0][diag_ind] = pt;
-            he->encoder->encode(r2, pow(2, he->he_scale), pt);
-            weightMatrix1[1][diag_ind] = pt;
-        }
-        s2_pack[packing_ind] = weightMatrix1;
-    }
-    return s2_pack;
 }
 
 vector<vector<vector<Plaintext>>> Linear_ckks::bert_softmax_v_packing_single_matrix(
@@ -3847,169 +3639,6 @@ vector<vector<vector<Plaintext>>> Linear_ckks::bert_softmax_v_packing_single_mat
     }
     return result;
 }
-
-vector<vector<vector<Plaintext>>>
-Linear_ckks::preprocess_softmax_v_r(HE_CKKS* he, const uint64_t *matrix, const FCMetadata &data) {
-    vector<vector<vector<uint64_t>>> weights_r(PACKING_NUM, vector<vector<uint64_t>>(data.image_size, vector<uint64_t>(data.filter_w)));
-
-    for (int packing_ind = 0; packing_ind < PACKING_NUM; packing_ind++) {
-        #pragma omp parallel for num_threads(64)
-        for (int i = 0; i < data.image_size; i++) {
-            for (int j = 0; j < data.filter_w; j++) {
-                weights_r[packing_ind][i][j] = matrix[i + j * data.image_size + packing_ind * data.image_size * data.filter_w];
-            }
-        }
-    }
-    vector<vector<vector<Plaintext>>> R_pack = bert_softmax_v_packing_single_matrix(he, weights_r, data);
-    return R_pack;
-}
-
-void Linear_ckks::bert_softmax_V(HE_CKKS* he, vector<Ciphertext> &softmax_s1, vector<Ciphertext> &V, const FCMetadata &data, vector<Ciphertext> &result) {
-    // FIXME: pack R according to ours ctxpt
-    // FIXME: compute softmax_s1 x R
-
-    // #pragma omp parallel for
-    // for (int i = 0; i < V.size(); i++) {
-    //     he->evaluator->mod_switch_to_next_inplace(V[i]);
-    // }
-    int n1 = 4;
-    int n2 = 8;
-    if (data.image_size == 64) {
-        n1 = 8;
-        n2 = 8;
-    }
-    vector<double> vec_w(he->num_slots,0.5);
-    Plaintext w;
-    he->encoder->encode(vec_w, pow(2, he->he_scale), w);
-    #pragma omp parallel for num_threads(PACKING_NUM/2)
-    for (int packing_ind = 0; packing_ind < PACKING_NUM/2; packing_ind++) {
-        int num_diag = data.slot_count / data.image_size / 2;
-        int num_matrix_per_row = data.image_size / num_diag; // 1 or 4
-        int num_matrix_per_col = data.filter_w / num_diag; // 1 or 2
-
-        vector<vector<Ciphertext>> rotatedIR(num_matrix_per_row);
-
-        #pragma omp parallel for
-        for (int i = 0; i < num_matrix_per_row; i++) {
-            vector<Ciphertext> tmp;
-            tmp.push_back(softmax_s1[packing_ind * num_matrix_per_row + i]);
-
-            for (int j = 1; j < n1; j++) {
-                Ciphertext temp_rot;
-                he->evaluator->rotate_rows(softmax_s1[packing_ind * num_matrix_per_row + i], (num_diag - j) * data.image_size, *(he->gal_keys), temp_rot);
-                tmp.push_back(temp_rot);
-            }
-
-            rotatedIR[i] = tmp;
-            tmp.clear();
-        }
-
-        //compute matrix multiplication
-        vector<vector<Ciphertext>> temp_results(num_matrix_per_col, vector<Ciphertext>(n2));
-        vector<vector<Ciphertext>> temp_results1(num_matrix_per_col, vector<Ciphertext>(n2 * num_matrix_per_row));
-
-        #pragma omp parallel for
-        for (int k = 0; k < num_matrix_per_row * n2; k++) {
-            int j = k / num_matrix_per_row;
-            int ct_i = k % num_matrix_per_row;
-            for (int l = 0; l < num_matrix_per_col; l++) {
-                for (int i = 0; i < n1; i++) {
-                    Ciphertext ct1_l;
-                    he->evaluator->multiply_plain(rotatedIR[ct_i][i], w, ct1_l);
-                    if (i == 0)
-                        temp_results1[l][k] = ct1_l;
-                    else {
-                        he->evaluator->add_inplace(temp_results1[l][k], ct1_l);
-                    }
-                }
-            }
-        }
-
-        #pragma omp parallel for
-        for (int j = 0; j < n2; j++) {
-            for (int ct_i = 0; ct_i < num_matrix_per_row; ct_i++) {
-                for (int l = 0; l < num_matrix_per_col; l++) {
-                    if (ct_i == 0)
-                        temp_results[l][j] = temp_results1[l][j * num_matrix_per_row + ct_i];
-                    else
-                        he->evaluator->add_inplace(temp_results[l][j], temp_results1[l][j * num_matrix_per_row + ct_i]);
-                }
-            }
-        }
-
-        #pragma omp parallel for
-        for (int l = 0; l < num_matrix_per_col; l++) {
-            Ciphertext ct;
-            for (int k = 0; k < n2; k++) {
-                if (k == 0)
-                    ct = temp_results[l][0];
-                else {
-                    Ciphertext temp_rot_ct;
-                    he->evaluator->rotate_rows(temp_results[l][k], -n1 * k * data.image_size, *(he->gal_keys), temp_rot_ct);
-                    he->evaluator->add_inplace(ct, temp_rot_ct);
-                }
-            }
-            result[packing_ind * data.image_size * data.filter_w * 2 / data.slot_count + l] = ct;
-        }
-
-        // FIXME: pack softmax_s2 according to gazelle
-        // FIXME: compute softmax_s2 x V
-
-        num_diag = data.image_size;
-        for (int ct_ind = 0; ct_ind < num_matrix_per_col; ct_ind++) {
-            vector<Ciphertext> rotation_results(num_diag);
-
-            #pragma omp parallel for
-            for (int i = 0; i < num_diag; i++) {
-                Ciphertext temp1;
-                Ciphertext temp2;
-                vector<Ciphertext> temp_mult = rotation_by_one_depth3(he, data, V[packing_ind * num_matrix_per_col + ct_ind], i);
-                he->evaluator->multiply_plain(temp_mult[0], w, temp1);
-                he->evaluator->multiply_plain(temp_mult[1], w, temp2);
-                he->evaluator->add(temp1, temp2, rotation_results[i]);
-            }
-            for (int i = 0; i < num_diag; i++) {
-                he->evaluator->add_inplace(result[packing_ind * data.image_size * data.filter_w * 2 / data.slot_count + ct_ind], rotation_results[i]);
-            }
-            rotation_results.clear();
-        }
-    }
-
-    parms_id_type parms_id = result[0].parms_id();
-    shared_ptr<const SEALContext::ContextData> context_data = he->context->get_context_data(parms_id);
-
-    #pragma omp parallel for
-    for (int i = 0; i < result.size(); i++) {
-        flood_ciphertext(result[i], context_data, SMUDGING_BITLEN_bert1);
-        he->evaluator->mod_switch_to_next_inplace(result[i]);
-        he->evaluator->mod_switch_to_next_inplace(result[i]);
-    }
-}
-
-vector<Ciphertext> Linear_ckks::w_ln(HE_CKKS* he, vector<Ciphertext> ln){
-    int cts_size = ln.size();
-    vector<Ciphertext> result(cts_size);
-    vector<double> vec_w(he->num_slots,0.5);
-    Plaintext w1;
-    he->encoder->encode(vec_w, pow(2, he->he_scale), w1);
-    #pragma omp parallel for
-    for (int i = 0; i < cts_size; i++) {
-        he->evaluator->multiply_plain(ln[i], w1, result[i]);
-    }
-
-    parms_id_type parms_id = result[0].parms_id();
-    shared_ptr<const SEALContext::ContextData> context_data = he->context->get_context_data(parms_id);
-
-    #pragma omp parallel for
-    for (int i = 0; i < cts_size; i++) {
-        flood_ciphertext(result[i], context_data, SMUDGING_BITLEN_bert3);
-        he->evaluator->mod_switch_to_next_inplace(result[i]);
-        he->evaluator->mod_switch_to_next_inplace(result[i]);
-    }
-
-    return result;
-}
-
 
 void Linear_ckks::softmax_v(
     HE_CKKS* he,
@@ -4107,8 +3736,8 @@ void Linear_ckks::softmax_v(
                     temp_mult[0]=(V[packing_ind * num_matrix_per_col + ct_ind]);
                     temp_mult[1]=(V[packing_ind * num_matrix_per_col + ct_ind]);
                 }
-                he->evaluator->multiply_inplace(temp_mult[0], softmax_s2[packing_ind][0][i]);
-                he->evaluator->multiply_inplace(temp_mult[1], softmax_s2[packing_ind][1][i]);
+                execution_observe::he_call(1,[&](){return he->evaluator->multiply_inplace(temp_mult[0], softmax_s2[packing_ind][0][i]);});
+                execution_observe::he_call(1,[&](){return he->evaluator->multiply_inplace(temp_mult[1], softmax_s2[packing_ind][1][i]);});
                 he->evaluator->add(temp_mult[0], temp_mult[1], rotation_results[i]);
                 // he->evaluator->relinearize_inplace(rotation_results[i], *(he->relin_keys));
             }
@@ -4131,7 +3760,7 @@ void Linear_ckks::softmax_v(
         he->evaluator->relinearize_inplace(result[i], *(he->relin_keys));
         if (post_av_rescale) {
           // Preserve the repository's post-MatMul scale-alignment depth.
-          he->evaluator->multiply_plain_inplace(result[i], mask);
+          execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(result[i], mask);});
           ++rescale_count;
           he->evaluator->rescale_to_next_inplace(result[i]);
         }
@@ -4166,13 +3795,13 @@ void Linear_ckks::softmax_v(
                 if(i < rot_ours){
                     UnifiedCiphertext ct1(loc);
                     UnifiedCiphertext ct2(loc);
-                    he->devaluator->rotate_vector(V[packing_ind * num_matrix_per_col + ct_ind], i, *(he->dgal_keys), ct1);
-                    he->devaluator->rotate_vector(V[packing_ind * num_matrix_per_col + ct_ind], -(data.image_size - i), *(he->dgal_keys), ct2);
-                    he->devaluator->multiply(ct1, softmax_s2[packing_ind][0][i], temp1);
-                    he->devaluator->multiply(ct2, softmax_s2[packing_ind][1][i], temp2);
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(V[packing_ind * num_matrix_per_col + ct_ind], i, *(he->dgal_keys), ct1);});
+                    execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(V[packing_ind * num_matrix_per_col + ct_ind], -(data.image_size - i), *(he->dgal_keys), ct2);});
+                    execution_observe::he_call(1,[&](){return he->devaluator->multiply(ct1, softmax_s2[packing_ind][0][i], temp1);});
+                    execution_observe::he_call(1,[&](){return he->devaluator->multiply(ct2, softmax_s2[packing_ind][1][i], temp2);});
                 } else {
-                    he->devaluator->multiply(V[packing_ind * num_matrix_per_col + ct_ind], softmax_s2[packing_ind][0][i], temp1);
-                    he->devaluator->multiply(V[packing_ind * num_matrix_per_col + ct_ind], softmax_s2[packing_ind][1][i], temp2);
+                    execution_observe::he_call(1,[&](){return he->devaluator->multiply(V[packing_ind * num_matrix_per_col + ct_ind], softmax_s2[packing_ind][0][i], temp1);});
+                    execution_observe::he_call(1,[&](){return he->devaluator->multiply(V[packing_ind * num_matrix_per_col + ct_ind], softmax_s2[packing_ind][1][i], temp2);});
                 }
                 he->devaluator->add(temp1, temp2, rotation_results[i]);
             }
@@ -4191,7 +3820,7 @@ void Linear_ckks::softmax_v(
         const int i = packing_ind * num_matrix_per_col + ct_ind;
         he->devaluator->relinearize_inplace(result[i], *(he->drelin_keys));
         if (post_av_rescale) {
-          he->devaluator->multiply_plain_inplace(result[i], mask);
+          execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(result[i], mask);});
           ++rescale_count;
           he->devaluator->rescale_to_next_inplace(result[i]);
         }
@@ -4223,11 +3852,11 @@ void Linear_ckks::softmax_v(
             const int index = pair * result_per_pair + local;
             result[index] = result[reference_index];
             if (loc == LOCATION::HOST)
-                he->evaluator->multiply_plain_inplace(result[index],
-                                                       zero_plain);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(result[index],
+                                                       zero_plain);});
             else
-                he->devaluator->multiply_plain_inplace(result[index],
-                                                        zero_plain);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(result[index],
+                                                        zero_plain);});
             ++ct_pt_multiply_count;
         }
     }
@@ -4259,64 +3888,6 @@ void Linear_ckks::softmax_v(
          << " total_pairs=" << PACKING_NUM / 2
          << " post_av_rescale=" << (post_av_rescale ? 1 : 0)
          << " inactive_pair_ctct=0" << endl;
-}
-
-void Linear_ckks::preprocess_softmax(const uint64_t *input, uint64_t *output, const FCMetadata &data){
-    int num_diag = data.image_size;
-    int num_diag_per_ct = data.slot_count / data.image_size / 2;
-    // vector<vector<uint64_t>> result_uint(data.image_size * data.image_size * 12 / data.slot_count, vector<uint64_t>(data.slot_count));
-    #pragma omp parallel for num_threads(PACKING_NUM/2)
-    for (int packing_ind = 0; packing_ind < PACKING_NUM/2; packing_ind++) {
-        vector<uint64_t> temp2, temp3;
-        // #pragma omp parallel for num_threads(32)
-        for (int diag_ind = 0; diag_ind < num_diag; diag_ind++) {
-            for (int j = 0; j < num_diag; j++) {
-                temp2.push_back(input[((j + diag_ind) % num_diag) + j * data.image_size + packing_ind * 2 * data.image_size * data.image_size]);
-                temp3.push_back(input[((j + diag_ind) % num_diag) + j * data.image_size + (packing_ind * 2 + 1) * data.image_size * data.image_size]);
-            }
-            if (temp2.size() == data.slot_count / 2) {
-                temp2.insert(temp2.end(), temp3.begin(), temp3.end());
-                // result_uint[packing_ind * data.image_size * data.image_size * 2 / data.slot_count + diag_ind / num_diag_per_ct] = temp2;
-
-                int offset = packing_ind * data.image_size * data.image_size * 2 / data.slot_count + diag_ind / num_diag_per_ct;
-                memcpy(&output[offset*data.slot_count], temp2.data(), data.slot_count*sizeof(uint64_t));
-                temp2.clear();
-                temp3.clear();
-            }
-        }
-    }
-}
-
-vector<vector<Plaintext>> Linear_ckks::softmax_mask_ct_ct(HE_CKKS* he, const FCMetadata &data){
-    vector<vector<Plaintext>> mask(2, vector<Plaintext>(data.image_size));
-    int num_diag = data.image_size;
-    int num_diag_per_ct = data.slot_count / data.image_size / 2;
-
-    #pragma omp parallel for num_threads(64)
-    for (int i = 0; i < data.image_size; i++) {
-        vector<int64_t> mask1(data.image_size, 0);
-        vector<int64_t> mask2(data.image_size, 0);
-        for (int j = 0; j < data.image_size - i; j++) {
-            mask1[j] = 1;
-        }
-        for (int j = data.image_size - i; j < data.image_size; j++) {
-            mask2[j] = 1;
-        }
-        vector<double> m1(data.slot_count, 0), m2(data.slot_count, 0);
-        int start_ind = (i % num_diag_per_ct) * num_diag;
-        for (int j = start_ind; j < num_diag + start_ind; j++) {
-            m1[j] = mask1[j - start_ind];
-            m1[j + data.slot_count / 2] = mask1[j - start_ind];
-            m2[j] = mask2[j - start_ind];
-            m2[j + data.slot_count / 2] = mask2[j - start_ind];
-        }
-        Plaintext pt;
-        he->encoder->encode(m1, pow(2,he->he_scale), pt);
-        mask[0][i] = pt;
-        he->encoder->encode(m2, pow(2,he->he_scale), pt);
-        mask[1][i] = pt;
-    }
-    return mask;
 }
 
 void Linear_ckks::preprocess_softmax_s1_ct_ct(
@@ -4433,23 +4004,23 @@ void Linear_ckks::preprocess_softmax_s1_ct_ct(
             const int cts_ind = packing_ind * ciphertexts_per_pair +
                                 diag_ind / num_diag_per_ct;
             Ciphertext cur_ct_l, cur_ct_r;
-            he->evaluator->multiply_plain(
-                matrix[cts_ind], forward_masks[diag_ind].hplain(), cur_ct_l);
-            he->evaluator->multiply_plain(
-                matrix[cts_ind], wrap_masks[diag_ind].hplain(), cur_ct_r);
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(
+                matrix[cts_ind], forward_masks[diag_ind].hplain(), cur_ct_l);});
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain(
+                matrix[cts_ind], wrap_masks[diag_ind].hplain(), cur_ct_r);});
             he->evaluator->rescale_to_next_inplace(cur_ct_l);
             he->evaluator->rescale_to_next_inplace(cur_ct_r);
             const int block = diag_ind % num_diag_per_ct;
 
             for (int stride = 1; stride < num_diag_per_ct; stride <<= 1) {
                 Ciphertext replicated;
-                he->evaluator->rotate_vector(
+                execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(
                     cur_ct_l, ours_vit::packed_block_rotation(
-                        block, stride, num_diag, true), *(he->gal_keys), replicated);
+                        block, stride, num_diag, true), *(he->gal_keys), replicated);});
                 he->evaluator->add_inplace(cur_ct_l, replicated);
-                he->evaluator->rotate_vector(
+                execution_observe::he_call(0,[&](){return he->evaluator->rotate_vector(
                     cur_ct_r, ours_vit::packed_block_rotation(
-                        block, stride, num_diag, true), *(he->gal_keys), replicated);
+                        block, stride, num_diag, true), *(he->gal_keys), replicated);});
                 he->evaluator->add_inplace(cur_ct_r, replicated);
             }
             weightMatrix1[0][diag_ind] = std::move(cur_ct_l);
@@ -4464,23 +4035,23 @@ void Linear_ckks::preprocess_softmax_s1_ct_ct(
             const int cts_ind = packing_ind * ciphertexts_per_pair +
                                 diag_ind / num_diag_per_ct;
             UnifiedCiphertext cur_ct_l(loc), cur_ct_r(loc);
-            he->devaluator->multiply_plain(
-                matrix[cts_ind], forward_masks[diag_ind].dplain(), cur_ct_l);
-            he->devaluator->multiply_plain(
-                matrix[cts_ind], wrap_masks[diag_ind].dplain(), cur_ct_r);
+            execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(
+                matrix[cts_ind], forward_masks[diag_ind].dplain(), cur_ct_l);});
+            execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain(
+                matrix[cts_ind], wrap_masks[diag_ind].dplain(), cur_ct_r);});
             he->devaluator->rescale_to_next_inplace(cur_ct_l);
             he->devaluator->rescale_to_next_inplace(cur_ct_r);
             const int block = diag_ind % num_diag_per_ct;
 
             for (int stride = 1; stride < num_diag_per_ct; stride <<= 1) {
                 UnifiedCiphertext replicated(loc);
-                he->devaluator->rotate_vector(
+                execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(
                     cur_ct_l, ours_vit::packed_block_rotation(
-                        block, stride, num_diag, true), *(he->dgal_keys), replicated);
+                        block, stride, num_diag, true), *(he->dgal_keys), replicated);});
                 he->devaluator->add_inplace(cur_ct_l, replicated);
-                he->devaluator->rotate_vector(
+                execution_observe::he_call(0,[&](){return he->devaluator->rotate_vector(
                     cur_ct_r, ours_vit::packed_block_rotation(
-                        block, stride, num_diag, true), *(he->dgal_keys), replicated);
+                        block, stride, num_diag, true), *(he->dgal_keys), replicated);});
                 he->devaluator->add_inplace(cur_ct_r, replicated);
             }
             weightMatrix1[0][diag_ind] = std::move(cur_ct_l);
@@ -4604,7 +4175,7 @@ void Linear_ckks::set_HE(LOCATION backend, bool enable_native_linear){
 	// published depth-7 chain.  The old public source used 34 bits and one
 	// fewer level, which is a different CKKS circuit.
 	const vector<int> he1_modulus = enable_native_linear
-	    ? vector<int>{60, 35, 60, 60, 60, 60, 60, 60, 60}
+	    ? vector<int>{60, 35, 60, 60, 60, 60, 60, 60, 60, 60, 60}
 	    : vector<int>{60, 35, 60, 60, 60, 60, 60, 60};
 	this->he1 = new HE_CKKS(
         party, /* Bob or Alice (Client or Server) */
@@ -4618,7 +4189,7 @@ void Linear_ckks::set_HE(LOCATION backend, bool enable_native_linear){
     cout << "OURS_NATIVE_HE1_CHAIN status=PASS enabled="
          << (enable_native_linear ? 1 : 0)
          << " data_level_extension="
-         << (enable_native_linear ? 1 : 0)
+         << (enable_native_linear ? 3 : 0)
          << " modulus_entries=" << he1_modulus.size()
          << " baseline_entries=8 reason=native_QK_AV_WO" << endl;
     cout << "he1 ok" << endl;

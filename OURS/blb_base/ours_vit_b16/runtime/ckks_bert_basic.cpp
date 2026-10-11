@@ -40,6 +40,7 @@ SOFTWARE.
 using namespace sci;
 using namespace std;
 using namespace seal;
+using std::chrono::steady_clock;
 
 namespace {
 int blb_conversion_threads() {
@@ -87,12 +88,12 @@ void check_cts(vector<Ciphertext> cts){
 }
 /*
 example:
-    auto t_load_model = high_resolution_clock::now();
+    auto t_load_model = steady_clock::now();
     xxx code
     cout << "> [TIMING]: xxx code takes: " << interval(t_load_model) << "sec" << endl;
 */
-inline double interval(chrono::_V2::system_clock::time_point start){
-    auto end = high_resolution_clock::now();
+inline double interval(chrono::steady_clock::time_point start){
+    auto end = steady_clock::now();
     auto interval = (end - start)/1e+9;
     return interval.count();
 }
@@ -233,7 +234,7 @@ Bert_ckks::Bert_ckks(int party, int port, string address, LOCATION backend,
     if(party == sci::ALICE){
         cout << "> Loading and preprocessing weights on server" << endl;
         #ifdef BERT_PERF
-        auto t_load_model = high_resolution_clock::now();
+        auto t_load_model = steady_clock::now();
         #endif 
         // The full BLB entry loads all twelve BERT-base blocks and the actual
         // MRPC pooler/classifier.  Bob deliberately does not load model files;
@@ -243,7 +244,7 @@ Bert_ckks::Bert_ckks(int party, int port, string address, LOCATION backend,
 
         #ifdef BERT_PERF
         cout << "> [TIMING]: Loading Model takes: " << interval(t_load_model) << "sec" << endl;
-        auto t_model_preprocess = high_resolution_clock::now();
+        auto t_model_preprocess = steady_clock::now();
         #endif 
 
         linear.weights_preprocess(bm, layers_to_preprocess);
@@ -375,13 +376,17 @@ void Bert_ckks::configure_heterogeneous_attention_layer(
         4. (可选) trunc-reduce，可以先做3，2和4合并一次。
 */
 vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext> &pts, int degree, uint64_t Q, int bit_out, int s_out, HE_CKKS* he, bool half){
+    fusion_observe::Scope fusion_scope("C2M_CORE",__func__,__LINE__,pts.size(),[this](){return current_comm();});
+    fusion_scope.detail="degree="+std::to_string(degree)+" slots="+std::to_string(he->num_slots)+
+        " modulus="+std::to_string(Q)+" bitwidth="+std::to_string(bit_out)+" fixed_scale="+std::to_string(s_out)+
+        " half="+std::to_string(half)+" he_scale="+std::to_string(he->he_scale);
     const bool profile_conversion = profile_enabled_;
     const auto conversion_bucket = profile_conversion_bucket_;
     const uint64_t conversion_comm_before =
         profile_conversion ? current_comm() : 0;
     if (profile_conversion) profile_push(BlbViTProfileStage::CKKS_TO_MPC);
     #ifdef BERT_PERF
-    auto t_conversion = high_resolution_clock::now();
+    auto t_conversion = steady_clock::now();
     #endif 
     if (pts.empty()) {
         throw invalid_argument("CKKS-to-MPC input is empty");
@@ -557,6 +562,7 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_to_mpc(const vector<Plaintext>
 }
 
 void Bert_ckks::pack_real_ckks_pairs(vector<Ciphertext>& ciphertexts, HE_CKKS* he) {
+    execution_observe::Region layout_region("Layout",__func__,__LINE__);
     if (ciphertexts.empty()) throw invalid_argument("empty real-pair packing input");
     const auto id = ciphertexts.front().parms_id();
     const double scale = ciphertexts.front().scale();
@@ -571,13 +577,13 @@ void Bert_ckks::pack_real_ckks_pairs(vector<Ciphertext>& ciphertexts, HE_CKKS* h
     for (size_t pair = 0; pair < packed.size(); ++pair) {
         Ciphertext conjugate;
         auto& first = ciphertexts[2 * pair];
-        he->evaluator->complex_conjugate(first, *he->gal_keys, conjugate);
+        execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(first, *he->gal_keys, conjugate);});
         he->evaluator->add(first, conjugate, packed[pair]);
         if (2 * pair + 1 < ciphertexts.size()) {
             auto& second = ciphertexts[2 * pair + 1];
-            he->evaluator->complex_conjugate(second, *he->gal_keys, conjugate);
+            execution_observe::he_call(3,[&](){return he->evaluator->complex_conjugate(second, *he->gal_keys, conjugate);});
             he->evaluator->add_inplace(second, conjugate);
-            he->evaluator->multiply_plain_inplace(second, imaginary_unit);
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(second, imaginary_unit);});
             he->evaluator->add_inplace(packed[pair], second);
         }
         // Projection produces 2*Re(first) + i*2*Re(second). Accounting for
@@ -599,8 +605,8 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_pairs_to_mpc(
     int bit_out, int s_out, HE_CKKS* he) {
     if (real_ciphertexts == 0 || pts.size() != (real_ciphertexts + 1) / 2)
         throw invalid_argument("real-pair conversion count mismatch");
-    auto packed = ckks_to_mpc(pts, he->poly_modulus_degree, he->get_Q(pts[0]),
-                              bit_out, s_out, he, true);
+    auto packed = fusion_observe::call(__func__,__LINE__,"pts",[&](){return ckks_to_mpc(pts, he->poly_modulus_degree, he->get_Q(pts[0]),
+                              bit_out, s_out, he, true);});
     const size_t slots = he->num_slots;
     vector<vector<HE_CKKS::scalar_t>> result(real_ciphertexts);
     for (size_t i = 0; i < real_ciphertexts; ++i) {
@@ -615,6 +621,8 @@ vector<vector<HE_CKKS::scalar_t>> Bert_ckks::ckks_pairs_to_mpc(
 void Bert_ckks::mask_ckks_to_mpc_inplace(
     vector<Ciphertext> &ciphertexts, vector<Plaintext> &server_shares,
     HE_CKKS *he) {
+    fusion_observe::Scope fusion_mask_scope("C2M_MASK",__func__,__LINE__,ciphertexts.size(),[this](){return current_comm();});
+
     if (party != sci::ALICE) {
         throw logic_error("only the CKKS evaluator may sample Algorithm 1 masks");
     }
@@ -675,6 +683,10 @@ vector<Plaintext> Bert_ckks::mpc_to_ckks(
     const vector<vector<HE_CKKS::scalar_t>> & x, int slot, uint64_t Q,
     int bitwidth, int s_in, int s_out, HE_CKKS* he, bool half,
     bool known_nonnegative){
+    fusion_observe::Scope fusion_scope("M2C_CORE",__func__,__LINE__,x.size(),[this](){return current_comm();});
+    fusion_scope.detail="degree="+std::to_string(slot*2)+" slots="+std::to_string(slot)+
+        " modulus="+std::to_string(Q)+" bitwidth="+std::to_string(bitwidth)+" fixed_scale="+std::to_string(s_in)+
+        " target_scale="+std::to_string(s_out)+" half="+std::to_string(half)+" he_scale="+std::to_string(he->he_scale);
     const bool profile_conversion = profile_enabled_;
     const auto conversion_bucket = profile_conversion_bucket_;
     const uint64_t conversion_comm_before =
@@ -947,7 +959,7 @@ void Bert_ckks::prepare_ckks_to_mpc_inplace(
                 public_unit = &public_unit_cache.back().plaintext;
                 ++public_unit_encodes;
             }
-            he->evaluator->multiply_plain_inplace(ciphertext, *public_unit);
+            execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(ciphertext, *public_unit);});
             ++this->he_rescale_count;
             he->evaluator->rescale_to_next_inplace(ciphertext);
             ++rescaled_ciphertexts;
@@ -1002,12 +1014,12 @@ FixArray Bert_ckks::element_wise_square(int32_t dim, FixArray input) {
         copy_n(input.data + ct * slot, slot, shares[ct].begin());
     }
 
-    vector<Plaintext> input_pts = mpc_to_ckks(
+    vector<Plaintext> input_pts = fusion_observe::call(__func__,__LINE__,"shares",[&](){return mpc_to_ckks(
         shares, slot, he->get_conversion_prime(), input.ell, input.s,
-        he->he_scale, he, false);
+        he->he_scale, he, false);});
     vector<Ciphertext> input_cts(num_cts);
     vector<Plaintext> output_pts(num_cts);
-    auto start = high_resolution_clock::now();
+    auto start = steady_clock::now();
     if (party == sci::BOB) {
         #pragma omp parallel for
         for (int i = 0; i < num_cts; ++i) {
@@ -1025,7 +1037,7 @@ FixArray Bert_ckks::element_wise_square(int32_t dim, FixArray input) {
             for (int i = 0; i < num_cts; ++i) {
                 // Add Alice's local MPC share before the CKKS multiplication.
                 he->evaluator->add_plain_inplace(input_cts[i], input_pts[i]);
-                he->evaluator->square_inplace(input_cts[i]);
+                execution_observe::he_call(1,[&](){return he->evaluator->square_inplace(input_cts[i]);});
                 he->evaluator->relinearize_inplace(input_cts[i],
                                                     *he->relin_keys);
                 ++this->he_rescale_count;
@@ -1034,7 +1046,7 @@ FixArray Bert_ckks::element_wise_square(int32_t dim, FixArray input) {
             cout << "BLB_VIT_LAYER_NORM_SQUARE_BACKEND backend=SEAL_HOST cts="
                  << num_cts << endl;
         } else {
-            auto copy_start = high_resolution_clock::now();
+            auto copy_start = steady_clock::now();
             vector<UnifiedCiphertext> device_cts;
             vector<UnifiedPlaintext> device_pts;
             device_cts.reserve(num_cts);
@@ -1046,25 +1058,25 @@ FixArray Bert_ckks::element_wise_square(int32_t dim, FixArray input) {
                 device_pts.back().to_device(*he->context, *he->dcontext);
             }
             const double h2d_seconds = chrono::duration<double>(
-                high_resolution_clock::now() - copy_start).count();
+                steady_clock::now() - copy_start).count();
             this->ct_transfer_mem_la += h2d_seconds;
             this->h2d_time += h2d_seconds;
             for (int i = 0; i < num_cts; ++i) {
                 he->devaluator->add_plain_inplace(device_cts[i],
                                                   device_pts[i]);
-                he->devaluator->square_inplace(device_cts[i]);
+                execution_observe::he_call(1,[&](){return he->devaluator->square_inplace(device_cts[i]);});
                 he->devaluator->relinearize_inplace(device_cts[i],
                                                      *he->drelin_keys);
                 ++this->he_rescale_count;
                 he->devaluator->rescale_to_next_inplace(device_cts[i]);
             }
-            copy_start = high_resolution_clock::now();
+            copy_start = steady_clock::now();
             for (int i = 0; i < num_cts; ++i) {
                 device_cts[i].to_host(*he->context, *he->dcontext);
                 input_cts[i] = std::move(device_cts[i].hcipher());
             }
             const double d2h_seconds = chrono::duration<double>(
-                high_resolution_clock::now() - copy_start).count();
+                steady_clock::now() - copy_start).count();
             this->ct_transfer_mem_la += d2h_seconds;
             this->d2h_time += d2h_seconds;
             cout << "BLB_VIT_LAYER_NORM_SQUARE_BACKEND backend=Phantom_DEVICE cts="
@@ -1080,14 +1092,15 @@ FixArray Bert_ckks::element_wise_square(int32_t dim, FixArray input) {
         mask_ckks_to_mpc_inplace(input_cts, output_pts, he);
         send_encrypted_vector(io, input_cts);
     }
+    execution_observe::interval("CKKS",__func__,__LINE__,start);
     this->he_compute_la +=
-        chrono::duration<double>(high_resolution_clock::now() - start).count();
+        chrono::duration<double>(steady_clock::now() - start).count();
     this->ct_transfer_comm += this->get_comm();
     this->ct_transfer_round += this->get_round();
 
-    vector<vector<HE_CKKS::scalar_t>> squared = ckks_to_mpc(
+    vector<vector<HE_CKKS::scalar_t>> squared = fusion_observe::call(__func__,__LINE__,"output_pts",[&](){return ckks_to_mpc(
         output_pts, he->poly_modulus_degree, he->get_Q(output_pts[0]),
-        input.ell, input.s, he, false);
+        input.ell, input.s, he, false);});
     FixArray result(party, dim, input.signed_, input.ell, input.s);
     size_t offset = 0;
     for (const auto &packed : squared) {
@@ -1360,14 +1373,14 @@ void Bert_ckks::eval_gelu_poly(
     // BLB Algorithm 4: x^2, x^3=x^2*x, x^4=x^2*x^2.
     auto powers = [&](auto *ev, auto &keys) {
         for (size_t i = 0; i < n; ++i) {
-            ev->square(input[i], square[i]);
+            execution_observe::he_call(1,[&](){return ev->square(input[i], square[i]);});
             ev->relinearize_inplace(square[i], keys);
             ev->rescale_to_next_inplace(square[i]);
             ev->mod_switch_to_next_inplace(input[i]);
-            ev->multiply(square[i], input[i], cube[i]);
+            execution_observe::he_call(1,[&](){return ev->multiply(square[i], input[i], cube[i]);});
             ev->relinearize_inplace(cube[i], keys);
             ev->rescale_to_next_inplace(cube[i]);
-            ev->square(square[i], quartic[i]);
+            execution_observe::he_call(1,[&](){return ev->square(square[i], quartic[i]);});
             ev->relinearize_inplace(quartic[i], keys);
             ev->rescale_to_next_inplace(quartic[i]);
             ev->mod_switch_to_next_inplace(input[i]);
@@ -1418,11 +1431,11 @@ void Bert_ckks::eval_gelu_poly(
     auto evaluate = [&](auto *ev) {
         for (size_t i = 0; i < n; ++i) {
             UnifiedCiphertext negative_linear(loc), positive_linear(loc);
-            ev->multiply_plain(input[i], coefficients[3], negative_linear);
-            ev->multiply_plain(input[i], coefficients[4], positive_linear);
-            ev->multiply_plain_inplace(quartic[i], coefficients[0]);
-            ev->multiply_plain_inplace(cube[i], coefficients[1]);
-            ev->multiply_plain_inplace(square[i], coefficients[2]);
+            execution_observe::he_call(2,[&](){return ev->multiply_plain(input[i], coefficients[3], negative_linear);});
+            execution_observe::he_call(2,[&](){return ev->multiply_plain(input[i], coefficients[4], positive_linear);});
+            execution_observe::he_call(2,[&](){return ev->multiply_plain_inplace(quartic[i], coefficients[0]);});
+            execution_observe::he_call(2,[&](){return ev->multiply_plain_inplace(cube[i], coefficients[1]);});
+            execution_observe::he_call(2,[&](){return ev->multiply_plain_inplace(square[i], coefficients[2]);});
             for (auto *term : {&quartic[i], &cube[i], &square[i], &negative_linear, &positive_linear}) {
                 ev->rescale_to_next_inplace(*term);
                 ev->rescale_to_next_inplace(*term);
@@ -1452,7 +1465,7 @@ void Bert_ckks::eval_gelu_poly(
 
 // void Bert_ckks::mp2ml_test(){
 //     #ifdef BERT_PERF
-//     auto t_conversion = high_resolution_clock::now();
+//     auto t_conversion = steady_clock::now();
 //     #endif 
 //     if (party == sci::BOB) {
 //         vector<double> x = {1,2,3,4,5,6,7,8};
@@ -1503,6 +1516,7 @@ void Bert_ckks::eval_gelu_poly(
 
 
 std::map<char*,FixArray> Bert_ckks::layer_norm_nonlinear(map<char*,FixArray> input) {
+    const auto optimized_mpc_start = steady_clock::now();
     FPMath *fpmath = nonlinear.fpmath[0];
     FixArray x_flat_avg = input["x_flat_avg"];
     FixArray sigma = input["sigma_flat"];
@@ -1545,6 +1559,8 @@ std::map<char*,FixArray> Bert_ckks::layer_norm_nonlinear(map<char*,FixArray> inp
     result["w"] = w;
     result["b"] = b;
     cout << "layer_norm_nonlinear done" << endl;
+    execution_observe::interval("MPC",__func__,__LINE__,optimized_mpc_start);
+    other_nonlinear_la += chrono::duration<double>(steady_clock::now()-optimized_mpc_start).count();
     return result;
 }
 
@@ -1592,7 +1608,7 @@ FixArray Bert_ckks::gelu_nonlinear(std::map<char*,FixArray> input){
     std::thread threads[nthreads];
     int chunk_size = array_size / nthreads;
     cout << "chunk_size, ell,s:" << chunk_size << "," << x_array.ell << "," << x_array.s << endl;
-    auto start = high_resolution_clock::now();
+    auto start = steady_clock::now();
     for (int i = 0; i < nthreads; ++i) {
         int offset = i * chunk_size;
         int lnum_ops;
@@ -1619,25 +1635,27 @@ FixArray Bert_ckks::gelu_nonlinear(std::map<char*,FixArray> input){
     for (int i = 0; i < nthreads; ++i) {
         threads[i].join();
     }
-    cout << "gelu time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
+    execution_observe::interval("MPC",__func__,__LINE__,start);
+    other_nonlinear_la += chrono::duration<double>(steady_clock::now()-start).count();
+    cout << "gelu time:" << ((steady_clock::now() - start)).count()/1e+9 << endl;
     // exit(0);
     // int this_party = party;
     // int N = x_array.size;
     // int bitwidth = x_array.ell;
     // int s = x_array.s;
-    // auto start = high_resolution_clock::now();
+    // auto start = steady_clock::now();
     // cout << "x_array.size:" << x_array.size << endl;
     // BoolArray msb_x = fpmath->fix->MSB(x_array);
-    // cout << "MSB time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
+    // cout << "MSB time:" << ((steady_clock::now() - start)).count()/1e+9 << endl;
     
     // // no communication
     // FixArray neg_x = fpmath->fix->mul(x_array, -1);
     // // point 2
     
     // FixArray y = fpmath->fix->if_else(msb_x, neg_x, x_array);
-    // start = high_resolution_clock::now();
+    // start = steady_clock::now();
     // BoolArray lt27 = fpmath->fix->LT(y, 2.7*(1 << s));
-    // cout << "LT time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
+    // cout << "LT time:" << ((steady_clock::now() - start)).count()/1e+9 << endl;
     // // point 8
     // BoolArray all_0 = fpmath->bool_op->input(sci::ALICE, N, uint8_t(0));
     // FixArray x_plus_y = fpmath->fix->add(x_array, y);   
@@ -1650,7 +1668,7 @@ FixArray Bert_ckks::gelu_nonlinear(std::map<char*,FixArray> input){
     // half_x_plus_y.s = s;
     // //half_x_plus_y = (x+|x|)/2 = max(x,0), if |x|<2.7, 则 gelu_y, 否则half_x_plus_y
     // FixArray ret = fpmath->fix->if_else(lt27, gelu_poly_flat, half_x_plus_y);
-    // cout << "other time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
+    // cout << "other time:" << ((steady_clock::now() - start)).count()/1e+9 << endl;
     // BoolArray msb_ret = fpmath->bool_op->AND(msb_x, lt27);
     // point 10
     
@@ -1683,7 +1701,7 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
     FixArray evaluation_input = x;
     const int exp_workers = min(nonlinear.active_workers(), x.size);
     if (blb_secure_exp_clamp_enabled()) {
-        const auto clip_start = high_resolution_clock::now();
+        const auto clip_start = steady_clock::now();
         underflow = BoolArray(x.party, x.size);
         vector<thread> workers;
         for (int worker = 0; worker < exp_workers; ++worker) {
@@ -1701,9 +1719,11 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
             });
         }
         for (auto &worker : workers) worker.join();
+        execution_observe::interval("MPC",__func__,__LINE__,clip_start);
+    other_nonlinear_la += chrono::duration<double>(steady_clock::now()-clip_start).count();
         cout << "EXP_SAFETY_PHASE phase=input_clip workers=" << exp_workers
              << " ms=" << chrono::duration<double, milli>(
-                    high_resolution_clock::now() - clip_start).count() << endl;
+                    steady_clock::now() - clip_start).count() << endl;
     }
     // BLB Algorithm 5: exactly six squares after a public HE division by 64.
     const int exp_squarings = 6;
@@ -1735,7 +1755,7 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
     int num_cts = (evaluation_input.size + slots - 1) / slots;
     cout << "slots, num_cts:" << slots << "," << num_cts << endl;
     vector<vector<uint64_t>> vec_x;
-    auto start = high_resolution_clock::now();
+    auto start = steady_clock::now();
     for(int i = 0; i < num_cts; i++){
         vector<uint64_t> tmp;
         for(int j = 0; j < slots; j++){
@@ -1745,18 +1765,18 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
         }
         vec_x.push_back(tmp);
     }
-    cout << "exp_he data copy time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
+    cout << "exp_he data copy time:" << ((steady_clock::now() - start)).count()/1e+9 << endl;
     cout << "vec_x.size:" << vec_x.size()*vec_x[0].size() << endl;
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     const auto previous_conversion_bucket = profile_conversion_bucket();
     profile_set_conversion_bucket(
         BlbViTCommAuditBucket::SOFTMAX_TO_CKKS_CONVERSION);
     vector<UnifiedPlaintext> pts_x;
-    mpc_to_ckks(pts_x, vec_x, slots, he->get_conversion_prime(), ell,
-                scale, he->he_scale, he);
+    fusion_observe::call(__func__,__LINE__,"pts_x",[&](){return mpc_to_ckks(pts_x, vec_x, slots, he->get_conversion_prime(), ell,
+                scale, he->he_scale, he);});
     profile_set_conversion_bucket(previous_conversion_bucket);
     cout << "pts.size:" << pts_x.size() << endl;
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     // Wide conversion uses the ordinary full-slot transport contract.
@@ -1766,7 +1786,7 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
     vector<Plaintext> pts_y(num_cts);
     if (party == sci::BOB) {
         cout << "send_encrypted_vector" << endl;
-            he->encrypt_send(pts_x, cts_x);
+            fusion_observe::encrypt_send(he,pts_x, cts_x,__func__,__LINE__);
 		if (getenv("OURS_VIT_CONVERSION_EXP_DIRECT_CHECK") != nullptr) {
 			const auto &input_ciphertext = cts_x[0];
 			Plaintext direct_input_plaintext;
@@ -1822,13 +1842,13 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
     else{
         auto loc = he->backend();
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         recv_encrypted_vector(he->context, io, cts_x);
-		this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+		this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
 
         if (he->is_gpu_enable()) {
             // Load reviced ciphertexts to GPU
-            start = high_resolution_clock::now();
+            start = steady_clock::now();
                 for_each_n(
                     cts_x.begin(),
                     cts_x.size(),
@@ -1839,12 +1859,12 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
                 pts_x.begin(), pts_x.size(),
                 [he](auto &pt) { pt.to_device(*he->context, *he->dcontext); });
             const double h2d_seconds =
-                ((high_resolution_clock::now() - start)).count()/1e+9;
+                ((steady_clock::now() - start)).count()/1e+9;
             this->ct_transfer_mem_la += h2d_seconds;
             this->h2d_time += h2d_seconds;
         }
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
 
         // Algorithm 5: public /64 in HE, then +1 and six squares.
         UnifiedPlaintext divisor(loc), one(loc);
@@ -1882,11 +1902,11 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
                 // is not a secret-shared exp and was the source of the
                 // deterministic C4E/B corruption.
                 he->evaluator->add_plain_inplace(cts_x[i], pts_x[i]);
-                he->evaluator->multiply_plain_inplace(cts_x[i], divisor);
+                execution_observe::he_call(2,[&](){return he->evaluator->multiply_plain_inplace(cts_x[i], divisor);});
                 he->evaluator->rescale_to_next_inplace(cts_x[i]);
                 he->evaluator->add_plain_inplace(cts_x[i], one);
                 for (int j = 0; j < exp_squarings; j++) {
-                    he->evaluator->square_inplace(cts_x[i]);
+                    execution_observe::he_call(1,[&](){return he->evaluator->square_inplace(cts_x[i]);});
                     he->evaluator->relinearize_inplace(cts_x[i], *he->relin_keys);
                     he->evaluator->rescale_to_next_inplace(cts_x[i]);
                 }
@@ -1895,11 +1915,11 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
                 // Keep the GPU path's share aggregation identical to SEAL:
                 // both local CKKS shares are present before any HE multiply.
                 he->devaluator->add_plain_inplace(cts_x[i], pts_x[i]);
-                he->devaluator->multiply_plain_inplace(cts_x[i], divisor);
+                execution_observe::he_call(2,[&](){return he->devaluator->multiply_plain_inplace(cts_x[i], divisor);});
                 he->devaluator->rescale_to_next_inplace(cts_x[i]);
                 he->devaluator->add_plain_inplace(cts_x[i], one);
                 for (int j = 0; j < exp_squarings; j++) {
-                    he->devaluator->square_inplace(cts_x[i]);
+                    execution_observe::he_call(1,[&](){return he->devaluator->square_inplace(cts_x[i]);});
                     he->devaluator->relinearize_inplace(cts_x[i], *he->drelin_keys);
                     he->devaluator->rescale_to_next_inplace(cts_x[i]);
                 }
@@ -1917,7 +1937,7 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
 #endif
         if (he->is_gpu_enable()) {
             // Load result ciphertexts to CPU
-            start = high_resolution_clock::now();
+            start = steady_clock::now();
             for_each_n(
                     cts_x.begin(),
                     cts_x.size(),
@@ -1925,15 +1945,16 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
                         ct.to_host(*he->context, *he->dcontext);
             });
             const double d2h_seconds =
-                ((high_resolution_clock::now() - start)).count()/1e+9;
+                ((steady_clock::now() - start)).count()/1e+9;
             this->ct_transfer_mem_la += d2h_seconds;
             this->d2h_time += d2h_seconds;
         }
 
         cout << "num of output cts:" << cts_x.size() << endl;
         cout << "bitwidth of output ct:" << cts_x[0].coeff_modulus_size() << endl;
-        this->he_compute_la += ((high_resolution_clock::now() - start)).count()/1e+9;
-        start = high_resolution_clock::now();
+        execution_observe::interval("CKKS",__func__,__LINE__,start);
+    this->he_compute_la += ((steady_clock::now() - start)).count()/1e+9;
+        start = steady_clock::now();
         for (int i = 0; i < cts_x.size(); ++i) {
             cts_y[i] = std::move(cts_x[i].hcipher());
         }
@@ -1944,14 +1965,14 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
         pack_real_ckks_pairs(cts_y, he);
         mask_ckks_to_mpc_inplace(cts_y, pts_y, he);
         send_encrypted_vector(io, cts_y);
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
     }
     this->ct_transfer_comm += this->get_comm();
     this->ct_transfer_round += this->get_round();
     vector<vector<HE_CKKS::scalar_t>> vec_output(pts_y.size());
-    start = high_resolution_clock::now();
-    vec_output = ckks_pairs_to_mpc(pts_y, num_cts, ell, scale, he);
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    start = steady_clock::now();
+    vec_output = fusion_observe::call(__func__,__LINE__,"pts_y",[&](){return ckks_pairs_to_mpc(pts_y, num_cts, ell, scale, he);});
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     // ckks_to_mpc already returned local additive shares; this is only their
@@ -1969,7 +1990,7 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
     // approximation.  Apply the mux after the HE round so malformed CKKS
     // values from the unclipped branch can never enter the denominator.
     if (blb_secure_exp_clamp_enabled()) {
-        const auto clip_start = high_resolution_clock::now();
+        const auto clip_start = steady_clock::now();
         vector<thread> workers;
         for (int worker = 0; worker < exp_workers; ++worker) {
             const int begin = ret.size * worker / exp_workers;
@@ -1988,9 +2009,11 @@ FixArray Bert_ckks::exp_he(const FixArray &x, bool apply_attention_mask){
             });
         }
         for (auto &worker : workers) worker.join();
+        execution_observe::interval("MPC",__func__,__LINE__,clip_start);
+    other_nonlinear_la += chrono::duration<double>(steady_clock::now()-clip_start).count();
         cout << "EXP_SAFETY_PHASE phase=output_mux_and_clamp workers="
              << exp_workers << " ms=" << chrono::duration<double, milli>(
-                    high_resolution_clock::now() - clip_start).count() << endl;
+                    steady_clock::now() - clip_start).count() << endl;
     }
     if (apply_attention_mask && public_attention_mask_ready) {
         const size_t row_width = public_attention_mask.size();
@@ -2074,12 +2097,12 @@ FixArray Bert_ckks::element_wise_mul(FixArray x, FixArray y){
         }
     }
 
-    auto start = high_resolution_clock::now();
-    mpc_to_ckks(pts_x, vec_x, slot_count, he->get_conversion_prime(),
-                bitwidth, s, he->he_scale, he);
-    mpc_to_ckks(pts_y, vec_y, slot_count, he->get_conversion_prime(),
-                bitwidth, s, he->he_scale, he);
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    auto start = steady_clock::now();
+    fusion_observe::call(__func__,__LINE__,"pts_x",[&](){return mpc_to_ckks(pts_x, vec_x, slot_count, he->get_conversion_prime(),
+                bitwidth, s, he->he_scale, he);});
+    fusion_observe::call(__func__,__LINE__,"pts_y",[&](){return mpc_to_ckks(pts_y, vec_y, slot_count, he->get_conversion_prime(),
+                bitwidth, s, he->he_scale, he);});
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     // Alice is server, Bob is client
@@ -2102,13 +2125,13 @@ FixArray Bert_ckks::element_wise_mul(FixArray x, FixArray y){
         cout << "client decrypt done" << endl;
 	} else {
         // Revice ciphertexts from BOB (or clinet)
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         recv_encrypted_vector(he->context, io, cts_x);
         recv_encrypted_vector(he->context, io, cts_y);
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
 
         if (he->is_gpu_enable()) {
-            start = high_resolution_clock::now();
+            start = steady_clock::now();
                 for_each_n(cts_x.begin(), cts_x.size(),
                     [he](auto &ct) { ct.to_device(*he->context, *he->dcontext); });
                 for_each_n(cts_y.begin(), cts_y.size(),
@@ -2118,46 +2141,47 @@ FixArray Bert_ckks::element_wise_mul(FixArray x, FixArray y){
             for_each_n(pts_y.begin(), pts_y.size(),
                 [he](auto &pt) { pt.to_device(*he->context, *he->dcontext); });
             const double h2d_seconds =
-                ((high_resolution_clock::now() - start)).count() / 1e+9;
+                ((steady_clock::now() - start)).count() / 1e+9;
             this->ct_transfer_mem_la += h2d_seconds;
             this->h2d_time += h2d_seconds;
         }
 
         // Begin computation
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
 
         #pragma omp parallel for if(!he->is_gpu_enable())
         for(int i=0;i<cts_x.size();i++){
             if (!he->is_gpu_enable()) {
                 he->evaluator->add_plain_inplace(cts_x[i], pts_x[i]);
                 he->evaluator->add_plain_inplace(cts_y[i], pts_y[i]);
-                he->evaluator->multiply_inplace(cts_x[i], cts_y[i]);
+                execution_observe::he_call(1,[&](){return he->evaluator->multiply_inplace(cts_x[i], cts_y[i]);});
                 he->evaluator->relinearize_inplace(cts_x[i], *he->relin_keys);
                 ++this->he_rescale_count;
                 he->evaluator->rescale_to_next_inplace(cts_x[i]);
             } else {
                 he->devaluator->add_plain_inplace(cts_x[i], pts_x[i]);
                 he->devaluator->add_plain_inplace(cts_y[i], pts_y[i]);
-                he->devaluator->multiply_inplace(cts_x[i], cts_y[i]);
+                execution_observe::he_call(1,[&](){return he->devaluator->multiply_inplace(cts_x[i], cts_y[i]);});
                 he->devaluator->relinearize_inplace(cts_x[i], *he->drelin_keys);
                 ++this->he_rescale_count;
                 he->devaluator->rescale_to_next_inplace(cts_x[i]);    
             }
         }
-        this->he_compute_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        execution_observe::interval("CKKS",__func__,__LINE__,start);
+    this->he_compute_la += ((steady_clock::now() - start)).count()/1e+9;
         
         if (he->is_gpu_enable()) {
             // Load result ciphertexts to CPU
-            start = high_resolution_clock::now();
+            start = steady_clock::now();
             for_each_n(cts_x.begin(), cts_x.size(),
                 [he](auto &ct) { ct.to_host(*he->context, *he->dcontext); });
             const double d2h_seconds =
-                ((high_resolution_clock::now() - start)).count()/1e+9;
+                ((steady_clock::now() - start)).count()/1e+9;
             this->ct_transfer_mem_la += d2h_seconds;
             this->d2h_time += d2h_seconds;
         }
 
-        start = high_resolution_clock::now();
+        start = steady_clock::now();
         cout << "server send_encrypted_vector" << endl;
         cout << "cts_x.size:" << cts_x.size() << endl;
         for (int i = 0; i < cts_x.size(); ++i) {
@@ -2165,18 +2189,18 @@ FixArray Bert_ckks::element_wise_mul(FixArray x, FixArray y){
         }
         mask_ckks_to_mpc_inplace(cts_output, output_pts, he);
         send_encrypted_vector(io, cts_output);
-        this->ct_transfer_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+        this->ct_transfer_la += ((steady_clock::now() - start)).count()/1e+9;
     }
     this->ct_transfer_comm += this->get_comm();
     this->ct_transfer_round += this->get_round();
     vector<vector<HE_CKKS::scalar_t>> output_vector;
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     // cout << "OK here" << endl;
     // cout << "cts_x.size:" << cts_x.size() << endl;
     // cout << "pts[0].scale()" << output_pts[0].scale() << endl;
     // cout << "Q:" << he->get_Q(output_pts[0]) << endl;
-    output_vector = ckks_to_mpc(output_pts, poly_modulus_degree, he->get_Q(output_pts[0]), bitwidth, s, he);
-    this->conversion_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    output_vector = fusion_observe::call(__func__,__LINE__,"output_pts",[&](){return ckks_to_mpc(output_pts, poly_modulus_degree, he->get_Q(output_pts[0]), bitwidth, s, he);});
+    this->conversion_la += ((steady_clock::now() - start)).count()/1e+9;
     this->conversion_comm += this->get_comm();
     this->conversion_round += this->get_round();
     FixArray output(party, original_size, original_signed, bitwidth, s);
@@ -2200,7 +2224,7 @@ FixArray Bert_ckks::div_batch_he(const FixArray& nm, const FixArray& dn, int bat
     assert(nm.party != sci::PUBLIC && dn.party != sci::PUBLIC);
     assert(nm.size == dn.size * batch_dn_size);
     assert(s_out <= dn.s);
-    auto start = high_resolution_clock::now();
+    auto start = steady_clock::now();
     BoolOp* bool_op = nonlinear.fpmath[0]->bool_op;
     BoolArray all_0 = bool_op->input(sci::ALICE, dn.size, uint8_t(0));
     BoolArray all_1 = bool_op->input(sci::ALICE, dn.size, uint8_t(1));
@@ -2248,7 +2272,8 @@ FixArray Bert_ckks::div_batch_he(const FixArray& nm, const FixArray& dn, int bat
     FixArray c0 = fix->LUT(spec_c0, idx, true, m + 4, m + 3);
     FixArray c1 = fix->LUT(spec_c1, idx, true, 2*m + 3, 2*m + 2);
     cout << "OK4" << endl;
-    this->other_nonlinear_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    execution_observe::interval("MPC",__func__,__LINE__,start);
+    this->other_nonlinear_la += ((steady_clock::now() - start)).count()/1e+9;
     this->other_nonlinear_comm += this->get_comm();
     this->other_nonlinear_round += this->get_round();
     // FixArray w = fix->mul(c0, eps, nrmlzd_dn.s + 4, all_0.data, msb_eps.data);
@@ -2257,14 +2282,15 @@ FixArray Bert_ckks::div_batch_he(const FixArray& nm, const FixArray& dn, int bat
     // w = fix->sub(fix->scale_up(c1, nrmlzd_dn.s + m + 4, nrmlzd_dn.s + m + 3),
     //             fix->extend(w, nrmlzd_dn.s + m + 4, all_0.data));
     // w = fix->truncate_reduce(w, w.s - s_out);
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     BoolArray msb_nm;
     uint8_t* msb_nm_data = nullptr;
     if (nm.signed_) {
         msb_nm = fix->MSB(nm);
         msb_nm_data = msb_nm.data;
     }
-    this->other_nonlinear_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    execution_observe::interval("MPC",__func__,__LINE__,start);
+    this->other_nonlinear_la += ((steady_clock::now() - start)).count()/1e+9;
     this->other_nonlinear_comm += this->get_comm();
     this->other_nonlinear_round += this->get_round();
     // Change extend w and adjust here
@@ -2284,13 +2310,14 @@ FixArray Bert_ckks::div_batch_he(const FixArray& nm, const FixArray& dn, int bat
     // FixArray a = fix->mul(nm, w_extend, nm.ell + s_out, msb_nm_data, all_0_dm.data);
     FixArray a = element_wise_mul(nm, w_extend);
     // a = fix->truncate_reduce(a, nm.s);
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     if ((nm.ell - nm.s) >= (l_out - s_out)) {
         a = fix->reduce(a, l_out);
     } else {
         a = fix->extend(a, l_out, msb_nm_data);
     }
-    this->other_nonlinear_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    execution_observe::interval("MPC",__func__,__LINE__,start);
+    this->other_nonlinear_la += ((steady_clock::now() - start)).count()/1e+9;
     this->other_nonlinear_comm += this->get_comm();
     this->other_nonlinear_round += this->get_round();
     cout << "OK4" << endl;
@@ -2338,7 +2365,7 @@ FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int 
     const auto previous_conversion_bucket = profile_conversion_bucket();
     const uint64_t rec_comm_before = profile_is_enabled() ? current_comm() : 0;
     profile_set_conversion_bucket(BlbViTCommAuditBucket::SOFTMAX_REC_CONVERSION);
-    auto start = high_resolution_clock::now();
+    auto start = steady_clock::now();
     // exp(max-max)=1 bounds a Softmax reciprocal by one. A row-level
     // floor of 1/2 protects against approximation underflow; two integer
     // bits then suffice. Generic (including ReLU) denominators stay wide.
@@ -2421,7 +2448,8 @@ FixArray Bert_ckks::div_batch_he_V2(const FixArray& nm, const FixArray& dn, int 
          << " row_bound=" << (compact_softmax_denominator ? batch_dn_size : 0)
          << " guard_factor=" << (compact_softmax_denominator ? 4 : 0)
          << " local_reduce=" << (denominator_reduced ? 1 : 0) << endl;
-    this->other_nonlinear_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    execution_observe::interval("MPC",__func__,__LINE__,start);
+    this->other_nonlinear_la += ((steady_clock::now() - start)).count()/1e+9;
     this->other_nonlinear_comm += this->get_comm();
     this->other_nonlinear_round += this->get_round();
     // Replication below overwrites the complete local-share buffer.
@@ -2466,7 +2494,7 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
                                            FPMath* fpmath[],
                                            int active_heads) {
     // std::cout << "Entering softmax fix" << std::endl;
-    auto start = high_resolution_clock::now();
+    auto start = steady_clock::now();
     int ell = x.ell;
     int s = x.s;
     cout << "ell,s:" << ell << "," << s << endl;
@@ -2628,7 +2656,8 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
     diagnostic_open_softmax_prefix(shifted_x_flat, "shifted", 8);
 
     FixArray e_x_flat;
-    this->other_nonlinear_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    execution_observe::interval("MPC",__func__,__LINE__,start);
+    this->other_nonlinear_la += ((steady_clock::now() - start)).count()/1e+9;
     this->other_nonlinear_comm += get_comm();
     this->other_nonlinear_round += get_round();
     // Keep the production Softmax on BLB's HE-assisted exponentiation path.
@@ -2662,7 +2691,7 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
          << " metadata_reinterpretation=0 row_sum_bound=" << array_size
          << " intermediate_reconstruction=0" << endl;
     diagnostic_open_sum(e_x_flat, "exp");
-    start = high_resolution_clock::now();
+    start = steady_clock::now();
     cout << "exp_he OK" << endl;
     vector<FixArray> e_x_tr(array_size);
     for (int i = 0; i < array_size; i++) {
@@ -2698,8 +2727,8 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
     diagnostic_open_sum(sum_e_x, "denominator");
     cout << "e_x_flat.size:" << e_x_flat.size << endl;
     cout << "sum_e_x.size:" << sum_e_x.size << endl;
-    cout << "exp_he data time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
-    start = high_resolution_clock::now();
+    cout << "exp_he data time:" << ((steady_clock::now() - start)).count()/1e+9 << endl;
+    start = steady_clock::now();
     // Strict B retains the full nonlinear ring. Public-range narrowing and
     // reciprocal clipping are optional optimizations, not BLB restoration.
     FixArray ret_flat = div_batch_he_V2(
@@ -2712,8 +2741,8 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
          << " output_ell=" << ret_flat.ell
          << " client_reconstruction=0" << endl;
     cout << "div_batch_he time:"
-         << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
-    start = high_resolution_clock::now();
+         << ((steady_clock::now() - start)).count()/1e+9 << endl;
+    start = steady_clock::now();
     //point5
     cout << "ret_flat.size:" << ret_flat.size << endl;
     // Normalize from the actual returned metadata rather than the nominal
@@ -2754,9 +2783,35 @@ vector<FixArray> Bert_ckks::softmax_fix_he(int party, FixArray x,
         for (int key = 0; key < array_size; ++key)
             ret[active_rows[i]].data[active_keys[key]] = ret_flat.data[i * array_size + key];
     }
-    this->other_nonlinear_la += ((high_resolution_clock::now() - start)).count()/1e+9;
+    execution_observe::interval("MPC",__func__,__LINE__,start);
+    this->other_nonlinear_la += ((steady_clock::now() - start)).count()/1e+9;
     return ret;
 }
+
+FixArray parallel_relu(Bert_ckks &b,const FixArray &z,int heads){
+ const int rows=heads*256,keys=197;auto start=std::chrono::steady_clock::now();
+ FixArray positive(b.party,rows*keys,false,37,12),safe(b.party,rows,false,37,12);
+ const int workers=std::min(b.nonlinear.active_workers(),std::max(1,rows/4));
+ std::vector<std::thread> threads;
+ for(int w=0;w<workers;w++)threads.emplace_back([&,w]{
+  int begin=rows*w/workers,end=rows*(w+1)/workers,n=end-begin;
+  auto *fix=b.nonlinear.fpmath[w]->fix;
+  FixArray x(b.party,n*keys,true,37,12);
+  for(int r=0;r<n;r++)std::copy_n(z.data+(begin+r)*256,keys,x.data+r*keys);
+  auto negative=fix->LT(x,uint64_t(0));auto p=fix->if_else(negative,uint64_t(0),x);p.signed_=false;
+  FixArray denominator(b.party,n,false,37,12);
+  for(int r=0;r<n;r++){uint64_t sum=0;for(int c=0;c<keys;c++)sum+=p.data[r*keys+c];denominator.data[r]=sum&z.ell_mask();}
+  auto zero=fix->EQ(denominator,uint64_t(0));auto guarded=fix->if_else(zero,uint64_t(1)<<12,denominator);
+  std::copy_n(p.data,n*keys,positive.data+begin*keys);std::copy_n(guarded.data,n,safe.data+begin);
+ });
+ for(auto &t:threads)t.join();execution_observe::interval("MPC",__func__,__LINE__,start);
+    b.other_nonlinear_la+=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+ auto compact=b.div_batch_he_V2(positive,safe,keys,37,12,false);
+ FixArray out(b.party,z.size,false,37,12);std::fill_n(out.data,out.size,uint64_t(0));
+ for(int r=0;r<rows;r++)std::copy_n(compact.data+r*keys,keys,out.data+r*256);
+ return out;
+}
+
 
 FixArray Bert_ckks::heterogeneous_attention_norm(
     FixArray input,
@@ -2773,10 +2828,18 @@ FixArray Bert_ckks::heterogeneous_attention_norm(
         layer_id >= ours_vit::kPlanLayers) {
         throw runtime_error("HETERO heterogeneous attention metadata mismatch");
     }
+    if(!execution_observe::force_generic() && std::all_of(protocols.begin(),protocols.end(),
+                   [](ours_vit::HeadProtocol p){return p==ours_vit::HeadProtocol::SoftmaxMpc;})) {
+        cout<<"OURS_HETERO_UNCHANGED_LAYER status=PASS layer="<<layer_id<<" dispatch=original_BLB public_plan_only=1"<<endl;
+        return softmax_he(input);
+    }
 
+    auto layout_start=std::chrono::steady_clock::now();
     vector<uint64_t> row_major(static_cast<size_t>(input.size));
     linear.plain_cross_packing_postprocess(input.data, row_major.data(), false,
                                            data);
+    execution_observe::interval("Layout",__func__,__LINE__,layout_start);
+    optimized_layout_s+=std::chrono::duration<double>(std::chrono::steady_clock::now()-layout_start).count();
     FixArray result(party, input.size, input.signed_, input.ell, input.s);
     FixOp *fix = nonlinear.fpmath[0]->fix;
     const uint64_t ring_mask = input.ell_mask();
@@ -2787,14 +2850,18 @@ FixArray Bert_ckks::heterogeneous_attention_norm(
     uint64_t mpc_protocol_invocations = 0;
     uint64_t native_linear_deferred_groups = 0;
 
+    cout << "OURS_GENERIC_EXECUTOR_ENTER status=PASS layer=" << layer_id
+         << " force_generic_all_s=" << execution_observe::force_generic() << endl;
     for (int group_start = 0; group_start < PACKING_NUM;) {
         int group_end = group_start + 1;
-        if (group_contiguous_protocols) {
+        if (true) { // reuse existing homogeneous operator batching; conversion groups unchanged
             while (group_end < PACKING_NUM &&
                    protocols[group_end] == protocols[group_start]) {
                 ++group_end;
             }
         }
+        fusion_observe::Context group_context(fusion_observe::public_heads,
+            "head_begin="+std::to_string(group_start)+" head_end="+std::to_string(group_end));
         const int group_heads = group_end - group_start;
         const int group_values = group_heads * per_head;
         ++protocol_invocations;
@@ -2803,11 +2870,14 @@ FixArray Bert_ckks::heterogeneous_attention_norm(
             ++native_linear_deferred_groups;
         else
             ++mpc_protocol_invocations;
+        layout_start=std::chrono::steady_clock::now();
         FixArray group_input(party, group_values, true, input.ell, input.s);
         memcpy(group_input.data,
                row_major.data() + static_cast<size_t>(group_start) * per_head,
                static_cast<size_t>(group_values) * sizeof(uint64_t));
-        const auto group_profile_start = high_resolution_clock::now();
+        execution_observe::interval("Layout",__func__,__LINE__,layout_start);
+    optimized_layout_s+=std::chrono::duration<double>(std::chrono::steady_clock::now()-layout_start).count();
+        const auto group_profile_start = steady_clock::now();
         const uint64_t group_comm_start = current_comm();
         const uint64_t group_round_start = current_round();
         const double group_he_start = he_compute_la;
@@ -2854,39 +2924,7 @@ FixArray Bert_ckks::heterogeneous_attention_norm(
         } else if (protocols[group_start] ==
                    ours_vit::HeadProtocol::ReluNormMpc) {
             relu_heads += group_heads;
-            // ReLU is evaluated on secret shares. Public padding keys are
-            // subsequently zeroed on both local shares, which is exactly a
-            // multiplication by a public 0/1 mask and leaks no input value.
-            BoolArray negative = fix->LT(group_input, uint64_t(0));
-            normalized = fix->if_else(negative, uint64_t(0), group_input);
-            normalized.signed_ = false;
-            for (int group_head = 0; group_head < group_heads; ++group_head)
-                for (int query = 0; query < tokens; ++query)
-                    for (int key = logical_tokens; key < tokens; ++key)
-                        normalized.data[
-                            (static_cast<size_t>(group_head) * tokens + query) *
-                                tokens + key] = 0;
-
-            FixArray denominator(party, group_heads * tokens, false,
-                                 input.ell, input.s);
-            for (int row = 0; row < group_heads * tokens; ++row) {
-                uint64_t local_sum = 0;
-                for (int key = 0; key < tokens; ++key)
-                    local_sum = (local_sum +
-                        normalized.data[static_cast<size_t>(row) * tokens + key]) &
-                        ring_mask;
-                denominator.data[row] = local_sum;
-            }
-            BoolArray zero = fix->EQ(denominator, uint64_t(0));
-            FixArray safe_denominator = fix->if_else(
-                zero, uint64_t(1) << input.s, denominator);
-            safe_denominator.signed_ = false;
-            // Reuse the same HE-assisted reciprocal/multiply primitive as the
-            // BLB Softmax engine.  ReLU and the zero-denominator mux stay in
-            // MPC, but the former full-MPC div_batch bottleneck is removed.
-            normalized = div_batch_he_V2(
-                normalized, safe_denominator, tokens,
-                input.ell, input.s, false);
+            normalized=parallel_relu(*this,group_input,group_heads);
         } else if (protocols[group_start] ==
                    ours_vit::HeadProtocol::HeLinear) {
             linear_heads += group_heads;
@@ -2896,11 +2934,14 @@ FixArray Bert_ckks::heterogeneous_attention_norm(
         } else {
             throw runtime_error("HETERO head protocol code is invalid");
         }
+        layout_start=std::chrono::steady_clock::now();
         memcpy(result.data + static_cast<size_t>(group_start) * per_head,
                normalized.data,
                static_cast<size_t>(group_values) * sizeof(uint64_t));
+        execution_observe::interval("Layout",__func__,__LINE__,layout_start);
+    optimized_layout_s+=std::chrono::duration<double>(std::chrono::steady_clock::now()-layout_start).count();
         const double group_wall_ms =
-            chrono::duration<double, std::milli>(high_resolution_clock::now() -
+            chrono::duration<double, std::milli>(steady_clock::now() -
                                                  group_profile_start)
                 .count();
         const uint64_t group_comm_bytes = current_comm() - group_comm_start;
@@ -2953,7 +2994,7 @@ FixArray Bert_ckks::heterogeneous_attention_norm(
          << " mpc_protocol_invocations=" << mpc_protocol_invocations
          << " native_linear_deferred_groups="
          << native_linear_deferred_groups
-         << " grouping=" << (group_contiguous_protocols ? 1 : 0)
+         << " grouping=1 conversion_grouping_unchanged=1 caller_grouping=" << (group_contiguous_protocols ? 1 : 0)
          << " linear_location="
          << "native_CKKS_deferred"
          << " selective_conversion=" << 1
@@ -2969,14 +3010,15 @@ FixArray Bert_ckks::softmax_he(FixArray input) {
     uint64_t* softmax_input_row = new uint64_t[qk_size];
     cout << "qk_size:" << qk_size << endl;
     cout << "OK" << endl;
-    auto start = high_resolution_clock::now();
+    auto start = steady_clock::now();
     linear.plain_cross_packing_postprocess(
         input.data, 
         softmax_input_row,
         // we need row packing
         false,
         data);
-    cout << "softmax packing time:" << ((high_resolution_clock::now() - start)).count()/1e+9 << endl;
+    execution_observe::interval("Layout",__func__,__LINE__,start);
+    cout << "softmax packing time:" << ((steady_clock::now() - start)).count()/1e+9 << endl;
     int ell = input.ell;
     int s = input.s;
     cout << "OK2" << endl;
@@ -3046,47 +3088,5 @@ FixArray Bert_ckks::softmax_he(FixArray input) {
          << " shares=local_additive" << endl;
     delete[] softmax_input_row;
     delete[] softmax_output_row;
-    return result;
-}
-
-
-FixArray Bert_ckks::softmax_ot(FixArray input) {
-    FCMetadata data = linear.data_lin1_0;
-    int softmax_dim = data.image_size;
-    int qk_size = PACKING_NUM*softmax_dim*softmax_dim;
-    int softmax_output_size = PACKING_NUM*softmax_dim*softmax_dim;
-    uint64_t* softmax_input_row = new uint64_t[qk_size];
-    cout << "OK" << endl;
-    linear.plain_cross_packing_postprocess(
-        input.data, 
-        softmax_input_row,
-        // we need row packing
-        false,
-        data);
-    cout << "OK2" << endl;
-    // may be need a truncation
-    uint64_t* softmax_output_row = new uint64_t[softmax_output_size];
-    uint64_t* softmax_l_row = new uint64_t[softmax_output_size];
-    // Softmax
-    nonlinear.softmax(
-        1,
-        softmax_input_row,
-        softmax_output_row,
-        softmax_l_row,
-        PACKING_NUM*softmax_dim,
-        softmax_dim,
-        NL_ELL,
-        NL_SCALE);
-    cout << "OK3" << endl;
-    FixArray result(party, softmax_output_size, input.signed_, NL_ELL,
-                    NL_SCALE);
-    memcpy(result.data, softmax_output_row,
-           static_cast<size_t>(softmax_output_size) * sizeof(uint64_t));
-    cout << "SOFTMAX_OUTPUT_METADATA backend=ot status=PASS ell="
-         << result.ell << " scale=" << result.s
-         << " shares=local_additive" << endl;
-    delete[] softmax_input_row;
-    delete[] softmax_output_row;
-    delete[] softmax_l_row;
     return result;
 }
