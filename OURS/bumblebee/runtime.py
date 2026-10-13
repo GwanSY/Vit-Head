@@ -60,6 +60,13 @@ def node(out, rank):
 
 
 def worker(out):
+    meta = json.loads((out / "run.json").read_text())
+    if meta["config"].get("task") == "attention":
+        from experiment import attention_worker
+        return attention_worker(out)
+    if meta["config"].get("task") == "block":
+        from block import block_worker
+        return block_worker(out)
     import jax
     import numpy as np
     import spu
@@ -71,7 +78,14 @@ def worker(out):
 
     meta = json.loads((out / "run.json").read_text())
     model, pixels = load(Path(meta["model"]), Path(meta["image"]))
-    reference = np.asarray(model(pixels, params=model.params, train=False).logits)
+    plan = meta["config"].get("head_plan")
+    layout = meta["config"].get("layout", "joint")
+    if plan is None:
+        reference = np.asarray(model(pixels, params=model.params, train=False).logits)
+    else:
+        from heads import bind
+        with bind(plan, layout):
+            reference = np.asarray(model(pixels, params=model.params, train=False).logits)
     conf = meta["spu"]
     ppd.init(conf["nodes"], conf["devices"])
     # Model and image are owned by different parties, as in the 2PC setting.
@@ -99,7 +113,7 @@ def worker(out):
     write(out / "run.json", meta)
     print("Starting secure ViT inference", flush=True)
     try:
-        secret = ppd.device("SPU")(inference(model), copts=copts)(params, inputs)
+        secret = ppd.device("SPU")(inference(model, plan, layout), copts=copts)(params, inputs)
         actual = np.asarray(ppd.get(secret))
     finally:
         frontend.compile = original
@@ -130,20 +144,25 @@ def worker(out):
     print(json.dumps(result), flush=True)
 
 
-def profile(path):
+def profile(path, last=False, execution=None):
     text = path.read_text(errors="replace")
+    if execution is not None:
+        markers = list(re.finditer(r"\[BumbleBeeBackend\]", text))
+        if execution >= len(markers):
+            raise RuntimeError(f"Missing execution {execution} in {path}")
+        text = text[markers[execution].start():markers[execution+1].start() if execution+1 < len(markers) else None]
     timings = re.findall(r"execution took ([\d.eE+-]+)s", text)
     links = re.findall(r"Link details: total send ([\d.eE+-]+) MiB recv ([\d.eE+-]+) MiB", text)
     operations = {}
     for name, count, seconds, sent, recv in re.findall(
-            r"- (\w+), executed (\d+) times, duration ([\d.eE+-]+)s, "
+            r"- ([\w.]+), executed (\d+) times, duration ([\d.eE+-]+)s, "
             r"send ([\d.eE+-]+) MiB, recv ([\d.eE+-]+) MiB", text):
         operations[name] = dict(calls=int(count), seconds=float(seconds),
                                 sent_mib=float(sent), recv_mib=float(recv))
-    if len(timings) != 1 or len(links) != 1:
+    if not timings or not links or (not last and (len(timings) != 1 or len(links) != 1)):
         raise RuntimeError(f"Incomplete native profile: {path.name}")
-    result = dict(seconds=float(timings[0]), sent_mib=float(links[0][0]),
-                  recv_mib=float(links[0][1]), operations=operations)
+    result = dict(seconds=float(timings[-1]), sent_mib=float(links[-1][0]),
+                  recv_mib=float(links[-1][1]), operations=operations)
     metrics = re.findall(r"\[BumbleBeeBackend\] ([^\n]+)", text)
     if metrics:
         result["backend_metrics"] = dict(re.findall(r"(\w+)=([\w.eE+-]+)", metrics[-1]))
@@ -172,8 +191,9 @@ def baseline(config_path, requested_out, backend=None):
     merged = command(["docker", "inspect", source, "--format", "{{.GraphDriver.Data.MergedDir}}"])
     original_library = Path(config["spu_package"]) / "spu/libspu.so"
     library = dict(library="/opt/bb/spu/libspu.so", host_file=str(original_library), sha256=digest(original_library))
-    if gpu:
-        native = Path(config["gpu_library"]).resolve(strict=True)
+    if gpu or config.get("native_library"):
+        native = ((config_path.parent / config["native_library"]).resolve(strict=True)
+                  if config.get("native_library") else Path(config["gpu_library"]).resolve(strict=True))
         library.update(original_cpu_sha256=library["sha256"], host_file=str(native), sha256=digest(native))
     tag = "ours-bb:base"
     prefix = f"ours-bb-{out.name}"
@@ -186,9 +206,11 @@ def baseline(config_path, requested_out, backend=None):
                SPU_BB_SET_IEQUAL_BITS="16", OMP_NUM_THREADS=str(threads), OPENBLAS_NUM_THREADS="1",
                YACL_NUM_THREADS=str(threads),
                XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1")
-    if gpu:
-        env["LD_LIBRARY_PATH"] = "/opt/openbumblebee-phantom/lib:/usr/local/cuda/lib64:/usr/local/nvidia/lib64"
+    if gpu or config.get("native_library"):
+        env["LD_LIBRARY_PATH"] = "/opt/openbumblebee-phantom/lib:/opt/cuda/lib64:/usr/local/cuda/lib64:/usr/local/nvidia/lib64"
     inside_out = "/work/" + str(out.relative_to(workspace))
+    if config.get("trace_intervals"):
+        env["SPU_BB_STAGE2_TRACE"] = inside_out + "/log/native"
     meta = dict(status="preparing", config=config, library=library,
                 model="/work/" + str(model.relative_to(workspace)),
                 image="/work/" + str(image.relative_to(workspace)),
@@ -198,18 +220,29 @@ def baseline(config_path, requested_out, backend=None):
                 native_provenance="Cached binary identified by SHA256; reference source hashes do not prove build identity",
                 precision="FM64/f18; intrinsic GELU FM32/f12; Exp FM64",
                 network="separate egress: 1 Gbps and 0.25 ms delay per party",
-                timing="three independent fresh SPU runtimes; native execution excludes model loading and compilation",
+                timing=f"{config['repeats']} independent fresh SPU runtimes; native execution excludes model loading and compilation",
                 environment=env)
     cpu_name = next(line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines()
                     if line.startswith("model name"))
     meta["hardware"] = dict(cpu=cpu_name, logical_cpus=os.cpu_count(), party_cpus=config["cpus"],
                             yacl_threads=threads, deployment="two isolated parties on one physical host")
+    manifest = Path(library["host_file"]).with_suffix(".json")
+    if manifest.exists():
+        built = json.loads(manifest.read_text())
+        if built.get("library_sha256") == library["sha256"] and built.get("status") == "built":
+            meta["native_build"] = dict(manifest=str(manifest), sha256=digest(manifest),
+                                        backend=built["backend"], sources=built["sources"])
+            meta["native_provenance"] = "Private native build with source hashes and compiler command recorded"
     if gpu:
         meta["hardware"]["gpus"] = [command(["nvidia-smi", "-i", device,
             "--query-gpu=name,uuid,driver_version", "--format=csv,noheader"]) for device in config["gpus"]]
         meta["hashes"]["Phantom"] = digest(Path(config["phantom"]) / "lib/libPhantom.so")
-    for filename in ("run.py", "runtime.py", "model.py", "config.json"):
+    for filename in ("run.py", "runtime.py", "model.py", "heads.py", "experiment.py", "config.json"):
         meta["hashes"][filename] = digest(ROOT / filename)
+    if config.get("study") == "mixed":
+        meta["hashes"]["mixed.py"] = digest(ROOT / "mixed.py")
+        if config.get("task") == "block":
+            meta["hashes"]["block.py"] = digest(ROOT / "block.py")
     source_files = ["libspu/mpc/bumblebee/protocol.cc", "libspu/mpc/bumblebee/arith/bumblebee_dot.cc",
                     "libspu/kernel/hal/intrinsic/nn/activation.cc", "libspu/kernel/hal/fxp_approx.cc",
                     "spu/utils/frontend.py", "spu/utils/distributed.py"]
@@ -241,10 +274,12 @@ def baseline(config_path, requested_out, backend=None):
             dependency = config["dependency_path"]
             args += ["-v", f"{merged}{dependency}:{dependency}:ro",
                      "-v", f"{config['spu_package']}:/opt/bb:ro"]
+            if gpu or config.get("native_library"):
+                args += ["-v", f"{library['host_file']}:{library['library']}:ro",
+                         "-v", f"{config['phantom']}:/opt/openbumblebee-phantom:ro",
+                         "-v", "/usr/local/cuda-12.3:/opt/cuda:ro"]
             if gpu:
-                args += ["--gpus", f"device={config['gpus'][rank]}",
-                         "-v", f"{config['gpu_library']}:{library['library']}:ro",
-                         "-v", f"{config['phantom']}:/opt/openbumblebee-phantom:ro"]
+                args += ["--gpus", f"device={config['gpus'][rank]}"]
             for key, value in env.items():
                 args += ["-e", f"{key}={value}"]
             command(args + [tag, "sleep", "infinity"])
@@ -259,7 +294,8 @@ def baseline(config_path, requested_out, backend=None):
                               enable_pphlo_profile=True, enable_hal_profile=True,
                               enable_pphlo_trace=False, enable_action_trace=False,
                               fxp_exp_mode=0, fxp_exp_iters=6,
-                              experimental_enable_colocated_optimization=True,
+                              # Q/K/V inside ViT are shared intermediate tensors.
+                              experimental_enable_colocated_optimization=config.get("task") != "attention",
                               experimental_disable_mmul_split=True)
         meta["spu"] = dict(nodes={f"node:{r}": f"{ip}:9320" for r, ip in enumerate(addresses)},
                            devices={"SPU": dict(kind="SPU", config=dict(
@@ -274,6 +310,7 @@ def baseline(config_path, requested_out, backend=None):
         for repeat in range(1, config["repeats"] + 1):
             meta = json.loads((out / "run.json").read_text())
             meta["active_repeat"] = repeat
+            previous_measurements = len(meta.get("measurements", []))
             write(out / "run.json", meta)
             processes, handles = [], []
             for rank, name in enumerate(containers):
@@ -285,64 +322,99 @@ def baseline(config_path, requested_out, backend=None):
             time.sleep(2)
             if any(p.poll() is not None for p in processes):
                 raise RuntimeError("A node failed to start; see party logs")
-            print(f"  b{repeat}: ViT-base 12 blocks, 144 Softmax heads", flush=True)
+            label = config.get("plan_name", "S")
+            print(f"  b{repeat}: {config.get('task','vit')}, plan={label}, layout={config.get('layout','joint')}", flush=True)
             with (out / "log" / f"b{repeat}.log").open("w") as log:
                 subprocess.run(["docker", "exec", containers[0], "python", "run.py", "worker", "--out", inside_out],
                                stdout=log, stderr=subprocess.STDOUT, check=True, timeout=config["timeout_s"])
             stop_nodes(containers, processes, handles)
             processes, handles = [], []
             meta = json.loads((out / "run.json").read_text())
-            parts = [profile(out / "log" / f"b{repeat}-p{rank}.log") for rank in range(2)]
-            if gpu and any(p.get("backend_metrics", {}).get("backend") != "gpu" or
-                           float(p.get("backend_metrics", {}).get("HE_calls", 0)) <= 0 or
-                           float(p.get("backend_metrics", {}).get("H2D_bytes", 0)) <= 0 for p in parts):
-                raise RuntimeError("GPU execution was not confirmed by native backend metrics")
-            for part in parts:
-                for op, calls in {"f_mmul": 73, "f_batch_mmul": 24, "f_tensordot": 1, "f_gelu": 12}.items():
-                    if part["operations"].get(op, {}).get("calls") != calls:
-                        raise RuntimeError(f"ViT graph mismatch: {op} should execute {calls} times")
-            row = meta["measurements"][-1]
-            row.update(online_s=max(p["seconds"] for p in parts),
-                       sent_gib=parts[0]["sent_mib"] / 1024,
-                       recv_gib=parts[0]["recv_mib"] / 1024,
-                       total_gib=sum(p["sent_mib"] for p in parts) / 1024)
-            for a, b in ((0, 1), (1, 0)):
-                if abs(parts[a]["sent_mib"] - parts[b]["recv_mib"]) > 0.01:
-                    raise RuntimeError("Party communication totals do not close")
-            meta.setdefault("profiles", []).append(parts)
-            write(out / "run.json", meta)
-            with (out / "ops.csv").open("w", newline="") as stream:
-                writer = csv.writer(stream)
-                writer.writerow(["repeat", "operation", "paper_calls", "calls", "paper_s", "p0_s", "p1_s"])
-                for i, pair in enumerate(meta["profiles"], 1):
-                    for name, (calls, seconds) in PAPER.items():
-                        a, b = (p["operations"][name] for p in pair)
-                        writer.writerow([i, name, calls, a["calls"], seconds, a["seconds"], b["seconds"]])
-            rows.append(row)
-            with (out / "results.csv").open("w", newline="") as stream:
-                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-                writer.writeheader()
-                writer.writerows(rows)
-            print(f"    {row['online_s']:.2f}s, {row['total_gib']:.2f} GiB, numeric={row['numerical_pass']}", flush=True)
-            if not row["numerical_pass"]:
-                raise RuntimeError("All-Softmax numerical validation failed")
-            if repeat == 1 and row["online_s"] > config["gate"]["paper_seconds"] * config["gate"]["latency_ratio"][1]:
-                print("  First run exceeds the time gate; omitting redundant repetitions", flush=True)
-                break
+            task = config.get("task", "vit")
+            parts = [profile(out / "log" / f"b{repeat}-p{rank}.log", last=task in ("attention","block")) for rank in range(2)]
+            samples = config.get("measured_calls", 1)
+            for sample in range(samples):
+                if samples > 1:
+                    parts = [profile(out / "log" / f"b{repeat}-p{rank}.log", execution=sample+1) for rank in range(2)]
+                require_he=config.get("scope")!="map"
+                if any(p.get("backend_metrics", {}).get("backend") != config["backend"] or
+                       (require_he and float(p.get("backend_metrics", {}).get("HE_calls", 0)) <= 0) for p in parts):
+                    raise RuntimeError("Native homomorphic execution was not confirmed on the requested backend")
+                if gpu and any(p.get("backend_metrics", {}).get("backend") != "gpu" or
+                               float(p.get("backend_metrics", {}).get("HE_calls", 0)) <= 0 or
+                               float(p.get("backend_metrics", {}).get("H2D_bytes", 0)) <= 0 for p in parts):
+                    raise RuntimeError("GPU execution was not confirmed by native backend metrics")
+                batch_calls = 24 if task == "vit" else 2
+                mmul_calls = 73 if task == "vit" else 0
+                if task == "block":mmul_calls=6
+                if task == "attention":
+                    stages=0 if config.get("scope")=="map" else 2
+                    one_head=config.get("head_count",12)==1
+                    mmul_calls=stages if one_head else 0
+                    batch_calls=0 if one_head else stages
+                if task == "vit" and config.get("head_plan") and config.get("layout") == "split":
+                    for types in config["head_plan"]["heads"]:
+                        sizes = [types.count(kind) for kind in set(types)]
+                        # A one-head group is lowered to ordinary matrix multiplication.
+                        mmul_calls += sizes.count(1)
+                        batch_calls += sum(size > 1 for size in sizes) - 1
+                if task in ("attention","block") and config.get("layout") == "split":
+                    sizes = [config["types"].count(kind) for kind in set(config["types"])]
+                    mmul_calls += sizes.count(1)
+                    batch_calls += sum(size > 1 for size in sizes) - 1
+                expected = {"f_mmul":mmul_calls,"f_batch_mmul":batch_calls}
+                if task == "vit":expected.update(f_tensordot=1,f_gelu=12)
+                if task == "block":expected.update(f_gelu=1,f_rsqrt=2)
+                for part in parts:
+                    for op, calls in expected.items():
+                        if part["operations"].get(op, {}).get("calls",0) != calls:
+                            raise RuntimeError(f"ViT graph mismatch: {op} should execute {calls} times")
+                row = meta["measurements"][previous_measurements + sample]
+                row.update(online_s=max(p["seconds"] for p in parts),
+                           sent_gib=parts[0]["sent_mib"] / 1024,
+                           recv_gib=parts[0]["recv_mib"] / 1024,
+                           total_gib=sum(p["sent_mib"] for p in parts) / 1024)
+                for a, b in ((0, 1), (1, 0)):
+                    if abs(parts[a]["sent_mib"] - parts[b]["recv_mib"]) > 0.01:
+                        raise RuntimeError("Party communication totals do not close")
+                meta.setdefault("profiles", []).append(parts)
+                write(out / "run.json", meta)
+                with (out / "ops.csv").open("w", newline="") as stream:
+                    writer = csv.writer(stream)
+                    writer.writerow(["repeat", "operation", "paper_calls", "calls", "paper_s", "p0_s", "p1_s"])
+                    for i, pair in enumerate(meta["profiles"], 1):
+                        for name, (calls, seconds) in PAPER.items():
+                            a, b = (p["operations"].get(name, {"calls":0,"seconds":0}) for p in pair)
+                            writer.writerow([i, name, calls, a["calls"], seconds, a["seconds"], b["seconds"]])
+                rows.append(row)
+                with (out / "results.csv").open("w", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
+                print(f"    {row['online_s']:.2f}s, {row['total_gib']:.2f} GiB, numeric={row['numerical_pass']}", flush=True)
+                if not row["numerical_pass"]:
+                    raise RuntimeError("Secure numerical validation failed")
+                if repeat == 1 and task == "vit" and not config.get("head_plan") and not config.get("force_repeats") and row["online_s"] > config["gate"]["paper_seconds"] * config["gate"]["latency_ratio"][1]:
+                    print("  First run exceeds the time gate; omitting redundant repetitions", flush=True)
+                    break
         gate = config["gate"]
         latency = statistics.median(row["online_s"] for row in rows)
         communication = statistics.median(row["total_gib"] for row in rows)
         lr = latency / gate["paper_seconds"]
         cr = communication / (gate["paper_sent_gib"] + gate["paper_recv_gib"])
         matched = gate["latency_ratio"][0] <= lr <= gate["latency_ratio"][1] and gate["communication_ratio"][0] <= cr <= gate["communication_ratio"][1]
-        meta["comparison"] = dict(median_seconds=latency, median_gib=communication,
+        meta["summary"] = dict(median_seconds=latency, median_gib=communication, completed_repeats=len(rows))
+        paper_baseline = config.get("task", "vit") == "vit" and not config.get("head_plan")
+        if paper_baseline:
+            meta["comparison"] = dict(median_seconds=latency, median_gib=communication,
                                   latency_ratio=lr, communication_ratio=cr, matched=matched,
                                   completed_repeats=len(rows),
                                   threshold_note="Engineering gate, not a tolerance stated in the paper; CPU/GPU backend and colocated hardware differ")
-        meta["status"] = "matched" if matched else "outside_gate"
-        meta["research_changes_started"] = False
+        meta["status"] = "complete" if not paper_baseline else "matched" if matched else "outside_gate"
+        meta["research_changes_started"] = bool(config.get("head_plan")) or config.get("task") in ("attention","block")
         write(out / "run.json", meta)
-        print(f"Paper gate: {meta['status']} (time {lr:.3f}x, communication {cr:.3f}x)", flush=True)
+        if paper_baseline:
+            print(f"Paper gate: {meta['status']} (time {lr:.3f}x, communication {cr:.3f}x)", flush=True)
     except (Exception, KeyboardInterrupt) as exc:
         meta = json.loads((out / "run.json").read_text())
         status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "failed"

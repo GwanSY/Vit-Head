@@ -48,8 +48,12 @@ def secure_gelu():
         jnn.gelu, fnn.gelu, ACT2FN["gelu"] = saved
 
 
-def inference(model):
+def inference(model, plan=None, layout="joint"):
     def vit(params, pixels):
         with secure_gelu():
+            if plan is not None:
+                from heads import bind
+                with bind(plan, layout):
+                    return model(pixels, params=params, train=False).logits
             return model(pixels, params=params, train=False).logits
     return vit
