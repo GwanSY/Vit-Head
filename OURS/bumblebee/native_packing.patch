@@ -1,0 +1,261 @@
+--- a/libspu/mpc/bumblebee/rlwe/packlwes.h
++++ b/libspu/mpc/bumblebee/rlwe/packlwes.h
+@@ -39,6 +39,12 @@
+   // require ct_array.size() == gap
+   void PackingWithModulusDrop(absl::Span<RLWECt> rlwes, RLWECt &packed) const;
+ 
++  // CPU-only breadth-first batching of independent gap-sized packing trees.
++  // Outputs must not alias any input ciphertext. Wire layout and arithmetic
++  // within each tree are identical to PackingWithModulusDrop.
++  void PackingWithModulusDropBatch(absl::Span<RLWECt> rlwes,
++                                  absl::Span<RLWECt> packed) const;
++
+  private:
+   void MultiplyFixedScalarInplace(RLWECt &ct) const;
+ 
+--- a/libspu/mpc/bumblebee/rlwe/packlwes.cc
++++ b/libspu/mpc/bumblebee/rlwe/packlwes.cc
+@@ -220,6 +220,88 @@
+     }
+     return cntxt->parms_id();
+   }();
++}
++
++void PackingHelper::PackingWithModulusDropBatch(
++    absl::Span<RLWECt> rlwes, absl::Span<RLWECt> packed) const {
++  SPU_ENFORCE(!evaluator_->using_gpu(), "CPU packing-tree batching only");
++  SPU_ENFORCE(!rlwes.empty());
++  const int64_t groups = (rlwes.size() + gap_ - 1) / gap_;
++  SPU_ENFORCE_EQ(packed.size(), static_cast<size_t>(groups));
++  // Separate output storage is essential: compacting each result directly to
++  // rlwes[group] while other groups read their inputs is a data race.
++  const auto input_begin = reinterpret_cast<uintptr_t>(rlwes.data());
++  const auto input_end = input_begin + rlwes.size()*sizeof(RLWECt);
++  const auto output_begin = reinterpret_cast<uintptr_t>(packed.data());
++  const auto output_end = output_begin + packed.size()*sizeof(RLWECt);
++  SPU_ENFORCE(output_end <= input_begin || output_begin >= input_end,
++              "packing outputs must not alias inputs");
++  const auto pid = rlwes[0].parms_id();
++  for (const auto& ct : rlwes) {
++    if (ct.size() == 0) continue;
++    SPU_ENFORCE_EQ(ct.size(), 2UL);
++    SPU_ENFORCE(ct.parms_id() == pid);
++  }
++  const int64_t poly_degree =
++      context_.first_context_data()->parms().poly_modulus_degree();
++  const size_t modulus_for_keyswitch =
++      gk_context_.first_context_data()->chain_index() + 1;
++  yacl::parallel_for(0, rlwes.size(), [&](int64_t bgn, int64_t end) {
++    for (int64_t i = bgn; i < end; ++i) {
++      InvNttInplace(rlwes[i], context_, true);
++      MultiplyFixedScalarInplace(rlwes[i]);
++      ModulusSwtichInplace(rlwes[i], modulus_for_keyswitch, context_);
++      rlwes[i].parms_id() = gk_context_.first_parms_id();
++    }
++  });
++  auto& evaluator = *evaluator_;
++  const int64_t logn = absl::bit_width(gap_) - 1;
++  for (int64_t k = logn; k >= 1; --k) {
++    const int64_t h = 1LL << (k - 1);
++    // The parallel_for barrier preserves dependencies between tree levels.
++    // No nested parallelism: even the last level has one task per group.
++    yacl::parallel_for(0, groups * h, [&](int64_t bgn, int64_t end) {
++      for (int64_t job = bgn; job < end; ++job) {
++        const int64_t group = job / h, i = job % h;
++        const int64_t start = group * gap_;
++        const int64_t count = std::min<int64_t>(gap_, rlwes.size()-start);
++        RLWECt dummy;
++        RLWECt& ct_even = i < count ? rlwes[start+i] : dummy;
++        RLWECt& ct_odd = i+h < count ? rlwes[start+i+h] : dummy;
++        const bool is_odd_empty = ct_odd.size() == 0;
++        const bool is_even_empty = ct_even.size() == 0;
++        if (is_even_empty && is_odd_empty) {
++          ct_even.release();
++          continue;
++        }
++        NegacyclicRightShiftInplace(ct_odd, h, gk_context_);
++        if (!is_even_empty) {
++          seal::Ciphertext tmp = ct_even;
++          if (!is_odd_empty) {
++            CATCH_SEAL_ERROR(evaluator.sub_inplace(ct_even, ct_odd));
++            CATCH_SEAL_ERROR(evaluator.add_inplace(tmp, ct_odd));
++          }
++          CATCH_SEAL_ERROR(evaluator.apply_galois_inplace(
++              ct_even, poly_degree/h+1, galois_keys_));
++          CATCH_SEAL_ERROR(evaluator.add_inplace(ct_even, tmp));
++        } else {
++          evaluator.negate(ct_odd, ct_even);
++          CATCH_SEAL_ERROR(evaluator.apply_galois_inplace(
++              ct_even, poly_degree/h+1, galois_keys_));
++          CATCH_SEAL_ERROR(evaluator.add_inplace(ct_even, ct_odd));
++        }
++      }
++    });
++  }
++  auto final_context = context_.first_context_data();
++  while (final_context->chain_index()+1 > modulus_for_keyswitch) {
++    final_context = final_context->next_context_data();
++  }
++  for (int64_t group=0; group<groups; ++group) {
++    SPU_ENFORCE(rlwes[group*gap_].size()>0);
++    packed[group] = std::move(rlwes[group*gap_]);
++    packed[group].parms_id() = final_context->parms_id();
++  }
+ }
+ 
+ void GenerateGaloisKeyForPacking(const seal::SEALContext &context,
+--- a/libspu/mpc/bumblebee/rlwe/packlwes_test.cc
++++ b/libspu/mpc/bumblebee/rlwe/packlwes_test.cc
+@@ -11,6 +11,7 @@
+ #include "libspu/mpc/bumblebee/rlwe/modswitch_helper.h"
+ #include "libspu/mpc/bumblebee/rlwe/types.h"
+ #include "libspu/mpc/bumblebee/rlwe/utils.h"
++#include "libspu/mpc/bumblebee/rlwe/bumblebee_metrics.h"
+ #include "libspu/mpc/utils/ring_ops.h"
+ 
+ namespace spu::mpc::bumblebee::test {
+@@ -134,6 +135,94 @@
+   }
+ }
+ 
++TEST_P(PackLWEsTest, BatchedRLWEBitwise) {
++  const size_t gap = std::get<1>(GetParam())/32;
++  seal::Encryptor encryptor(*N_context_, *N_rlwe_sk_);
++  PackingHelper ph(gap, *galois_, *N_context_, *N_context_);
++  // Exercise single ciphertext, full groups, incomplete groups, and both
++  // coefficient/NTT inputs. Same ciphertexts, no fresh encryption comparison.
++  for (bool ntt : {false,true}) {
++    for (size_t count : {1UL,gap-1,gap,2*gap+5}) {
++      std::vector<RLWECt> original(count);
++      for (auto& ct : original) {
++        RLWEPt pt;
++        N_encoder_->Forward(ring_rand(FM64,{poly_N}), &pt, true);
++        NttInplace(pt, *N_context_);
++        encryptor.encrypt_symmetric(pt, ct);
++        if (!ntt) InvNttInplace(ct, *N_context_);
++      }
++      auto optimized = original;
++      const size_t groups = (count+gap-1)/gap;
++      std::vector<RLWECt> a(groups),b(groups);
++      ResetBumblebeeMetrics();
++      for (size_t group=0;group<groups;++group) {
++        const size_t begin=group*gap, n=std::min(gap,count-begin);
++        ph.PackingWithModulusDrop(absl::MakeSpan(original).subspan(begin,n),a[group]);
++      }
++      const auto old_he_calls=GetBumblebeeMetrics().he.calls;
++      ResetBumblebeeMetrics();
++      ph.PackingWithModulusDropBatch(absl::MakeSpan(optimized),absl::MakeSpan(b));
++      EXPECT_EQ(GetBumblebeeMetrics().he.calls,old_he_calls);
++      for (size_t group=0;group<groups;++group) {
++        ASSERT_EQ(a[group].size(),b[group].size());
++        ASSERT_EQ(a[group].parms_id(),b[group].parms_id());
++        ASSERT_EQ(a[group].is_ntt_form(),b[group].is_ntt_form());
++        ASSERT_EQ(a[group].scale(),b[group].scale());
++        const size_t words=a[group].size()*a[group].poly_modulus_degree()*a[group].coeff_modulus_size();
++        ASSERT_TRUE(std::equal(a[group].data(),a[group].data()+words,b[group].data()));
++      }
++    }
++  }
++}
++
++TEST_P(PackLWEsTest, RuntimeContextsBitwise) {
++  // Match the deployed FM64 matrix-OLE contexts: 3 coefficient moduli in
++  // the computation context, special-prime Galois context, drop to 2 for KS.
++  seal::EncryptionParameters parms(seal::scheme_type::ckks);
++  parms.set_poly_modulus_degree(poly_N);
++  parms.set_coeff_modulus(seal::CoeffModulus::Create(poly_N,{59,55,49}));
++  parms.set_use_special_prime(false);
++  seal::SEALContext work(parms,true,seal::sec_level_type::none);
++  seal::KeyGenerator keygen(work);
++  auto sk=keygen.secret_key();
++  parms.set_use_special_prime(true);
++  seal::SEALContext gk_context(parms,true,seal::sec_level_type::none);
++  GaloisKeys keys;
++  GenerateGaloisKeyForPacking(gk_context,sk,false,&keys);
++  ModulusSwitchHelper msh(work,64);
++  VectorEncoder encoder(work,msh);
++  seal::Encryptor encryptor(work,sk);
++  const size_t gap=std::get<1>(GetParam())/32;
++  PackingHelper ph(gap,keys,gk_context,work);
++  for (bool ntt : {false,true}) {
++    for (size_t count : {gap,2*gap+5}) {
++      std::vector<RLWECt> a(count);
++      for (auto& ct : a) {
++        RLWEPt pt;
++        encoder.Forward(ring_rand(FM64,{poly_N}),&pt,true);
++        NttInplace(pt,work);
++        encryptor.encrypt_symmetric(pt,ct);
++        if (!ntt) InvNttInplace(ct,work);
++      }
++      auto b=a;
++      const size_t groups=(count+gap-1)/gap;
++      std::vector<RLWECt> old(groups),opt(groups);
++      for (size_t g=0;g<groups;++g) {
++        ph.PackingWithModulusDrop(absl::MakeSpan(a).subspan(g*gap,std::min(gap,count-g*gap)),old[g]);
++      }
++      ph.PackingWithModulusDropBatch(absl::MakeSpan(b),absl::MakeSpan(opt));
++      for (size_t g=0;g<groups;++g) {
++        ASSERT_EQ(old[g].parms_id(),opt[g].parms_id());
++        ASSERT_EQ(old[g].coeff_modulus_size(),2UL);
++        const size_t words=old[g].size()*poly_N*old[g].coeff_modulus_size();
++        ASSERT_TRUE(std::equal(old[g].data(),old[g].data()+words,opt[g].data()));
++      }
++    }
++  }
++  std::vector<RLWECt> aliased(gap);
++  EXPECT_ANY_THROW(ph.PackingWithModulusDropBatch(absl::MakeSpan(aliased),absl::MakeSpan(aliased).subspan(0,1)));
++}
++
+ TEST_P(PackLWEsTest, Basic) {
+   auto field = std::get<0>(GetParam());  // FM64
+   size_t num_lwes = std::get<1>(GetParam()) / 128;
+--- a/libspu/mpc/bumblebee/arith/bumblebee_dot.cc
++++ b/libspu/mpc/bumblebee/arith/bumblebee_dot.cc
+@@ -14,6 +14,7 @@
+ #include "libspu/mpc/bumblebee/arith/bumblebee_dot.h"
+ 
+ #include <future>
++#include <cstdlib>
+ #include <unordered_map>
+ #include <utility>
+ 
+@@ -479,12 +480,33 @@
+                                   ? packing_evaluators_.at(field_bitlen).get()
+                                   : nullptr);
+ 
+-    for (size_t i = 0; i < out_n; i += pack_stride) {
+-      size_t this_batch = std::min(out_n - i, pack_stride);
+-      size_t packed_idx = i / pack_stride;
+-      pack_helper.PackingWithModulusDrop(
+-          ct_array_to_pack.subspan(i, this_batch),
+-          ct_array_to_pack[packed_idx]);
++    const char* batch_env = std::getenv("SPU_BB_PACK_TREE_BATCH");
++    const bool tree_batch = batch_env && std::string(batch_env) == "1" &&
++                            !UsePhantomHeBackend();
++    if (tree_batch) {
++      std::vector<RLWECt> packed(CeilDiv(out_n, pack_stride));
++      pack_helper.PackingWithModulusDropBatch(ct_array_to_pack,
++                                             absl::MakeSpan(packed));
++      for (size_t i=0; i<packed.size(); ++i) {
++        ct_array_to_pack[i] = std::move(packed[i]);
++      }
++    } else {
++      for (size_t i = 0; i < out_n; i += pack_stride) {
++        size_t this_batch = std::min(out_n - i, pack_stride);
++        size_t packed_idx = i / pack_stride;
++        pack_helper.PackingWithModulusDrop(
++            ct_array_to_pack.subspan(i, this_batch),
++            ct_array_to_pack[packed_idx]);
++      }
++    }
++    if (Stage2Enabled()) {
++      const auto now = Stage2Now();
++      const size_t groups = CeilDiv(out_n, pack_stride);
++      const size_t levels = absl::bit_width(pack_stride)-1;
++      RecordStage2Event("packing_schedule", fmt::format(
++          "mode={};inputs={};groups={};gap={};launches={}",
++          tree_batch ? "tree_batch" : "original", out_n, groups, gap,
++          tree_batch ? 1+levels : groups*(1+levels)), now, now);
+     }
+ 
+     pack_time = _timer.CountMs();

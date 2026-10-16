@@ -55,7 +55,29 @@ def node(out, rank):
 
     api.Runtime.__init__ = observed
     Path("/tmp/bb-node.pid").write_text(str(os.getpid()))
-    conf = json.loads((out / "run.json").read_text())["spu"]
+    metadata = json.loads((out / "run.json").read_text())
+    if metadata["config"].get("paired_variants"):
+        # Actual process CPU includes all native workers. It is CPU-seconds,
+        # not a wall-time component and must not be added to link wait unions.
+        original_run = api.Runtime.run
+        execution_number = 0
+        def observed_run(self, executable):
+            nonlocal execution_number
+            execution_number += 1
+            wall_start = time.perf_counter_ns()
+            cpu_start = time.process_time_ns()
+            thread_start = time.thread_time_ns()
+            try:
+                return original_run(self, executable)
+            finally:
+                record = dict(execution=execution_number, party=rank,
+                    wall_s=(time.perf_counter_ns()-wall_start)/1e9,
+                    process_cpu_s=(time.process_time_ns()-cpu_start)/1e9,
+                    caller_thread_cpu_s=(time.thread_time_ns()-thread_start)/1e9)
+                with (out / "log" / f"cpu-p{rank}.jsonl").open("a") as stream:
+                    stream.write(json.dumps(record)+"\n")
+        api.Runtime.run = observed_run
+    conf = metadata["spu"]
     ppd.RPC.serve(f"node:{rank}", conf["nodes"])
 
 
@@ -65,8 +87,14 @@ def worker(out):
         from experiment import attention_worker
         return attention_worker(out)
     if meta["config"].get("task") == "block":
+        if meta["config"].get("paired_variants"):
+            from optimize_study import paired_worker
+            return paired_worker(out)
         from block import block_worker
         return block_worker(out)
+    if meta["config"].get("paired_variants"):
+        from optimize_study import paired_worker
+        return paired_worker(out)
     import jax
     import numpy as np
     import spu
@@ -243,6 +271,11 @@ def baseline(config_path, requested_out, backend=None):
         meta["hashes"]["mixed.py"] = digest(ROOT / "mixed.py")
         if config.get("task") == "block":
             meta["hashes"]["block.py"] = digest(ROOT / "block.py")
+    if config.get("paired_variants"):
+        for filename in ("optimized_heads.py", "optimize_study.py"):
+            meta["hashes"][filename] = digest(ROOT / filename)
+        meta["timing"] = ("Paired variants share one fresh two-party runtime; all variants warm up "
+                          "before measured balanced interleaving; native scope excludes compile/upload/reveal")
     source_files = ["libspu/mpc/bumblebee/protocol.cc", "libspu/mpc/bumblebee/arith/bumblebee_dot.cc",
                     "libspu/kernel/hal/intrinsic/nn/activation.cc", "libspu/kernel/hal/fxp_approx.cc",
                     "spu/utils/frontend.py", "spu/utils/distributed.py"]
@@ -331,11 +364,14 @@ def baseline(config_path, requested_out, backend=None):
             processes, handles = [], []
             meta = json.loads((out / "run.json").read_text())
             task = config.get("task", "vit")
-            parts = [profile(out / "log" / f"b{repeat}-p{rank}.log", last=task in ("attention","block")) for rank in range(2)]
+            parts = [profile(out / "log" / f"b{repeat}-p{rank}.log", last=task in ("attention","block")
+                             or bool(config.get("paired_variants"))) for rank in range(2)]
             samples = config.get("measured_calls", 1)
             for sample in range(samples):
                 if samples > 1:
-                    parts = [profile(out / "log" / f"b{repeat}-p{rank}.log", execution=sample+1) for rank in range(2)]
+                    row = meta["measurements"][previous_measurements + sample]
+                    execution = row.get("execution_index", sample+1)
+                    parts = [profile(out / "log" / f"b{repeat}-p{rank}.log", execution=execution) for rank in range(2)]
                 require_he=config.get("scope")!="map"
                 if any(p.get("backend_metrics", {}).get("backend") != config["backend"] or
                        (require_he and float(p.get("backend_metrics", {}).get("HE_calls", 0)) <= 0) for p in parts):
